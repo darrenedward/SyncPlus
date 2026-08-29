@@ -23,6 +23,7 @@ fn new_profiles_default_to_non_destructive_one_way_sync() {
         SyncOptions {
             safe_delete: false,
             destination_cleanup: false,
+            deletion_method: None,
         }
     );
 }
