@@ -1,0 +1,20 @@
+# Rust build output
+/target/
+
+# Local SyncPlus state and recovery data
+*.db
+*.sqlite
+*.sqlite-*
+*.sqlite.gz
+/local-data/
+/recovery/
+
+# Local secrets and logs
+.env
+.env.*
+*.log
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
