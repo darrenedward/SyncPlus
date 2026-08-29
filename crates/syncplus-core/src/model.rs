@@ -1,0 +1,330 @@
+use std::{fmt, path::Path, path::PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RunId(u64);
+
+impl RunId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProfileSnapshotId(u64);
+
+impl ProfileSnapshotId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    name: String,
+    root: PathBuf,
+}
+
+impl Peer {
+    pub fn new(name: impl Into<String>, root: PathBuf) -> Self {
+        Self {
+            name: name.into(),
+            root,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    OneWay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncOptions {
+    pub safe_delete: bool,
+    pub destination_cleanup: bool,
+}
+
+impl Default for SyncOptions {
+    fn default() -> Self {
+        Self {
+            safe_delete: false,
+            destination_cleanup: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncProfile {
+    name: String,
+    peer_a: Peer,
+    peer_b: Peer,
+    mode: SyncMode,
+    options: SyncOptions,
+}
+
+impl SyncProfile {
+    pub fn new(name: impl Into<String>, peer_a: Peer, peer_b: Peer) -> Self {
+        Self {
+            name: name.into(),
+            peer_a,
+            peer_b,
+            mode: SyncMode::OneWay,
+            options: SyncOptions::default(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn peer_a(&self) -> &Peer {
+        &self.peer_a
+    }
+
+    pub fn peer_b(&self) -> &Peer {
+        &self.peer_b
+    }
+
+    pub const fn mode(&self) -> SyncMode {
+        self.mode
+    }
+
+    pub const fn options(&self) -> SyncOptions {
+        self.options
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileSnapshot {
+    id: ProfileSnapshotId,
+    profile: SyncProfile,
+}
+
+impl ProfileSnapshot {
+    fn new(id: ProfileSnapshotId, profile: &SyncProfile) -> Self {
+        Self {
+            id,
+            profile: profile.clone(),
+        }
+    }
+
+    pub const fn id(&self) -> ProfileSnapshotId {
+        self.id
+    }
+
+    pub fn profile(&self) -> &SyncProfile {
+        &self.profile
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActiveRunState {
+    IdleEdit,
+    Prechecking,
+    Analyzing,
+    PlanReview,
+    ExecutionConfirmation,
+    Executing,
+    CompletionReconciliation,
+    ReviewResolution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalOutcome {
+    Completed,
+    CompletedWithReviewRequired,
+    Failed,
+    Cancelled,
+    Blocked,
+    RecoveryReview,
+    ReviewCleared,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunState {
+    Active(ActiveRunState),
+    PendingReview,
+    Terminal(TerminalOutcome),
+}
+
+impl RunState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Terminal(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEvent {
+    BeginPrecheck,
+    PrecheckPassed,
+    AnalysisCompleted,
+    PlanReviewed,
+    ExecutionConfirmed,
+    ExecutionCompleted,
+    ReconciliationCompleted { requires_review: bool },
+    OpenReview,
+    BeginResolutionRun,
+    ReviewCleared,
+    Blocked,
+    Failed,
+    Cancelled,
+    RecoveryReview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyViolation {
+    PrecheckRequired,
+    FreshAnalysisRequired,
+    ExecutionConfirmationRequired,
+    UnresolvedReview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreError {
+    InvalidTransition { state: RunState, event: RunEvent },
+    SafetyViolation(SafetyViolation),
+}
+
+impl fmt::Display for CoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidTransition { state, event } => {
+                write!(formatter, "invalid transition from {state:?} using {event:?}")
+            }
+            Self::SafetyViolation(violation) => write!(formatter, "safety violation: {violation:?}"),
+        }
+    }
+}
+
+impl std::error::Error for CoreError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncRun {
+    id: RunId,
+    snapshot: ProfileSnapshot,
+    state: RunState,
+}
+
+impl SyncRun {
+    pub fn new(id: RunId, profile: &SyncProfile) -> Self {
+        Self {
+            id,
+            snapshot: ProfileSnapshot::new(ProfileSnapshotId::new(id.value()), profile),
+            state: RunState::Active(ActiveRunState::IdleEdit),
+        }
+    }
+
+    pub const fn id(&self) -> RunId {
+        self.id
+    }
+
+    pub const fn snapshot_id(&self) -> ProfileSnapshotId {
+        self.snapshot.id()
+    }
+
+    pub fn snapshot(&self) -> &ProfileSnapshot {
+        &self.snapshot
+    }
+
+    pub const fn state(&self) -> RunState {
+        self.state
+    }
+
+    pub const fn outcome(&self) -> Option<TerminalOutcome> {
+        match self.state {
+            RunState::PendingReview => Some(TerminalOutcome::CompletedWithReviewRequired),
+            RunState::Terminal(outcome) => Some(outcome),
+            RunState::Active(_) => None,
+        }
+    }
+
+    pub fn transition(self, event: RunEvent) -> Result<Self, CoreError> {
+        let next_state = next_state(self.state, event).ok_or(CoreError::InvalidTransition {
+            state: self.state,
+            event,
+        })?;
+
+        Ok(Self {
+            state: next_state,
+            ..self
+        })
+    }
+}
+
+fn next_state(state: RunState, event: RunEvent) -> Option<RunState> {
+    if matches!(
+        event,
+        RunEvent::Blocked | RunEvent::Failed | RunEvent::Cancelled | RunEvent::RecoveryReview
+    ) {
+        return match state {
+            RunState::Active(_) | RunState::PendingReview => Some(RunState::Terminal(match event {
+                RunEvent::Blocked => TerminalOutcome::Blocked,
+                RunEvent::Failed => TerminalOutcome::Failed,
+                RunEvent::Cancelled => TerminalOutcome::Cancelled,
+                RunEvent::RecoveryReview => TerminalOutcome::RecoveryReview,
+                _ => unreachable!("the event was checked above"),
+            })),
+            RunState::Terminal(_) => None,
+        };
+    }
+
+    match (state, event) {
+        (RunState::Active(ActiveRunState::IdleEdit), RunEvent::BeginPrecheck) => {
+            Some(RunState::Active(ActiveRunState::Prechecking))
+        }
+        (RunState::Active(ActiveRunState::Prechecking), RunEvent::PrecheckPassed) => {
+            Some(RunState::Active(ActiveRunState::Analyzing))
+        }
+        (RunState::Active(ActiveRunState::Analyzing), RunEvent::AnalysisCompleted) => {
+            Some(RunState::Active(ActiveRunState::PlanReview))
+        }
+        (RunState::Active(ActiveRunState::PlanReview), RunEvent::PlanReviewed) => {
+            Some(RunState::Active(ActiveRunState::ExecutionConfirmation))
+        }
+        (
+            RunState::Active(ActiveRunState::ExecutionConfirmation),
+            RunEvent::ExecutionConfirmed,
+        ) => Some(RunState::Active(ActiveRunState::Executing)),
+        (RunState::Active(ActiveRunState::Executing), RunEvent::ExecutionCompleted) => {
+            Some(RunState::Active(ActiveRunState::CompletionReconciliation))
+        }
+        (
+            RunState::Active(ActiveRunState::CompletionReconciliation),
+            RunEvent::ReconciliationCompleted {
+                requires_review: false,
+            },
+        ) => Some(RunState::Terminal(TerminalOutcome::Completed)),
+        (
+            RunState::Active(ActiveRunState::CompletionReconciliation),
+            RunEvent::ReconciliationCompleted {
+                requires_review: true,
+            },
+        ) => Some(RunState::PendingReview),
+        (RunState::PendingReview, RunEvent::OpenReview) => {
+            Some(RunState::Active(ActiveRunState::ReviewResolution))
+        }
+        (RunState::Active(ActiveRunState::ReviewResolution), RunEvent::BeginResolutionRun) => {
+            Some(RunState::Active(ActiveRunState::Analyzing))
+        }
+        (RunState::Active(ActiveRunState::ReviewResolution), RunEvent::ReviewCleared) => {
+            Some(RunState::Terminal(TerminalOutcome::ReviewCleared))
+        }
+        _ => None,
+    }
+}
