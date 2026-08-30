@@ -17,6 +17,17 @@ struct FakeProbe {
 }
 
 impl PrecheckProbe for FakeProbe {
+    fn volume_identity(
+        &self,
+        _path: &std::path::Path,
+    ) -> Result<Option<crate::VolumeIdentity>, crate::PrecheckError> {
+        Ok(None)
+    }
+
+    fn requires_volume_identity(&self) -> bool {
+        false
+    }
+
     fn source_access(
         &self,
         _path: &std::path::Path,

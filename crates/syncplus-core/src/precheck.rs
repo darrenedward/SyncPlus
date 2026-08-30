@@ -10,6 +10,7 @@ use unicode_normalization::UnicodeNormalization;
 use crate::{
     DeletionMethod, Peer, PeerScope, PeerScopeLock, PeerScopeLockRegistry, ProcessSpecError,
     ProcessSpecification, ScopeLockConflict, ScopeLockOwner, SyncProfile, ValidatedSyncOptions,
+    VolumeIdentity, VolumeIdentityError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +96,15 @@ pub trait PrecheckProbe {
         exclusions: &[String],
     ) -> Result<u64, PrecheckError>;
 
+    /// Return the stable local volume identity for a peer when the operating
+    /// system provides one. Implementations must not follow a symlink at the
+    /// selected peer root or mutate the filesystem.
+    fn volume_identity(&self, path: &Path) -> Result<Option<VolumeIdentity>, PrecheckError>;
+
+    /// Whether resuming a run with no recorded volume identity is unsafe for
+    /// this peer implementation.
+    fn requires_volume_identity(&self) -> bool;
+
     fn item_permission_issues(
         &self,
         _source: &Path,
@@ -121,6 +131,8 @@ pub enum PrecheckBlockerKind {
     InsufficientSpace,
     PeerScopeOverlap,
     DestinationNamingConflict,
+    VolumeIdentityMismatch,
+    VolumeIdentityUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +178,8 @@ impl PrecheckBlocker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrecheckBlocked {
     blockers: Vec<PrecheckBlocker>,
+    source_volume_identity: Option<VolumeIdentity>,
+    destination_volume_identity: Option<VolumeIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +218,24 @@ impl PermissionIssue {
 impl PrecheckBlocked {
     pub fn blockers(&self) -> &[PrecheckBlocker] {
         &self.blockers
+    }
+
+    pub const fn source_volume_identity(&self) -> Option<VolumeIdentity> {
+        self.source_volume_identity
+    }
+
+    pub const fn destination_volume_identity(&self) -> Option<VolumeIdentity> {
+        self.destination_volume_identity
+    }
+
+    pub fn is_replacement_only(&self) -> bool {
+        self.source_volume_identity.is_some()
+            && self.destination_volume_identity.is_some()
+            && !self.blockers.is_empty()
+            && self
+                .blockers
+                .iter()
+                .all(|blocker| blocker.kind == PrecheckBlockerKind::VolumeIdentityMismatch)
     }
 }
 
@@ -296,6 +328,8 @@ impl NamingConflict {
 pub struct PrecheckResult {
     source: PathBuf,
     destination: PathBuf,
+    source_volume_identity: Option<VolumeIdentity>,
+    destination_volume_identity: Option<VolumeIdentity>,
     blockers: Vec<PrecheckBlocker>,
     warnings: Vec<PathRiskWarning>,
 }
@@ -305,6 +339,8 @@ impl PrecheckResult {
         Self {
             source: source.to_path_buf(),
             destination: destination.to_path_buf(),
+            source_volume_identity: None,
+            destination_volume_identity: None,
             blockers: Vec::new(),
             warnings: Vec::new(),
         }
@@ -316,6 +352,14 @@ impl PrecheckResult {
 
     pub fn destination(&self) -> &Path {
         &self.destination
+    }
+
+    pub const fn source_volume_identity(&self) -> Option<VolumeIdentity> {
+        self.source_volume_identity
+    }
+
+    pub const fn destination_volume_identity(&self) -> Option<VolumeIdentity> {
+        self.destination_volume_identity
     }
 
     pub fn blockers(&self) -> &[PrecheckBlocker] {
@@ -336,6 +380,8 @@ impl PrecheckResult {
         } else {
             Err(PrecheckBlocked {
                 blockers: self.blockers.clone(),
+                source_volume_identity: self.source_volume_identity,
+                destination_volume_identity: self.destination_volume_identity,
             })
         }
     }
@@ -378,7 +424,21 @@ impl std::fmt::Display for PrecheckFailure {
             Self::InvalidSpecification(error) => write!(formatter, "invalid profile: {error}"),
             Self::Probe(error) => write!(formatter, "precheck probe failed: {error}"),
             Self::Blocked(blocked) => {
-                write!(formatter, "precheck blocked by {} issue(s)", blocked.blockers.len())
+                write!(formatter, "precheck blocked: ")?;
+                for (index, blocker) in blocked.blockers.iter().enumerate() {
+                    if index > 0 {
+                        write!(formatter, "; ")?;
+                    }
+                    write!(
+                        formatter,
+                        "{:?} at {:?}: {} ({})",
+                        blocker.kind,
+                        blocker.path,
+                        blocker.requirement,
+                        blocker.remediation
+                    )?;
+                }
+                Ok(())
             }
             Self::ScopeLocked(conflict) => write!(
                 formatter,
@@ -418,12 +478,120 @@ impl RunPrecheck {
         profile: &SyncProfile,
         probe: &P,
     ) -> Result<PrecheckResult, PrecheckErrorKind> {
+        Self::check_with_expected_volumes(profile, probe, None, None)
+    }
+
+    pub fn check_with_expected_volumes<P: PrecheckProbe>(
+        profile: &SyncProfile,
+        probe: &P,
+        expected_source: Option<VolumeIdentity>,
+        expected_destination: Option<VolumeIdentity>,
+    ) -> Result<PrecheckResult, PrecheckErrorKind> {
+        Self::check_with_volume_expectations(
+            profile,
+            probe,
+            expected_source,
+            expected_destination,
+            false,
+            false,
+        )
+    }
+
+    pub fn check_for_resume<P: PrecheckProbe>(
+        profile: &SyncProfile,
+        probe: &P,
+        expected_source: Option<VolumeIdentity>,
+        expected_destination: Option<VolumeIdentity>,
+    ) -> Result<PrecheckResult, PrecheckErrorKind> {
+        Self::check_for_resume_with_replacement(
+            profile,
+            probe,
+            expected_source,
+            expected_destination,
+            false,
+        )
+    }
+
+    pub fn check_for_resume_with_replacement<P: PrecheckProbe>(
+        profile: &SyncProfile,
+        probe: &P,
+        expected_source: Option<VolumeIdentity>,
+        expected_destination: Option<VolumeIdentity>,
+        allow_replacement: bool,
+    ) -> Result<PrecheckResult, PrecheckErrorKind> {
+        Self::check_with_volume_expectations(
+            profile,
+            probe,
+            expected_source,
+            expected_destination,
+            true,
+            allow_replacement,
+        )
+    }
+
+    fn check_with_volume_expectations<P: PrecheckProbe>(
+        profile: &SyncProfile,
+        probe: &P,
+        expected_source: Option<VolumeIdentity>,
+        expected_destination: Option<VolumeIdentity>,
+        require_recorded_identity: bool,
+        allow_replacement: bool,
+    ) -> Result<PrecheckResult, PrecheckErrorKind> {
         let specification =
             ProcessSpecification::from_profile(profile).map_err(PrecheckErrorKind::InvalidSpecification)?;
         let (source_peer, destination_peer) = selected_peers(profile);
         let source = source_peer.root();
         let destination = destination_peer.root();
         let mut result = PrecheckResult::new(source, destination);
+
+        result.source_volume_identity = probe
+            .volume_identity(source)
+            .map_err(PrecheckErrorKind::Probe)?;
+        result.destination_volume_identity = probe
+            .volume_identity(destination)
+            .map_err(PrecheckErrorKind::Probe)?;
+
+        let source_volume_identity = result.source_volume_identity;
+        let destination_volume_identity = result.destination_volume_identity;
+        append_volume_identity_blocker(
+            &mut result,
+            source,
+            "source",
+            expected_source,
+            source_volume_identity,
+            allow_replacement,
+        );
+        append_volume_identity_blocker(
+            &mut result,
+            destination,
+            "destination",
+            expected_destination,
+            destination_volume_identity,
+            allow_replacement,
+        );
+
+        if require_recorded_identity && probe.requires_volume_identity() {
+            append_missing_recorded_identity_blocker(
+                &mut result,
+                source,
+                "source",
+                expected_source,
+                source_volume_identity,
+            );
+            append_missing_recorded_identity_blocker(
+                &mut result,
+                destination,
+                "destination",
+                expected_destination,
+                destination_volume_identity,
+            );
+        }
+
+        if (expected_source.is_some() && source_volume_identity.is_none())
+            || (expected_destination.is_some() && destination_volume_identity.is_none())
+        {
+            return Ok(result);
+        }
 
         let source_scope = PeerScope::new(source);
         let destination_scope = PeerScope::new(destination);
@@ -546,7 +714,96 @@ impl RunPrecheck {
         registry: &PeerScopeLockRegistry,
         owner: ScopeLockOwner,
     ) -> Result<PrecheckLease, PrecheckFailure> {
-        let result = Self::check(profile, probe).map_err(|error| match error {
+        Self::check_and_lock_with_expected_volumes(profile, probe, registry, owner, None, None)
+    }
+
+    pub fn check_and_lock_with_expected_volumes<P: PrecheckProbe>(
+        profile: &SyncProfile,
+        probe: &P,
+        registry: &PeerScopeLockRegistry,
+        owner: ScopeLockOwner,
+        expected_source: Option<VolumeIdentity>,
+        expected_destination: Option<VolumeIdentity>,
+    ) -> Result<PrecheckLease, PrecheckFailure> {
+        Self::check_and_lock_with_volume_expectations(
+            profile,
+            probe,
+            registry,
+            owner,
+            expected_source,
+            expected_destination,
+            false,
+            false,
+        )
+    }
+
+    pub fn check_and_lock_for_resume<P: PrecheckProbe>(
+        profile: &SyncProfile,
+        probe: &P,
+        registry: &PeerScopeLockRegistry,
+        owner: ScopeLockOwner,
+        expected_source: Option<VolumeIdentity>,
+        expected_destination: Option<VolumeIdentity>,
+    ) -> Result<PrecheckLease, PrecheckFailure> {
+        Self::check_and_lock_for_resume_with_replacement(
+            profile,
+            probe,
+            registry,
+            owner,
+            expected_source,
+            expected_destination,
+            false,
+        )
+    }
+
+    pub fn check_and_lock_for_resume_with_replacement<P: PrecheckProbe>(
+        profile: &SyncProfile,
+        probe: &P,
+        registry: &PeerScopeLockRegistry,
+        owner: ScopeLockOwner,
+        expected_source: Option<VolumeIdentity>,
+        expected_destination: Option<VolumeIdentity>,
+        allow_replacement: bool,
+    ) -> Result<PrecheckLease, PrecheckFailure> {
+        Self::check_and_lock_with_volume_expectations(
+            profile,
+            probe,
+            registry,
+            owner,
+            expected_source,
+            expected_destination,
+            true,
+            allow_replacement,
+        )
+    }
+
+    fn check_and_lock_with_volume_expectations<P: PrecheckProbe>(
+        profile: &SyncProfile,
+        probe: &P,
+        registry: &PeerScopeLockRegistry,
+        owner: ScopeLockOwner,
+        expected_source: Option<VolumeIdentity>,
+        expected_destination: Option<VolumeIdentity>,
+        require_recorded_identity: bool,
+        allow_replacement: bool,
+    ) -> Result<PrecheckLease, PrecheckFailure> {
+        let result = if require_recorded_identity {
+            Self::check_for_resume_with_replacement(
+                profile,
+                probe,
+                expected_source,
+                expected_destination,
+                allow_replacement,
+            )
+        } else {
+            Self::check_with_expected_volumes(
+                profile,
+                probe,
+                expected_source,
+                expected_destination,
+            )
+        }
+        .map_err(|error| match error {
             PrecheckErrorKind::InvalidSpecification(error) => {
                 PrecheckFailure::InvalidSpecification(error)
             }
@@ -573,6 +830,56 @@ impl RunPrecheck {
             _scope_lock: lock,
         })
     }
+}
+
+fn append_volume_identity_blocker(
+    result: &mut PrecheckResult,
+    path: &Path,
+    peer_label: &str,
+    expected: Option<VolumeIdentity>,
+    observed: Option<VolumeIdentity>,
+    allow_replacement: bool,
+) {
+    let Some(expected) = expected else {
+        return;
+    };
+    if observed == Some(expected) || (allow_replacement && observed.is_some()) {
+        return;
+    }
+    let observed_text = observed
+        .map(|identity| identity.to_string())
+        .unwrap_or_else(|| "no volume identity was detected".to_owned());
+    result.blockers.push(PrecheckBlocker::new(
+        PrecheckBlockerKind::VolumeIdentityMismatch,
+        path,
+        format!(
+            "the {peer_label} must be on {expected}; the current peer reports {observed_text}"
+        ),
+        "reconnect the recorded volume or explicitly review the replacement before resuming",
+    ));
+}
+
+fn append_missing_recorded_identity_blocker(
+    result: &mut PrecheckResult,
+    path: &Path,
+    peer_label: &str,
+    expected: Option<VolumeIdentity>,
+    observed: Option<VolumeIdentity>,
+) {
+    if expected.is_some() {
+        return;
+    }
+    let observed_text = observed
+        .map(|identity| identity.to_string())
+        .unwrap_or_else(|| "no volume identity was detected".to_owned());
+    result.blockers.push(PrecheckBlocker::new(
+        PrecheckBlockerKind::VolumeIdentityUnavailable,
+        path,
+        format!(
+            "no recorded volume identity is available for the {peer_label}; the current peer reports {observed_text}"
+        ),
+        "start a new Sync Run after the peer is available so its volume identity can be recorded",
+    ));
 }
 
 fn selected_peers(profile: &SyncProfile) -> (&Peer, &Peer) {
@@ -651,6 +958,22 @@ impl PrecheckProbe for LocalPrecheckProbe {
         } else {
             Ok(transfer_bytes)
         }
+    }
+
+    fn volume_identity(&self, path: &Path) -> Result<Option<VolumeIdentity>, PrecheckError> {
+        match VolumeIdentity::capture(path) {
+            Ok(identity) => Ok(Some(identity)),
+            Err(VolumeIdentityError::Unavailable(_)) => Ok(None),
+            Err(error) => Err(PrecheckError::new(
+                path,
+                "inspect local volume identity",
+                error.to_string(),
+            )),
+        }
+    }
+
+    fn requires_volume_identity(&self) -> bool {
+        true
     }
 
     fn item_permission_issues(

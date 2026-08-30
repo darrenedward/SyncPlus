@@ -16,7 +16,7 @@ use crate::{
     RunReport, RunReportStatus, RunSnapshot, SafeDeleteError, ScopeLockOwner,
     PeerScopeLockRegistry,
     SourceInventorySnapshot, StorageError, TransferError, VerificationError,
-    VerifiedReplacement, CompletionReconciliation,
+    VerifiedReplacement, CompletionReconciliation, PrecheckBlocked,
 };
 
 #[derive(Debug)]
@@ -131,23 +131,55 @@ impl RunWorkflow {
         C: FnOnce(&ConfirmedPlan) -> bool,
         F: Fn() -> bool,
     {
-        let _lease = match self.acquire_precheck(run_id, profile, probe) {
+        let lease = match self.acquire_precheck(run_id, profile, probe) {
             Ok(lease) => lease,
             Err(error) => {
-                self.persist_blocked(run_id, profile, store, &error)?;
+                let (source_volume_identity, destination_volume_identity) =
+                    blocked_volume_identities(&error);
+                self.persist_blocked(
+                    run_id,
+                    profile,
+                    store,
+                    &error,
+                    source_volume_identity,
+                    destination_volume_identity,
+                )?;
                 return Err(error);
             }
         };
+        let source_volume_identity = lease.result().source_volume_identity();
+        let destination_volume_identity = lease.result().destination_volume_identity();
         let analysis = FreshAnalysis::analyze(profile)?;
         let confirmed = analysis.confirm(profile)?;
         if !confirm(&confirmed) {
             return Err(WorkflowError::ConfirmationRequired);
         }
-        if let Err(error) = self.recheck_precheck(profile, probe) {
-            self.persist_blocked(run_id, profile, store, &error)?;
+        if let Err(error) = self.recheck_precheck(
+            profile,
+            probe,
+            source_volume_identity,
+            destination_volume_identity,
+            false,
+            false,
+        ) {
+            self.persist_blocked(
+                run_id,
+                profile,
+                store,
+                &error,
+                source_volume_identity,
+                destination_volume_identity,
+            )?;
             return Err(error);
         }
-        let report = self.execute_confirmed(run_id, &confirmed, store, should_cancel)?;
+        let report = self.execute_confirmed(
+            run_id,
+            &confirmed,
+            store,
+            should_cancel,
+            source_volume_identity,
+            destination_volume_identity,
+        )?;
         self.cleanup_partials_after_success(&confirmed, &report)?;
         Ok(report)
     }
@@ -161,6 +193,8 @@ impl RunWorkflow {
         confirmed: &ConfirmedPlan,
         store: &mut RunEvidenceStore,
         should_cancel: F,
+        source_volume_identity: Option<crate::VolumeIdentity>,
+        destination_volume_identity: Option<crate::VolumeIdentity>,
     ) -> Result<RunReport, WorkflowError>
     where
         F: Fn() -> bool,
@@ -168,10 +202,17 @@ impl RunWorkflow {
         let plan = confirmed.plan();
         plan.validate()
             .map_err(|error| WorkflowError::InvalidRun(error.to_string()))?;
-        let snapshot = RunSnapshot::from_profile(
+        let (peer_a_volume_identity, peer_b_volume_identity) = orient_volume_identities(
+            confirmed.profile(),
+            source_volume_identity,
+            destination_volume_identity,
+        );
+        let snapshot = RunSnapshot::from_profile_with_volume_identities(
             run_id,
             confirmed.profile(),
             crate::AuthorizationSnapshot::default(),
+            peer_a_volume_identity,
+            peer_b_volume_identity,
         )?;
         store.begin_run(&snapshot)?;
         let inventory = SourceInventorySnapshot::from_inventory(plan.source_inventory());
@@ -220,6 +261,34 @@ impl RunWorkflow {
         C: FnOnce(&ConfirmedPlan) -> bool,
         F: Fn() -> bool,
     {
+        self.resume_with_replacement_confirmation(
+            run_id,
+            probe,
+            |_| false,
+            confirm,
+            store,
+            should_cancel,
+        )
+    }
+
+    /// Resume an incomplete run, optionally accepting a different volume only
+    /// after a separate explicit replacement confirmation. The ordinary
+    /// `resume` entry point always rejects replacement volumes.
+    pub fn resume_with_replacement_confirmation<P, A, C, F>(
+        &self,
+        run_id: RunId,
+        probe: &P,
+        authorize_replacement: A,
+        confirm: C,
+        store: &mut RunEvidenceStore,
+        should_cancel: F,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        P: PrecheckProbe,
+        A: FnOnce(&PrecheckBlocked) -> bool,
+        C: FnOnce(&ConfirmedPlan) -> bool,
+        F: Fn() -> bool,
+    {
         let report = store.load_report(run_id)?;
         if matches!(report.status(), RunReportStatus::Completed | RunReportStatus::ReviewCleared)
         {
@@ -236,14 +305,71 @@ impl RunWorkflow {
         }
 
         let profile = report.snapshot().profile().clone();
+        let expected_source_volume_identity = report
+            .snapshot()
+            .volume_identity(crate::PeerSide::from(profile.source()));
+        let source_side = crate::PeerSide::from(profile.source());
+        let expected_destination_volume_identity = report
+            .snapshot()
+            .volume_identity(source_side.opposite());
         let next_run_id = store.next_run_id()?;
-        let _lease = match self.acquire_precheck(next_run_id, &profile, probe) {
+        let mut authorize_replacement = Some(authorize_replacement);
+        let lease = match self.acquire_precheck_with_expected_volumes(
+            next_run_id,
+            &profile,
+            probe,
+            expected_source_volume_identity,
+            expected_destination_volume_identity,
+            true,
+            false,
+        ) {
             Ok(lease) => lease,
             Err(error) => {
-                self.persist_blocked(next_run_id, &profile, store, &error)?;
-                return Err(error);
+                let replacement_authorized = match &error {
+                    WorkflowError::Precheck(PrecheckFailure::Blocked(blocked))
+                        if blocked.is_replacement_only() => authorize_replacement
+                        .take()
+                        .is_some_and(|authorize| authorize(blocked)),
+                    _ => false,
+                };
+                if replacement_authorized {
+                    match self.acquire_precheck_with_expected_volumes(
+                        next_run_id,
+                        &profile,
+                        probe,
+                        expected_source_volume_identity,
+                        expected_destination_volume_identity,
+                        true,
+                        true,
+                    ) {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            self.persist_blocked(
+                                next_run_id,
+                                &profile,
+                                store,
+                                &error,
+                                expected_source_volume_identity,
+                                expected_destination_volume_identity,
+                            )?;
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    self.persist_blocked(
+                        next_run_id,
+                        &profile,
+                        store,
+                        &error,
+                        expected_source_volume_identity,
+                        expected_destination_volume_identity,
+                    )?;
+                    return Err(error);
+                }
             }
         };
+        let source_volume_identity = lease.result().source_volume_identity();
+        let destination_volume_identity = lease.result().destination_volume_identity();
         self.classify_open_actions(run_id, &profile, &report, store)?;
         let reopened = store.load_report(run_id)?;
         if reopened.status() == RunReportStatus::RecoveryReview {
@@ -258,11 +384,32 @@ impl RunWorkflow {
         if !confirm(&confirmed) {
             return Err(WorkflowError::ConfirmationRequired);
         }
-        if let Err(error) = self.recheck_precheck(&profile, probe) {
-            self.persist_blocked(next_run_id, &profile, store, &error)?;
+        if let Err(error) = self.recheck_precheck(
+            &profile,
+            probe,
+            source_volume_identity,
+            destination_volume_identity,
+            true,
+            false,
+        ) {
+            self.persist_blocked(
+                next_run_id,
+                &profile,
+                store,
+                &error,
+                expected_source_volume_identity,
+                expected_destination_volume_identity,
+            )?;
             return Err(error);
         }
-        let report = self.execute_confirmed(next_run_id, &confirmed, store, should_cancel)?;
+        let report = self.execute_confirmed(
+            next_run_id,
+            &confirmed,
+            store,
+            should_cancel,
+            source_volume_identity,
+            destination_volume_identity,
+        )?;
         self.cleanup_partials_after_success(&confirmed, &report)?;
         Ok(report)
     }
@@ -273,13 +420,43 @@ impl RunWorkflow {
         profile: &crate::SyncProfile,
         probe: &P,
     ) -> Result<PrecheckLease, WorkflowError> {
-        RunPrecheck::check_and_lock(
-            profile,
-            probe,
-            &self.scope_locks,
-            ScopeLockOwner::new(profile.name(), run_id),
+        self.acquire_precheck_with_expected_volumes(
+            run_id, profile, probe, None, None, false, false,
         )
-        .map_err(WorkflowError::Precheck)
+    }
+
+    fn acquire_precheck_with_expected_volumes<P: PrecheckProbe>(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        probe: &P,
+        expected_source_volume_identity: Option<crate::VolumeIdentity>,
+        expected_destination_volume_identity: Option<crate::VolumeIdentity>,
+        require_recorded_identity: bool,
+        allow_replacement: bool,
+    ) -> Result<PrecheckLease, WorkflowError> {
+        let owner = ScopeLockOwner::new(profile.name(), run_id);
+        let result = if require_recorded_identity {
+            RunPrecheck::check_and_lock_for_resume_with_replacement(
+                profile,
+                probe,
+                &self.scope_locks,
+                owner,
+                expected_source_volume_identity,
+                expected_destination_volume_identity,
+                allow_replacement,
+            )
+        } else {
+            RunPrecheck::check_and_lock_with_expected_volumes(
+                profile,
+                probe,
+                &self.scope_locks,
+                owner,
+                expected_source_volume_identity,
+                expected_destination_volume_identity,
+            )
+        };
+        result.map_err(WorkflowError::Precheck)
     }
 
     fn persist_blocked(
@@ -288,11 +465,20 @@ impl RunWorkflow {
         profile: &crate::SyncProfile,
         store: &mut RunEvidenceStore,
         error: &WorkflowError,
+        source_volume_identity: Option<crate::VolumeIdentity>,
+        destination_volume_identity: Option<crate::VolumeIdentity>,
     ) -> Result<(), WorkflowError> {
-        let snapshot = RunSnapshot::from_profile(
+        let (peer_a_volume_identity, peer_b_volume_identity) = orient_volume_identities(
+            profile,
+            source_volume_identity,
+            destination_volume_identity,
+        );
+        let snapshot = RunSnapshot::from_profile_with_volume_identities(
             run_id,
             profile,
             crate::AuthorizationSnapshot::default(),
+            peer_a_volume_identity,
+            peer_b_volume_identity,
         )?;
         store.begin_run(&snapshot)?;
         store.mark_blocked(run_id, &error.to_string())?;
@@ -323,8 +509,28 @@ impl RunWorkflow {
         &self,
         profile: &crate::SyncProfile,
         probe: &P,
+        expected_source_volume_identity: Option<crate::VolumeIdentity>,
+        expected_destination_volume_identity: Option<crate::VolumeIdentity>,
+        require_recorded_identity: bool,
+        allow_replacement: bool,
     ) -> Result<(), WorkflowError> {
-        let result = RunPrecheck::check(profile, probe).map_err(|error| {
+        let result = if require_recorded_identity {
+            RunPrecheck::check_for_resume_with_replacement(
+                profile,
+                probe,
+                expected_source_volume_identity,
+                expected_destination_volume_identity,
+                allow_replacement,
+            )
+        } else {
+            RunPrecheck::check_with_expected_volumes(
+                profile,
+                probe,
+                expected_source_volume_identity,
+                expected_destination_volume_identity,
+            )
+        }
+        .map_err(|error| {
             WorkflowError::Precheck(match error {
                 PrecheckErrorKind::InvalidSpecification(error) => {
                     PrecheckFailure::InvalidSpecification(error)
@@ -832,6 +1038,35 @@ fn transfer_reason(error: &TransferError) -> ActionReason {
     }
 }
 
+fn orient_volume_identities(
+    profile: &crate::SyncProfile,
+    source_volume_identity: Option<crate::VolumeIdentity>,
+    destination_volume_identity: Option<crate::VolumeIdentity>,
+) -> (
+    Option<crate::VolumeIdentity>,
+    Option<crate::VolumeIdentity>,
+) {
+    match profile.source() {
+        crate::OneWaySource::PeerA => (source_volume_identity, destination_volume_identity),
+        crate::OneWaySource::PeerB => (destination_volume_identity, source_volume_identity),
+    }
+}
+
+fn blocked_volume_identities(
+    error: &WorkflowError,
+) -> (
+    Option<crate::VolumeIdentity>,
+    Option<crate::VolumeIdentity>,
+) {
+    match error {
+        WorkflowError::Precheck(PrecheckFailure::Blocked(blocked)) => (
+            blocked.source_volume_identity(),
+            blocked.destination_volume_identity(),
+        ),
+        _ => (None, None),
+    }
+}
+
 fn safe_delete_reason(error: &SafeDeleteError) -> ActionReason {
     match error {
         SafeDeleteError::Verification(VerificationError::SourceChanged) => {
@@ -864,7 +1099,7 @@ mod tests {
         ItemType, JournalEvent, OneWaySource, Peer, PeerSide, PlanActionKind, PlanRecord,
         PreActionState, ProcessError, RecoveryEvidence, RecoveryMethod, RetryPolicy,
         LocalPrecheckProbe, PartialTransferPolicy, PeerScope, PeerScopeLockRegistry,
-        PrecheckFailure,
+        PrecheckFailure, PrecheckProbe,
         RunEvidenceStore, RunId, RunReportStatus, ScopeLockOwner, SyncOptions, SyncProfile,
     };
 
@@ -1018,9 +1253,14 @@ mod tests {
         let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
         let calls = AtomicUsize::new(0);
         let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
-            .execute_confirmed(RunId::new(1), &confirmed, &mut store, || {
-                calls.fetch_add(1, Ordering::Relaxed) >= 514
-            })
+            .execute_confirmed(
+                RunId::new(1),
+                &confirmed,
+                &mut store,
+                || calls.fetch_add(1, Ordering::Relaxed) >= 514,
+                None,
+                None,
+            )
             .expect("cancellation should produce a durable report");
 
         assert_eq!(report.status(), RunReportStatus::Cancelled);
@@ -1373,10 +1613,21 @@ mod tests {
         write_file(&fixture.source().join("b.txt"), b"remaining work");
 
         let profile = fixture.profile();
-        let snapshot = crate::RunSnapshot::from_profile(
+        let probe = LocalPrecheckProbe::default();
+        let source_volume_identity = probe
+            .volume_identity(&fixture.source())
+            .expect("source volume identity")
+            .expect("source volume identity should be available");
+        let destination_volume_identity = probe
+            .volume_identity(&fixture.destination())
+            .expect("destination volume identity")
+            .expect("destination volume identity should be available");
+        let snapshot = crate::RunSnapshot::from_profile_with_volume_identities(
             RunId::new(1),
             &profile,
             AuthorizationSnapshot::default(),
+            Some(source_volume_identity),
+            Some(destination_volume_identity),
         )
         .expect("snapshot");
         let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
@@ -1410,7 +1661,7 @@ mod tests {
         let resumed = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
             .resume(
                 RunId::new(1),
-                &LocalPrecheckProbe::default(),
+                &probe,
                 |_| true,
                 &mut store,
                 || false,

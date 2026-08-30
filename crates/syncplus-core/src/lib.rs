@@ -12,6 +12,7 @@ mod transfer;
 mod removal;
 mod workflow;
 mod reconciliation;
+mod volume;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
@@ -51,6 +52,7 @@ pub use reconciliation::{
     CompletionReconciliation, InventorySnapshotItem, ReconciliationFinding,
     ReconciliationFindingKind, ReconciliationReason, SourceDrainStatus, SourceInventorySnapshot,
 };
+pub use volume::{VolumeIdentity, VolumeIdentityError};
 pub use precheck::{
     AccessSnapshot, DestinationNamingPolicy, ExecutionPermit, LocalPrecheckProbe,
     NamingConflict, NamingRule, PathRiskLevel, PathRiskWarning, PrecheckBlocker,
@@ -78,6 +80,9 @@ mod precheck_tests;
 
 #[cfg(test)]
 mod scope_lock_tests;
+
+#[cfg(test)]
+mod volume_tests;
 
 #[cfg(test)]
 mod removal_tests;
