@@ -45,7 +45,9 @@ impl PrecheckProbe for FakeProbe {
     fn required_space(
         &self,
         _source: &std::path::Path,
+        _destination: &std::path::Path,
         _options: crate::ValidatedSyncOptions,
+        _exclusions: &[String],
     ) -> Result<u64, crate::PrecheckError> {
         Ok(self.required_space)
     }
@@ -87,7 +89,7 @@ fn blocked_precheck_reports_plain_language_remediation_and_no_execution_permit()
         .expect("valid profile should produce a precheck result");
 
     assert!(!result.can_execute());
-    assert!(result.execution_permit().is_err());
+    assert!(result.require_passed().is_err());
     assert!(result
         .blockers()
         .iter()
@@ -204,6 +206,51 @@ fn local_probe_names_are_checked_without_following_symlinks() {
         .naming_conflicts(root.path(), &root.path().join("destination"), &[])
         .expect("local naming probe should succeed");
     assert!(conflicts.is_empty(), "a symlink target is not traversed as a file");
+}
+
+#[test]
+fn local_probe_detects_case_collisions_against_an_existing_destination_name() {
+    let source = TestTree::new();
+    let destination = TestTree::new();
+    fs::write(source.path().join("Report.txt"), b"source").expect("write source fixture");
+    fs::write(destination.path().join("report.txt"), b"destination")
+        .expect("write destination fixture");
+
+    let probe = crate::LocalPrecheckProbe::new(DestinationNamingPolicy::case_insensitive());
+    let conflicts = probe
+        .naming_conflicts(source.path(), destination.path(), &[])
+        .expect("local naming probe should succeed");
+    assert!(conflicts.iter().any(|conflict| {
+        conflict.rule() == crate::NamingRule::CaseInsensitiveCollision
+            && conflict.related_path().is_some()
+    }));
+}
+
+#[test]
+fn a_passing_precheck_lease_holds_the_lock_for_the_execution_permit() {
+    let registry = PeerScopeLockRegistry::new();
+    let probe = passing_probe();
+    let lease = RunPrecheck::check_and_lock(
+        &profile(PathBuf::from("/source"), PathBuf::from("/destination")),
+        &probe,
+        &registry,
+        ScopeLockOwner::new("profile", RunId::new(1)),
+    )
+    .expect("passing precheck should acquire a lease");
+    assert_eq!(lease.permit().source(), std::path::Path::new("/source"));
+    assert!(registry
+        .acquire(
+            ScopeLockOwner::new("later", RunId::new(2)),
+            [crate::PeerScope::new("/source")],
+        )
+        .is_err());
+    drop(lease);
+    assert!(registry
+        .acquire(
+            ScopeLockOwner::new("later", RunId::new(2)),
+            [crate::PeerScope::new("/source")],
+        )
+        .is_ok());
 }
 
 struct TestTree(PathBuf);

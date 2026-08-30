@@ -171,6 +171,12 @@ pub struct PeerScopeLock {
     token: u64,
 }
 
+impl PeerScopeLock {
+    pub(crate) const fn token(&self) -> u64 {
+        self.token
+    }
+}
+
 impl Drop for PeerScopeLock {
     fn drop(&mut self) {
         self.registry.release(self.token);

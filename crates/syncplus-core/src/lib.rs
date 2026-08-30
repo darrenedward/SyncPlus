@@ -22,7 +22,7 @@ pub use precheck::{
     AccessSnapshot, DestinationNamingPolicy, ExecutionPermit, LocalPrecheckProbe,
     NamingConflict, NamingRule, PathRiskLevel, PathRiskWarning, PrecheckBlocker,
     PrecheckBlockerKind, PrecheckBlocked, PrecheckError, PrecheckErrorKind, PrecheckFailure,
-    PrecheckLease, PrecheckProbe, PrecheckResult, RunPrecheck,
+    PrecheckLease, PrecheckProbe, PrecheckResult, PermissionIssue, RunPrecheck,
 };
 pub use scope_lock::{
     PeerScope, PeerScopeLock, PeerScopeLockRegistry, ScopeLockConflict, ScopeLockError,

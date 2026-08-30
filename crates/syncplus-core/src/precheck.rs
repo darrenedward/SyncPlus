@@ -8,8 +8,8 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
-    Peer, PeerScope, PeerScopeLock, PeerScopeLockRegistry, ProcessSpecError, ProcessSpecification,
-    ScopeLockConflict, ScopeLockOwner, SyncProfile, ValidatedSyncOptions,
+    DeletionMethod, Peer, PeerScope, PeerScopeLock, PeerScopeLockRegistry, ProcessSpecError,
+    ProcessSpecification, ScopeLockConflict, ScopeLockOwner, SyncProfile, ValidatedSyncOptions,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,8 +90,20 @@ pub trait PrecheckProbe {
     fn required_space(
         &self,
         source: &Path,
+        destination: &Path,
         options: ValidatedSyncOptions,
+        exclusions: &[String],
     ) -> Result<u64, PrecheckError>;
+
+    fn item_permission_issues(
+        &self,
+        _source: &Path,
+        _destination: &Path,
+        _exclusions: &[String],
+        _options: ValidatedSyncOptions,
+    ) -> Result<Vec<PermissionIssue>, PrecheckError> {
+        Ok(Vec::new())
+    }
 
     fn naming_conflicts(
         &self,
@@ -154,6 +166,39 @@ impl PrecheckBlocker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrecheckBlocked {
     blockers: Vec<PrecheckBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionIssue {
+    path: PathBuf,
+    requirement: String,
+    remediation: String,
+}
+
+impl PermissionIssue {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        requirement: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            requirement: requirement.into(),
+            remediation: remediation.into(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn requirement(&self) -> &str {
+        &self.requirement
+    }
+
+    pub fn remediation(&self) -> &str {
+        &self.remediation
+    }
 }
 
 impl PrecheckBlocked {
@@ -285,12 +330,9 @@ impl PrecheckResult {
         self.blockers.is_empty()
     }
 
-    pub fn execution_permit(&self) -> Result<ExecutionPermit, PrecheckBlocked> {
+    pub fn require_passed(&self) -> Result<(), PrecheckBlocked> {
         if self.can_execute() {
-            Ok(ExecutionPermit {
-                source: self.source.clone(),
-                destination: self.destination.clone(),
-            })
+            Ok(())
         } else {
             Err(PrecheckBlocked {
                 blockers: self.blockers.clone(),
@@ -303,6 +345,7 @@ impl PrecheckResult {
 pub struct ExecutionPermit {
     source: PathBuf,
     destination: PathBuf,
+    lock_token: u64,
 }
 
 impl ExecutionPermit {
@@ -363,6 +406,7 @@ impl PrecheckLease {
     }
 
     pub fn permit(&self) -> &ExecutionPermit {
+        debug_assert_eq!(self._scope_lock.token(), self.permit.lock_token);
         &self.permit
     }
 }
@@ -440,7 +484,7 @@ impl RunPrecheck {
         }
 
         let required = probe
-            .required_space(source, options)
+            .required_space(source, destination, options, profile.exclusions())
             .map_err(PrecheckErrorKind::Probe)?;
         let available = probe
             .available_space(destination)
@@ -451,6 +495,18 @@ impl RunPrecheck {
                 destination,
                 format!("the destination needs at least {required} bytes of available space"),
                 format!("free space on the destination and retry; the precheck found only {available} bytes available"),
+            ));
+        }
+
+        let permission_issues = probe
+            .item_permission_issues(source, destination, profile.exclusions(), options)
+            .map_err(PrecheckErrorKind::Probe)?;
+        for issue in permission_issues {
+            result.blockers.push(PrecheckBlocker::new(
+                PrecheckBlockerKind::RequiredPermission,
+                issue.path(),
+                issue.requirement(),
+                issue.remediation(),
             ));
         }
 
@@ -496,9 +552,7 @@ impl RunPrecheck {
             }
             PrecheckErrorKind::Probe(error) => PrecheckFailure::Probe(error),
         })?;
-        let permit = result
-            .execution_permit()
-            .map_err(PrecheckFailure::Blocked)?;
+        result.require_passed().map_err(PrecheckFailure::Blocked)?;
         let lock = registry
             .acquire(
                 owner,
@@ -508,6 +562,11 @@ impl RunPrecheck {
                 crate::ScopeLockError::Conflict(conflict) => PrecheckFailure::ScopeLocked(conflict),
                 crate::ScopeLockError::EmptyScopes => unreachable!("precheck always supplies both scopes"),
             })?;
+        let permit = ExecutionPermit {
+            source: result.source.clone(),
+            destination: result.destination.clone(),
+            lock_token: lock.token(),
+        };
         Ok(PrecheckLease {
             result,
             permit,
@@ -580,9 +639,67 @@ impl PrecheckProbe for LocalPrecheckProbe {
     fn required_space(
         &self,
         source: &Path,
-        _options: ValidatedSyncOptions,
+        destination: &Path,
+        options: ValidatedSyncOptions,
+        exclusions: &[String],
     ) -> Result<u64, PrecheckError> {
-        directory_size(source)
+        let transfer_bytes = directory_size(source, exclusions)?;
+        if options.deletion_method() == Some(DeletionMethod::Trash)
+            && !same_filesystem(source, destination)
+        {
+            Ok(transfer_bytes.saturating_mul(2))
+        } else {
+            Ok(transfer_bytes)
+        }
+    }
+
+    fn item_permission_issues(
+        &self,
+        source: &Path,
+        destination: &Path,
+        exclusions: &[String],
+        options: ValidatedSyncOptions,
+    ) -> Result<Vec<PermissionIssue>, PrecheckError> {
+        let mut issues = Vec::new();
+        for relative in collect_entries(source, exclusions)? {
+            let path = source.join(&relative);
+            let access = local_access(&path, false);
+            if !access.readable() {
+                issues.push(PermissionIssue::new(
+                    &path,
+                    "each included source item must be readable",
+                    "grant the current user read access to this item and retry the precheck",
+                ));
+            }
+            if options.safe_delete() && !access.removable() {
+                issues.push(PermissionIssue::new(
+                    &path,
+                    "Safe Delete requires removal access for each included source item",
+                    "grant removal access on the item's containing directory or exclude the item",
+                ));
+            }
+        }
+        if destination.exists() {
+            for relative in collect_entries(destination, &[])? {
+                let path = destination.join(&relative);
+                let access = local_access(&path, true);
+                if !access.writable() {
+                    issues.push(PermissionIssue::new(
+                        &path,
+                        "destination items that may be replaced must be writable",
+                        "grant the current user write access to this destination item or remove the conflict explicitly",
+                    ));
+                }
+                if options.destination_cleanup() && !access.removable() {
+                    issues.push(PermissionIssue::new(
+                        &path,
+                        "Destination Cleanup requires removal access for each destination item",
+                        "grant removal access on the item's containing directory or disable Destination Cleanup",
+                    ));
+                }
+            }
+        }
+        Ok(issues)
     }
 
     fn naming_conflicts(
@@ -598,6 +715,7 @@ impl PrecheckProbe for LocalPrecheckProbe {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DestinationNamingPolicy {
+    auto_detect: bool,
     case_insensitive: bool,
     unicode_normalization: bool,
     max_component_bytes: Option<usize>,
@@ -608,6 +726,7 @@ pub struct DestinationNamingPolicy {
 impl Default for DestinationNamingPolicy {
     fn default() -> Self {
         Self {
+            auto_detect: true,
             case_insensitive: false,
             unicode_normalization: false,
             max_component_bytes: None,
@@ -620,27 +739,32 @@ impl Default for DestinationNamingPolicy {
 impl DestinationNamingPolicy {
     pub fn case_insensitive() -> Self {
         Self {
+            auto_detect: false,
             case_insensitive: true,
             ..Self::default()
         }
     }
 
     pub fn with_unicode_normalization(mut self, enabled: bool) -> Self {
+        self.auto_detect = false;
         self.unicode_normalization = enabled;
         self
     }
 
     pub fn with_max_component_bytes(mut self, maximum: usize) -> Self {
+        self.auto_detect = false;
         self.max_component_bytes = Some(maximum);
         self
     }
 
     pub fn with_reserved_name(mut self, name: impl Into<String>) -> Self {
+        self.auto_detect = false;
         self.reserved_names.push(name.into());
         self
     }
 
     pub fn with_invalid_character(mut self, character: char) -> Self {
+        self.auto_detect = false;
         self.invalid_characters.push(character);
         self
     }
@@ -651,6 +775,11 @@ impl DestinationNamingPolicy {
         destination: &Path,
         exclusions: &[String],
     ) -> Result<Vec<NamingConflict>, PrecheckError> {
+        let policy = if self.auto_detect {
+            self.detect_for_destination(destination)
+        } else {
+            self.clone()
+        };
         let source_entries = collect_entries(source, exclusions)?;
         let destination_entries = if destination.exists() {
             collect_entries(destination, &[])?
@@ -661,12 +790,12 @@ impl DestinationNamingPolicy {
         let mut source_keys: BTreeMap<String, (PathBuf, PathBuf)> = BTreeMap::new();
 
         for relative in &source_entries {
-            if let Some(conflict) = self.validate_relative(relative, destination.join(relative)) {
+            if let Some(conflict) = policy.validate_relative(relative, destination.join(relative)) {
                 conflicts.push(conflict);
             }
-            let key = self.key(relative);
+            let key = policy.key(relative);
             if let Some((existing_relative, existing_destination)) = source_keys.get(&key) {
-                let rule = if self.unicode_normalization
+                let rule = if policy.unicode_normalization
                     && normalize_text(&relative.to_string_lossy(), false, true)
                         == normalize_text(&existing_relative.to_string_lossy(), false, true)
                 {
@@ -686,7 +815,7 @@ impl DestinationNamingPolicy {
         }
 
         for relative in destination_entries {
-            let key = self.key(&relative);
+            let key = policy.key(&relative);
             if let Some((source_relative, expected_destination)) = source_keys.get(&key) {
                 if relative != *source_relative {
                     conflicts.push(NamingConflict::new(
@@ -700,6 +829,38 @@ impl DestinationNamingPolicy {
         }
 
         Ok(conflicts)
+    }
+
+    fn detect_for_destination(&self, destination: &Path) -> Self {
+        let mut policy = self.clone();
+        policy.auto_detect = false;
+        policy.max_component_bytes.get_or_insert(255);
+        policy.unicode_normalization = cfg!(target_os = "macos");
+
+        #[cfg(unix)]
+        if let Some(filesystem_type) = filesystem_type(destination) {
+            const EXFAT_MAGIC: i64 = 0x2011_bab0;
+            const NTFS_MAGIC: i64 = 0x5346_544e;
+            const MSDOS_MAGIC: i64 = 0x4d44;
+            if matches!(filesystem_type, EXFAT_MAGIC | NTFS_MAGIC | MSDOS_MAGIC) {
+                policy.case_insensitive = true;
+                policy
+                    .reserved_names
+                    .extend(windows_reserved_names().into_iter().map(String::from));
+                policy.invalid_characters.extend(['<', '>', ':', '"', '/', '\\', '|', '?', '*']);
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            policy.case_insensitive = true;
+            policy
+                .reserved_names
+                .extend(windows_reserved_names().into_iter().map(String::from));
+            policy.invalid_characters.extend(['<', '>', ':', '"', '/', '\\', '|', '?', '*']);
+        }
+
+        policy
     }
 
     fn validate_relative(&self, relative: &Path, destination: PathBuf) -> Option<NamingConflict> {
@@ -763,6 +924,14 @@ fn normalize_text(value: &str, case_insensitive: bool, unicode_normalization: bo
     } else {
         normalized
     }
+}
+
+fn windows_reserved_names() -> [&'static str; 22] {
+    [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
+        "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
+        "LPT8", "LPT9",
+    ]
 }
 
 fn collect_entries(root: &Path, exclusions: &[String]) -> Result<Vec<PathBuf>, PrecheckError> {
@@ -845,11 +1014,7 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 }
 
 fn local_access(path: &Path, destination: bool) -> AccessSnapshot {
-    let target = if path.exists() {
-        path.to_path_buf()
-    } else {
-        path.parent().unwrap_or(path).to_path_buf()
-    };
+    let target = probe_target(path);
     let readable = if path.is_dir() {
         fs::read_dir(path).is_ok()
     } else {
@@ -866,7 +1031,15 @@ fn local_access(path: &Path, destination: bool) -> AccessSnapshot {
     )
 }
 
-fn directory_size(path: &Path) -> Result<u64, PrecheckError> {
+fn directory_size(path: &Path, exclusions: &[String]) -> Result<u64, PrecheckError> {
+    directory_size_recursive(path, Path::new(""), exclusions)
+}
+
+fn directory_size_recursive(
+    path: &Path,
+    relative: &Path,
+    exclusions: &[String],
+) -> Result<u64, PrecheckError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| PrecheckError::new(path, "inspect source", error.to_string()))?;
     if metadata.is_file() {
@@ -880,17 +1053,72 @@ fn directory_size(path: &Path) -> Result<u64, PrecheckError> {
         .map_err(|error| PrecheckError::new(path, "read source", error.to_string()))?
     {
         let entry = entry.map_err(|error| PrecheckError::new(path, "read source", error.to_string()))?;
-        size = size.saturating_add(directory_size(&entry.path())?);
+        let child_relative = if relative.as_os_str().is_empty() {
+            PathBuf::from(entry.file_name())
+        } else {
+            relative.join(entry.file_name())
+        };
+        let file_type = entry
+            .file_type()
+            .map_err(|error| PrecheckError::new(&child_relative, "inspect source", error.to_string()))?;
+        if is_excluded(&child_relative, file_type.is_dir(), exclusions) {
+            continue;
+        }
+        size = size.saturating_add(directory_size_recursive(
+            &entry.path(),
+            &child_relative,
+            exclusions,
+        )?);
     }
     Ok(size)
 }
 
+fn same_filesystem(left: &Path, right: &Path) -> bool {
+    matches!((device_id(left), device_id(right)), (Some(left), Some(right)) if left == right)
+}
+
+#[cfg(unix)]
+fn filesystem_type(path: &Path) -> Option<i64> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let target = probe_target(path);
+    let path = CString::new(target.as_os_str().as_bytes()).ok()?;
+    let mut statistics = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is a valid NUL-terminated path and `statistics` is
+    // writable storage for the operating-system result.
+    let result = unsafe { libc::statfs(path.as_ptr(), statistics.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: statfs initialized the structure after returning success.
+    Some(unsafe { statistics.assume_init() }.f_type as i64)
+}
+
+fn device_id(path: &Path) -> Option<u64> {
+    let target = probe_target(path);
+    #[cfg(unix)]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let path = CString::new(target.as_os_str().as_bytes()).ok()?;
+        let mut statistics = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `path` is a valid NUL-terminated path and `statistics` is
+        // writable storage for the operating-system result.
+        let result = unsafe { libc::stat(path.as_ptr(), statistics.as_mut_ptr()) };
+        if result != 0 {
+            return None;
+        }
+        // SAFETY: stat initialized the structure after returning success.
+        Some(unsafe { statistics.assume_init() }.st_dev as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        None
+    }
+}
+
 fn available_space(path: &Path) -> Result<u64, PrecheckError> {
-    let target = if path.exists() {
-        path.to_path_buf()
-    } else {
-        path.parent().unwrap_or(path).to_path_buf()
-    };
+    let target = probe_target(path);
     #[cfg(unix)]
     {
         use std::{ffi::CString, os::unix::ffi::OsStrExt};
@@ -922,6 +1150,14 @@ fn available_space(path: &Path) -> Result<u64, PrecheckError> {
 enum AccessMode {
     Write,
     WriteExec,
+}
+
+fn probe_target(path: &Path) -> PathBuf {
+    if path.exists() {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(path).to_path_buf()
+    }
 }
 
 fn has_access(path: &Path, mode: AccessMode) -> bool {
