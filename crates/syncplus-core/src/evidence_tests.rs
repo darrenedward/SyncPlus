@@ -1,9 +1,11 @@
 use std::{fs, path::PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rusqlite::{params, Connection};
+
 use crate::{
     ActionOutcome, ActionReason, AuthorizationSnapshot, DeletionMethod, FileIdentity, ItemType,
-    JournalEvent, OneWaySource, Peer, PeerSide, PlanActionKind, PreActionState, RecoveryEvidence,
+    JournalEvent, OneWaySource, Peer, PeerSide, PlanActionKind, PlanRecord, PreActionState, RecoveryEvidence,
     RecoveryResolution, RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle, RunReportStatus,
     RunSnapshot, SyncOptions, SyncProfile, SyncRun,
 };
@@ -350,6 +352,193 @@ fn action_settlement_requires_start_and_preserves_plan_order() {
         .append_event(RunId::new(9), JournalEvent::Completed { action_id: 2 })
         .expect_err("a later action cannot settle before the first action");
     assert!(matches!(error, crate::StorageError::InvalidEvent(_)));
+    let error = store
+        .append_event(RunId::new(9), JournalEvent::Started { action_id: 2 })
+        .expect_err("a later action cannot start before the first action");
+    assert!(matches!(error, crate::StorageError::InvalidEvent(_)));
+}
+
+#[test]
+fn safe_delete_actions_cannot_settle_through_generic_completed_event() {
+    let path = TestDatabase::new();
+    let safe_profile = profile().with_options(SyncOptions {
+        safe_delete: true,
+        destination_cleanup: false,
+        deletion_method: Some(DeletionMethod::Trash),
+    });
+    let run_id = RunId::new(11);
+    let snapshot = RunSnapshot::from_profile(
+        run_id,
+        &safe_profile,
+        AuthorizationSnapshot::default(),
+    )
+    .expect("safe-delete snapshot");
+    let mut store = RunEvidenceStore::open(path.path()).expect("open evidence store");
+    store.begin_run(&snapshot).expect("persist snapshot");
+    store
+        .append_event(
+            run_id,
+            JournalEvent::Planned {
+                action: PlanRecord::new(
+                    1,
+                    PathBuf::from("source.txt"),
+                    PlanActionKind::RemoveSourceAfterVerification,
+                    PeerSide::PeerA,
+                    Some(1),
+                    PreActionState::new(ItemType::RegularFile, 1, None, None, None),
+                ),
+            },
+        )
+        .expect("persist removal plan");
+    store
+        .append_event(run_id, JournalEvent::Started { action_id: 1 })
+        .expect("persist removal start");
+
+    let error = store
+        .append_event(run_id, JournalEvent::Completed { action_id: 1 })
+        .expect_err("generic completion must not authorize source removal");
+    assert!(matches!(error, crate::StorageError::InvalidEvent(_)));
+}
+
+#[test]
+fn journal_replay_rejects_corrupt_generic_completion_for_safe_delete() {
+    let path = TestDatabase::new();
+    let safe_profile = profile().with_options(SyncOptions {
+        safe_delete: true,
+        destination_cleanup: false,
+        deletion_method: Some(DeletionMethod::Trash),
+    });
+    let run_id = RunId::new(12);
+    let snapshot = RunSnapshot::from_profile(
+        run_id,
+        &safe_profile,
+        AuthorizationSnapshot::default(),
+    )
+    .expect("safe-delete snapshot");
+    {
+        let mut store = RunEvidenceStore::open(path.path()).expect("open evidence store");
+        store.begin_run(&snapshot).expect("persist snapshot");
+        store
+            .append_event(
+                run_id,
+                JournalEvent::Planned {
+                    action: PlanRecord::new(
+                        1,
+                        PathBuf::from("source.txt"),
+                        PlanActionKind::RemoveSourceAfterVerification,
+                        PeerSide::PeerA,
+                        Some(1),
+                        PreActionState::new(ItemType::RegularFile, 1, None, None, None),
+                    ),
+                },
+            )
+            .expect("persist removal plan");
+        store
+            .append_event(run_id, JournalEvent::Started { action_id: 1 })
+            .expect("persist removal start");
+        store
+            .append_event(
+                run_id,
+                JournalEvent::Unresolved {
+                    action_id: 1,
+                    reason: ActionReason::PermissionDenied,
+                },
+            )
+            .expect("persist unresolved boundary");
+    }
+    let connection = Connection::open(path.path()).expect("open database for corruption fixture");
+    connection
+        .execute(
+            "UPDATE action_events SET phase = 'completed', reason = NULL
+             WHERE run_id = ?1 AND action_id = 1 AND phase = 'unresolved'",
+            params![run_id.value()],
+        )
+        .expect("corrupt completion phase");
+
+    let store = RunEvidenceStore::open(path.path()).expect("reopen evidence store");
+    let error = store
+        .load_journal(run_id)
+        .expect_err("corrupt Safe Delete completion must not replay as success");
+    assert!(matches!(error, crate::StorageError::CorruptEvidence(_)));
+}
+
+#[test]
+fn journal_replay_rejects_corrupt_recovery_completion_for_safe_delete() {
+    let path = TestDatabase::new();
+    let safe_profile = profile().with_options(SyncOptions {
+        safe_delete: true,
+        destination_cleanup: false,
+        deletion_method: Some(DeletionMethod::Trash),
+    });
+    let run_id = RunId::new(13);
+    let snapshot = RunSnapshot::from_profile(
+        run_id,
+        &safe_profile,
+        AuthorizationSnapshot::default(),
+    )
+    .expect("safe-delete snapshot");
+    {
+        let mut store = RunEvidenceStore::open(path.path()).expect("open evidence store");
+        store.begin_run(&snapshot).expect("persist snapshot");
+        store
+            .append_event(
+                run_id,
+                JournalEvent::Planned {
+                    action: PlanRecord::new(
+                        1,
+                        PathBuf::from("source.txt"),
+                        PlanActionKind::RemoveSourceAfterVerification,
+                        PeerSide::PeerA,
+                        Some(42),
+                        PreActionState::new(ItemType::RegularFile, 42, None, None, None),
+                    ),
+                },
+            )
+            .expect("persist removal plan");
+        store
+            .append_event(run_id, JournalEvent::Started { action_id: 1 })
+            .expect("persist removal start");
+        store
+            .append_event(
+                run_id,
+                JournalEvent::RecoveryReview {
+                    action_id: 1,
+                    reason: ActionReason::InterruptedBoundary,
+                    evidence: recovery_evidence(),
+                },
+            )
+            .expect("persist recovery review");
+        store
+            .append_event(
+                run_id,
+                JournalEvent::RecoveryResolved {
+                    action_id: 1,
+                    resolution: RecoveryResolution::Unresolved(ActionReason::FilesystemUncertain),
+                },
+            )
+            .expect("persist unresolved recovery resolution");
+    }
+    let connection = Connection::open(path.path()).expect("open database for corruption fixture");
+    connection
+        .execute(
+            "UPDATE action_events SET resolution = 'completed',
+                    recovery_observed_at_unix_nanos = 100,
+                    recovery_target = ?1,
+                    recovery_source_present = 1,
+                    recovery_destination_present = 1,
+                    recovery_present = 0,
+                    recovery_source_size = 42,
+                    recovery_destination_size = 42
+             WHERE run_id = ?2 AND action_id = 1 AND phase = 'recovery_resolved'",
+            params![b"/recovery/source.txt".as_slice(), run_id.value()],
+        )
+        .expect("corrupt recovery resolution");
+
+    let store = RunEvidenceStore::open(path.path()).expect("reopen evidence store");
+    let error = store
+        .load_journal(run_id)
+        .expect_err("corrupt Safe Delete recovery completion must not replay as success");
+    assert!(matches!(error, crate::StorageError::CorruptEvidence(_)));
 }
 
 #[test]

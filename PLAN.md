@@ -1,6 +1,6 @@
 # SyncPlus — a safety-first desktop synchronization app
 
-> Status: implementation complete pending review · 2026-08-30 · controlled transfer, bounded parser evidence, process-group supervision, independent content proof, metadata checks, and verified replacement are implemented for issue #13; Safe Delete and end-to-end workflow milestones remain pending
+> Status: implementation complete pending review · 2026-08-30 · controlled transfer and the per-item Safe Delete proof boundary are implemented for issues #13–#14; cancellation/resume and end-to-end Completion Reconciliation milestones remain pending
 
 ## Product goal
 

@@ -294,12 +294,49 @@ pub enum RecoveryResolution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalResult {
+    deletion_method: DeletionMethod,
+    evidence: RecoveryEvidence,
+}
+
+impl RemovalResult {
+    pub(crate) fn new(deletion_method: DeletionMethod, evidence: RecoveryEvidence) -> Self {
+        Self {
+            deletion_method,
+            evidence,
+        }
+    }
+
+    pub const fn deletion_method(&self) -> DeletionMethod {
+        self.deletion_method
+    }
+
+    pub fn evidence(&self) -> &RecoveryEvidence {
+        &self.evidence
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JournalEvent {
     Planned { action: PlanRecord },
     Started { action_id: ActionId },
     Progress {
         action_id: ActionId,
         completed_bytes: u64,
+    },
+    ProofBoundary {
+        action_id: ActionId,
+        deletion_method: DeletionMethod,
+        evidence: RecoveryEvidence,
+        metadata_verified: bool,
+    },
+    RemovalStarted {
+        action_id: ActionId,
+        deletion_method: DeletionMethod,
+    },
+    RemovalCompleted {
+        action_id: ActionId,
+        result: RemovalResult,
     },
     Completed { action_id: ActionId },
     Failed {
@@ -337,9 +374,12 @@ pub enum ActionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionJournalEntry {
     plan: PlanRecord,
+    last_phase: String,
     started: bool,
     progress_bytes: Vec<u64>,
     outcome: ActionOutcome,
+    proof_boundary: Option<RecoveryEvidence>,
+    removal_result: Option<RemovalResult>,
     recovery_evidence: Option<RecoveryEvidence>,
     recovery_resolution_evidence: Option<RecoveryEvidence>,
 }
@@ -363,6 +403,14 @@ impl ActionJournalEntry {
 
     pub fn recovery_evidence(&self) -> Option<&RecoveryEvidence> {
         self.recovery_evidence.as_ref()
+    }
+
+    pub fn proof_boundary(&self) -> Option<&RecoveryEvidence> {
+        self.proof_boundary.as_ref()
+    }
+
+    pub fn removal_result(&self) -> Option<&RemovalResult> {
+        self.removal_result.as_ref()
     }
 
     pub fn recovery_resolution_evidence(&self) -> Option<&RecoveryEvidence> {
@@ -563,7 +611,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 2 {
+        if version > 3 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -642,6 +690,20 @@ impl RunEvidenceStore {
                 ",
             )?;
             transaction.pragma_update(None, "user_version", 2)?;
+            transaction.commit()?;
+            version = 2;
+        }
+        if version == 2 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                ALTER TABLE action_events ADD COLUMN proof_destination_size INTEGER;
+                ALTER TABLE action_events ADD COLUMN proof_destination_sha256 BLOB;
+                ALTER TABLE action_events ADD COLUMN proof_metadata_verified INTEGER;
+                ALTER TABLE action_events ADD COLUMN deletion_method TEXT;
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 3)?;
             transaction.commit()?;
         }
         verify_integrity(&connection)?;
@@ -812,7 +874,30 @@ impl RunEvidenceStore {
                 |row| row.get(0),
             )
             .optional()?;
-        validate_event(&event, has_plan, current_phase.as_deref())?;
+        let planned_operation: Option<String> = transaction
+            .query_row(
+                "SELECT operation FROM action_events
+                 WHERE run_id = ?1 AND action_id = ?2 AND phase = 'planned'",
+                params![run_id.value(), action_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let configured_deletion_method: Option<String> = transaction
+            .query_row(
+                "SELECT deletion_method FROM run_snapshots WHERE run_id = ?1",
+                params![run_id.value()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        validate_event(
+            &event,
+            has_plan,
+            current_phase.as_deref(),
+            planned_operation.as_deref(),
+            configured_deletion_method.as_deref(),
+        )?;
+        validate_removal_result_against_proof(&transaction, run_id, action_id, &event)?;
         validate_action_order(&transaction, run_id, action_id, &event)?;
         validate_recovery_resolution(&transaction, run_id, action_id, &event)?;
         let sequence = transaction
@@ -831,8 +916,10 @@ impl RunEvidenceStore {
                 progress_bytes, reason, recovery_observed_at_unix_nanos,
                 recovery_target, recovery_source_present, recovery_destination_present,
                 recovery_present, recovery_source_size, recovery_destination_size,
-                recovery_source_sha256, recovery_destination_sha256, resolution
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                recovery_source_sha256, recovery_destination_sha256, resolution,
+                proof_destination_size, proof_destination_sha256,
+                proof_metadata_verified, deletion_method
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
             params![
                 run_id.value(),
                 action_id,
@@ -860,6 +947,10 @@ impl RunEvidenceStore {
                 fields.recovery_source_sha256,
                 fields.recovery_destination_sha256,
                 fields.resolution,
+                fields.proof_destination_size,
+                fields.proof_destination_sha256,
+                fields.proof_metadata_verified,
+                fields.deletion_method,
             ],
         )?;
         transaction.commit()?;
@@ -867,6 +958,15 @@ impl RunEvidenceStore {
     }
 
     pub fn load_journal(&self, run_id: RunId) -> Result<Vec<ActionJournalEntry>, StorageError> {
+        let configured_deletion_method: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT deletion_method FROM run_snapshots WHERE run_id = ?1",
+                params![run_id.value()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
         let mut statement = self.connection.prepare(
             "SELECT action_id, sequence, phase, relative_path, operation,
                     affected_side, planned_bytes, pre_item_type, pre_size,
@@ -874,7 +974,9 @@ impl RunEvidenceStore {
                     progress_bytes, reason, recovery_observed_at_unix_nanos,
                     recovery_target, recovery_source_present, recovery_destination_present,
                     recovery_present, recovery_source_size, recovery_destination_size,
-                    recovery_source_sha256, recovery_destination_sha256, resolution
+                    recovery_source_sha256, recovery_destination_sha256, resolution,
+                    proof_destination_size, proof_destination_sha256,
+                    proof_metadata_verified, deletion_method
              FROM action_events WHERE run_id = ?1 ORDER BY action_id, sequence",
         )?;
         let rows = statement
@@ -904,12 +1006,16 @@ impl RunEvidenceStore {
                     recovery_source_sha256: row.get(22)?,
                     recovery_destination_sha256: row.get(23)?,
                     resolution: row.get(24)?,
+                    proof_destination_size: row.get(25)?,
+                    proof_destination_sha256: row.get(26)?,
+                    proof_metadata_verified: row.get(27)?,
+                    deletion_method: row.get(28)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         let mut entries = BTreeMap::new();
         for row in rows {
-            apply_stored_event(&mut entries, row)?;
+            apply_stored_event(&mut entries, row, configured_deletion_method.as_deref())?;
         }
         Ok(entries.into_values().collect())
     }
@@ -1005,6 +1111,10 @@ struct EventFields {
     recovery_source_sha256: Option<Vec<u8>>,
     recovery_destination_sha256: Option<Vec<u8>>,
     resolution: Option<&'static str>,
+    proof_destination_size: Option<i64>,
+    proof_destination_sha256: Option<Vec<u8>>,
+    proof_metadata_verified: Option<i64>,
+    deletion_method: Option<&'static str>,
 }
 
 impl EventFields {
@@ -1033,6 +1143,10 @@ impl EventFields {
             recovery_source_sha256: None,
             recovery_destination_sha256: None,
             resolution: None,
+            proof_destination_size: None,
+            proof_destination_sha256: None,
+            proof_metadata_verified: None,
+            deletion_method: None,
         };
         match event {
             JournalEvent::Planned { action } => Self {
@@ -1059,6 +1173,10 @@ impl EventFields {
                 recovery_source_sha256: None,
                 recovery_destination_sha256: None,
                 resolution: None,
+                proof_destination_size: None,
+                proof_destination_sha256: None,
+                proof_metadata_verified: None,
+                deletion_method: None,
             },
             JournalEvent::Started { .. } => {
                 let mut fields = empty();
@@ -1071,6 +1189,37 @@ impl EventFields {
                 let mut fields = empty();
                 fields.phase = "progress";
                 fields.progress_bytes = Some(*completed_bytes as i64);
+                fields
+            }
+            JournalEvent::ProofBoundary {
+                deletion_method,
+                evidence,
+                metadata_verified,
+                ..
+            } => {
+                let mut fields = empty();
+                fields.phase = "proof_boundary";
+                fields.deletion_method = Some(encode_deletion_method(*deletion_method));
+                fields.proof_destination_size = evidence.destination_size.map(|size| size as i64);
+                fields.proof_destination_sha256 =
+                    evidence.destination_sha256.map(|hash| hash.to_vec());
+                fields.proof_metadata_verified = Some(bool_to_int(*metadata_verified));
+                set_recovery_fields(&mut fields, evidence);
+                fields
+            }
+            JournalEvent::RemovalStarted {
+                deletion_method, ..
+            } => {
+                let mut fields = empty();
+                fields.phase = "removal_started";
+                fields.deletion_method = Some(encode_deletion_method(*deletion_method));
+                fields
+            }
+            JournalEvent::RemovalCompleted { result, .. } => {
+                let mut fields = empty();
+                fields.phase = "removal_completed";
+                fields.deletion_method = Some(encode_deletion_method(result.deletion_method()));
+                set_recovery_fields(&mut fields, result.evidence());
                 fields
             }
             JournalEvent::Completed { .. } => {
@@ -1152,6 +1301,10 @@ fn terminal_fields(phase: &'static str, reason: ActionReason) -> EventFields {
         recovery_source_sha256: None,
         recovery_destination_sha256: None,
         resolution: None,
+        proof_destination_size: None,
+        proof_destination_sha256: None,
+        proof_metadata_verified: None,
+        deletion_method: None,
     }
 }
 
@@ -1180,11 +1333,16 @@ struct StoredEvent {
     recovery_source_sha256: Option<Vec<u8>>,
     recovery_destination_sha256: Option<Vec<u8>>,
     resolution: Option<String>,
+    proof_destination_size: Option<u64>,
+    proof_destination_sha256: Option<Vec<u8>>,
+    proof_metadata_verified: Option<bool>,
+    deletion_method: Option<String>,
 }
 
 fn apply_stored_event(
     entries: &mut BTreeMap<ActionId, ActionJournalEntry>,
     row: StoredEvent,
+    configured_deletion_method: Option<&str>,
 ) -> Result<(), StorageError> {
     if row.phase == "planned" {
         let relative_path = blob_to_path(
@@ -1246,9 +1404,12 @@ fn apply_stored_event(
                         sha256,
                     ),
                 ),
+                last_phase: "planned".to_owned(),
                 started: false,
                 progress_bytes: Vec::new(),
                 outcome: ActionOutcome::InProgress,
+                proof_boundary: None,
+                removal_result: None,
                 recovery_evidence: None,
                 recovery_resolution_evidence: None,
             },
@@ -1259,6 +1420,7 @@ fn apply_stored_event(
     let entry = entries.get_mut(&row.action_id).ok_or_else(|| {
         StorageError::CorruptEvidence("non-planned boundary has no planned action".to_owned())
     })?;
+    validate_replayed_transition(entry, &row.phase)?;
     match row.phase.as_str() {
         "started" => entry.started = true,
         "progress" => entry
@@ -1266,7 +1428,84 @@ fn apply_stored_event(
             .push(row.progress_bytes.ok_or_else(|| {
                 StorageError::CorruptEvidence("progress boundary has no byte count".to_owned())
             })?),
-        "completed" => entry.outcome = ActionOutcome::Completed,
+        "proof_boundary" => {
+            let method = row.deletion_method.as_deref().ok_or_else(|| {
+                StorageError::CorruptEvidence("proof boundary has no deletion method".to_owned())
+            })?;
+            let deletion_method = decode_deletion_method(method)?;
+            validate_replayed_deletion_method(entry, deletion_method, configured_deletion_method)?;
+            if row.proof_metadata_verified != Some(true)
+                || row.proof_destination_size.is_none()
+                || row.proof_destination_sha256.is_none()
+            {
+                return Err(StorageError::CorruptEvidence(
+                    "proof boundary is missing metadata or destination content evidence"
+                        .to_owned(),
+                ));
+            }
+            let evidence = decode_recovery_evidence(&row)?;
+            let proof_destination_size = row.proof_destination_size.ok_or_else(|| {
+                StorageError::CorruptEvidence("proof boundary has no destination size".to_owned())
+            })?;
+            let proof_destination_sha256 =
+                decode_hash(row.proof_destination_sha256.as_deref())?.ok_or_else(|| {
+                    StorageError::CorruptEvidence(
+                        "proof boundary has no destination SHA-256".to_owned(),
+                    )
+                })?;
+            if !evidence.source_present()
+                || !evidence.destination_present()
+                || evidence.recovery_present()
+                || evidence.source_size().is_none()
+                || evidence.source_sha256().is_none()
+                || evidence.destination_size() != Some(proof_destination_size)
+                || evidence.destination_sha256() != Some(&proof_destination_sha256)
+            {
+                return Err(StorageError::CorruptEvidence(
+                    "proof boundary has incomplete source or destination evidence".to_owned(),
+                ));
+            }
+            entry.proof_boundary = Some(evidence);
+            entry.outcome = ActionOutcome::RecoveryReview(ActionReason::InterruptedBoundary);
+        }
+        "removal_started" => {
+            let method = row.deletion_method.as_deref().ok_or_else(|| {
+                StorageError::CorruptEvidence("removal start has no deletion method".to_owned())
+            })?;
+            let deletion_method = decode_deletion_method(method)?;
+            validate_replayed_deletion_method(entry, deletion_method, configured_deletion_method)?;
+            entry.outcome = ActionOutcome::RecoveryReview(ActionReason::InterruptedBoundary);
+        }
+        "removal_completed" => {
+            let method = row.deletion_method.as_deref().ok_or_else(|| {
+                StorageError::CorruptEvidence(
+                    "removal result has no deletion method".to_owned(),
+                )
+            })?;
+            let evidence = decode_recovery_evidence(&row)?;
+            let deletion_method = decode_deletion_method(method)?;
+            validate_replayed_deletion_method(entry, deletion_method, configured_deletion_method)?;
+            validate_removal_evidence(deletion_method, &evidence)?;
+            if let Some(proof) = entry.proof_boundary.as_ref()
+                && (proof.destination_size() != evidence.destination_size()
+                    || proof.destination_sha256() != evidence.destination_sha256())
+            {
+                return Err(StorageError::CorruptEvidence(
+                    "removal result does not match the persisted proof boundary".to_owned(),
+                ));
+            }
+            entry.removal_result = Some(RemovalResult::new(deletion_method, evidence));
+            entry.outcome = ActionOutcome::Completed;
+        }
+        "completed" => {
+            if entry.plan.operation() == PlanActionKind::RemoveSourceAfterVerification {
+                return Err(StorageError::CorruptEvidence(
+                    "Safe Delete action has generic completion without a removal result"
+                        .to_owned(),
+                ));
+            }
+            entry.outcome = ActionOutcome::Completed;
+        }
         "failed" => {
             entry.outcome = ActionOutcome::Failed(decode_reason(row.reason.as_deref().ok_or_else(
                 || StorageError::CorruptEvidence("failed boundary has no reason".to_owned()),
@@ -1298,6 +1537,11 @@ fn apply_stored_event(
             &row,
         )? {
             RecoveryResolution::Completed { evidence } => {
+                if entry.plan.operation() == PlanActionKind::RemoveSourceAfterVerification {
+                    return Err(StorageError::CorruptEvidence(
+                        "Safe Delete action has an unverified recovery completion".to_owned(),
+                    ));
+                }
                 if let Some(review) = entry.recovery_evidence.as_ref() {
                     if !evidence.is_newer_than(review) {
                         return Err(StorageError::CorruptEvidence(
@@ -1318,6 +1562,92 @@ fn apply_stored_event(
                 "unknown journal phase {phase}"
             )))
         }
+    }
+    entry.last_phase = row.phase;
+    Ok(())
+}
+
+fn validate_replayed_transition(
+    entry: &ActionJournalEntry,
+    next_phase: &str,
+) -> Result<(), StorageError> {
+    let allowed = match next_phase {
+        "started" => entry.last_phase == "planned",
+        "progress" => matches!(entry.last_phase.as_str(), "started" | "progress"),
+        "proof_boundary" => {
+            matches!(entry.last_phase.as_str(), "started" | "progress")
+                && entry.proof_boundary.is_none()
+        }
+        "removal_started" => {
+            entry.last_phase == "proof_boundary" && entry.proof_boundary.is_some()
+        }
+        "removal_completed" => {
+            entry.last_phase == "removal_started"
+                && entry.proof_boundary.is_some()
+                && entry.removal_result.is_none()
+        }
+        "recovery_review" => {
+            matches!(
+                entry.last_phase.as_str(),
+                "started" | "progress" | "proof_boundary" | "removal_started"
+            ) && entry.recovery_evidence.is_none()
+        }
+        "recovery_resolved" => {
+            entry.last_phase == "recovery_review"
+                && entry.recovery_evidence.is_some()
+                && entry.recovery_resolution_evidence.is_none()
+        }
+        "completed" | "failed" | "cancelled" | "deferred" | "unresolved" => matches!(
+            entry.last_phase.as_str(),
+            "started" | "progress" | "proof_boundary" | "removal_started"
+        ),
+        _ => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(StorageError::CorruptEvidence(format!(
+            "{next_phase} cannot follow {} during journal replay",
+            entry.last_phase
+        )))
+    }
+}
+
+fn validate_removal_evidence(
+    deletion_method: DeletionMethod,
+    evidence: &RecoveryEvidence,
+) -> Result<(), StorageError> {
+    let valid_recovery = match deletion_method {
+        DeletionMethod::Trash => evidence.recovery_present() && evidence.recovery_target().is_some(),
+        DeletionMethod::PermanentRemoval => {
+            !evidence.recovery_present() && evidence.recovery_target().is_none()
+        }
+    };
+    if evidence.source_present()
+        || !evidence.destination_present()
+        || evidence.destination_size().is_none()
+        || evidence.destination_sha256().is_none()
+        || !valid_recovery
+    {
+        return Err(StorageError::CorruptEvidence(
+            "removal result does not prove source absence and the selected recovery outcome"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_replayed_deletion_method(
+    entry: &ActionJournalEntry,
+    deletion_method: DeletionMethod,
+    configured_deletion_method: Option<&str>,
+) -> Result<(), StorageError> {
+    if entry.plan.operation() != PlanActionKind::RemoveSourceAfterVerification
+        || configured_deletion_method != Some(encode_deletion_method(deletion_method))
+    {
+        return Err(StorageError::CorruptEvidence(
+            "replayed removal boundary does not match the frozen Safe Delete method".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -1371,11 +1701,107 @@ fn validate_event(
     event: &JournalEvent,
     has_plan: bool,
     current_phase: Option<&str>,
+    planned_operation: Option<&str>,
+    configured_deletion_method: Option<&str>,
 ) -> Result<(), StorageError> {
+    if let JournalEvent::ProofBoundary {
+        evidence,
+        metadata_verified,
+        ..
+    } = event
+    {
+        if !metadata_verified
+            || !evidence.source_present()
+            || !evidence.destination_present()
+            || evidence.recovery_present()
+            || evidence.destination_size().is_none()
+            || evidence.destination_sha256().is_none()
+            || evidence.source_size().is_none()
+            || evidence.source_sha256().is_none()
+        {
+            return Err(StorageError::InvalidEvent(
+                "proof boundary is missing independent destination or metadata evidence".to_owned(),
+            ));
+        }
+    }
+    if matches!(event, JournalEvent::Completed { .. })
+        && planned_operation == Some("remove_source_after_verification")
+    {
+        return Err(StorageError::InvalidEvent(
+            "source-removal actions must settle through RemovalCompleted".to_owned(),
+        ));
+    }
+    if matches!(
+        event,
+        JournalEvent::RecoveryResolved {
+            resolution: RecoveryResolution::Completed { .. },
+            ..
+        }
+    ) && planned_operation
+        == Some("remove_source_after_verification")
+    {
+        return Err(StorageError::InvalidEvent(
+            "Safe Delete recovery cannot be marked completed without a RemovalCompleted result"
+                .to_owned(),
+        ));
+    }
+    let event_method = match event {
+        JournalEvent::ProofBoundary {
+            deletion_method, ..
+        }
+        | JournalEvent::RemovalStarted {
+            deletion_method, ..
+        } => Some(*deletion_method),
+        JournalEvent::RemovalCompleted { result, .. } => Some(result.deletion_method()),
+        JournalEvent::Planned { .. }
+        | JournalEvent::Started { .. }
+        | JournalEvent::Progress { .. }
+        | JournalEvent::Completed { .. }
+        | JournalEvent::Failed { .. }
+        | JournalEvent::Cancelled { .. }
+        | JournalEvent::Deferred { .. }
+        | JournalEvent::Unresolved { .. }
+        | JournalEvent::RecoveryReview { .. }
+        | JournalEvent::RecoveryResolved { .. } => None,
+    };
+    if let Some(event_method) = event_method {
+        if planned_operation != Some("remove_source_after_verification")
+            || configured_deletion_method != Some(encode_deletion_method(event_method))
+        {
+            return Err(StorageError::InvalidEvent(
+                "removal boundary does not match the frozen Safe Delete method".to_owned(),
+            ));
+        }
+    }
+    if let JournalEvent::RemovalCompleted { result, .. } = event {
+        let evidence = result.evidence();
+        let valid_recovery = match result.deletion_method() {
+            DeletionMethod::Trash => {
+                evidence.recovery_present() && evidence.recovery_target().is_some()
+            }
+            DeletionMethod::PermanentRemoval => {
+                !evidence.recovery_present() && evidence.recovery_target().is_none()
+            }
+        };
+        if evidence.source_present()
+            || !evidence.destination_present()
+            || evidence.destination_size().is_none()
+            || evidence.destination_sha256().is_none()
+            || !valid_recovery
+        {
+            return Err(StorageError::InvalidEvent(
+                "removal result does not prove source absence and the selected recovery outcome"
+                    .to_owned(),
+            ));
+        }
+    }
     let phase = match event {
         JournalEvent::Planned { .. } => "planned",
         JournalEvent::Started { .. } => "started",
         JournalEvent::Progress { .. } => "progress",
+        JournalEvent::ProofBoundary { .. } => "proof_boundary",
+        JournalEvent::RemovalStarted { .. } => "removal_started",
+        JournalEvent::RemovalCompleted { .. } => "removal_completed",
         JournalEvent::Completed { .. } => "completed",
         JournalEvent::Failed { .. } => "failed",
         JournalEvent::Cancelled { .. } => "cancelled",
@@ -1402,7 +1828,17 @@ fn validate_event(
             "an action must be planned before its next boundary".to_owned(),
         ));
     }
-    if matches!(current_phase, Some("completed" | "failed" | "cancelled" | "deferred" | "unresolved")) {
+    if matches!(
+        current_phase,
+        Some(
+            "completed"
+                | "failed"
+                | "cancelled"
+                | "deferred"
+                | "unresolved"
+                | "removal_completed"
+        )
+    ) {
         return Err(StorageError::InvalidEvent(
             "a settled action cannot receive another boundary".to_owned(),
         ));
@@ -1410,9 +1846,26 @@ fn validate_event(
     match phase {
         "started" if current_phase == Some("planned") => Ok(()),
         "progress" if matches!(current_phase, Some("started" | "progress")) => Ok(()),
+        "proof_boundary" if matches!(current_phase, Some("started" | "progress")) => Ok(()),
+        "removal_started" if current_phase == Some("proof_boundary") => Ok(()),
+        "removal_completed" if current_phase == Some("removal_started") => Ok(()),
         "recovery_resolved" if current_phase == Some("recovery_review") => Ok(()),
-        "completed" | "failed" | "cancelled" | "deferred" | "unresolved" | "recovery_review"
-            if matches!(current_phase, Some("started" | "progress")) => Ok(()),
+        "completed" | "failed" | "cancelled" | "deferred" | "unresolved"
+            if matches!(
+                current_phase,
+                Some("started" | "progress" | "proof_boundary" | "removal_started")
+            ) =>
+        {
+            Ok(())
+        }
+        "recovery_review"
+            if matches!(
+                current_phase,
+                Some("started" | "progress" | "proof_boundary" | "removal_started")
+            ) =>
+        {
+            Ok(())
+        }
         _ => Err(StorageError::InvalidEvent(format!(
             "{phase} cannot follow {current_phase:?}"
         ))),
@@ -1425,7 +1878,7 @@ fn validate_action_order(
     action_id: ActionId,
     event: &JournalEvent,
 ) -> Result<(), StorageError> {
-    if !event_settles_action(event) {
+    if !event_advances_action(event) {
         return Ok(());
     }
 
@@ -1493,22 +1946,60 @@ fn validate_recovery_resolution(
     Ok(())
 }
 
-fn event_settles_action(event: &JournalEvent) -> bool {
-    matches!(
-        event,
-        JournalEvent::Completed { .. }
-            | JournalEvent::Failed { .. }
-            | JournalEvent::Cancelled { .. }
-            | JournalEvent::Deferred { .. }
-            | JournalEvent::Unresolved { .. }
-            | JournalEvent::RecoveryResolved { .. }
-    )
+fn validate_removal_result_against_proof(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: RunId,
+    action_id: ActionId,
+    event: &JournalEvent,
+) -> Result<(), StorageError> {
+    let JournalEvent::RemovalCompleted { result, .. } = event else {
+        return Ok(());
+    };
+    let proof: Option<(Option<i64>, Option<Vec<u8>>)> = transaction
+        .query_row(
+            "SELECT proof_destination_size, proof_destination_sha256
+             FROM action_events
+             WHERE run_id = ?1 AND action_id = ?2 AND phase = 'proof_boundary'
+             ORDER BY sequence DESC LIMIT 1",
+            params![run_id.value(), action_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((proof_size, proof_sha256)) = proof else {
+        return Err(StorageError::InvalidEvent(
+            "removal result requires a persisted proof boundary".to_owned(),
+        ));
+    };
+    let proof_size = proof_size
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| StorageError::InvalidEvent("proof boundary has no destination size".to_owned()))?;
+    let proof_sha256 = decode_hash(proof_sha256.as_deref())?.ok_or_else(|| {
+        StorageError::InvalidEvent("proof boundary has no destination SHA-256".to_owned())
+    })?;
+    if result.evidence().destination_size() != Some(proof_size)
+        || result.evidence().destination_sha256() != Some(&proof_sha256)
+    {
+        return Err(StorageError::InvalidEvent(
+            "removal result does not match the persisted proof boundary".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn event_advances_action(event: &JournalEvent) -> bool {
+    !matches!(event, JournalEvent::Planned { .. })
 }
 
 fn is_settled_phase(phase: &str) -> bool {
     matches!(
         phase,
-        "completed" | "failed" | "cancelled" | "deferred" | "unresolved" | "recovery_resolved"
+        "completed"
+            | "failed"
+            | "cancelled"
+            | "deferred"
+            | "unresolved"
+            | "removal_completed"
+            | "recovery_resolved"
     )
 }
 
@@ -1585,6 +2076,9 @@ fn event_action_id(event: &JournalEvent) -> ActionId {
         JournalEvent::Planned { action } => action.action_id,
         JournalEvent::Started { action_id }
         | JournalEvent::Progress { action_id, .. }
+        | JournalEvent::ProofBoundary { action_id, .. }
+        | JournalEvent::RemovalStarted { action_id, .. }
+        | JournalEvent::RemovalCompleted { action_id, .. }
         | JournalEvent::Completed { action_id }
         | JournalEvent::Failed { action_id, .. }
         | JournalEvent::Cancelled { action_id }

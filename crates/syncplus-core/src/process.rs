@@ -338,9 +338,32 @@ impl ProcessSpecification {
         }
         validate_relative_transfer_path(action.relative_path())?;
         Ok((
-            self.source_root.join(action.relative_path()),
-            self.destination_root.join(action.relative_path()),
+            self.source_path(action)?,
+            self.destination_path(action)?,
         ))
+    }
+
+    pub(crate) fn source_path(&self, action: &PlanAction) -> Result<PathBuf, ProcessSpecError> {
+        if action.source_side() != PeerSide::from(self.source) {
+            return Err(ProcessSpecError::ActionSourceMismatch);
+        }
+        validate_relative_transfer_path(action.relative_path())?;
+        Ok(self.source_root.join(action.relative_path()))
+    }
+
+    pub(crate) fn destination_path(
+        &self,
+        action: &PlanAction,
+    ) -> Result<PathBuf, ProcessSpecError> {
+        if action.source_side() != PeerSide::from(self.source) {
+            return Err(ProcessSpecError::ActionSourceMismatch);
+        }
+        validate_relative_transfer_path(action.relative_path())?;
+        Ok(self.destination_root.join(action.relative_path()))
+    }
+
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.source_root
     }
 
     pub fn preview(&self) -> String {

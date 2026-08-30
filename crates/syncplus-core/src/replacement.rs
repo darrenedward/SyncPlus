@@ -13,12 +13,17 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedReplacement {
+    source: PathBuf,
     destination: PathBuf,
     previous_destination: Option<PathBuf>,
     proof: VerifiedTransferProof,
 }
 
 impl VerifiedReplacement {
+    pub fn source(&self) -> &Path {
+        &self.source
+    }
+
     pub fn destination(&self) -> &Path {
         &self.destination
     }
@@ -331,6 +336,7 @@ where
             ));
         }
         Ok(VerifiedReplacement {
+            source: source.to_path_buf(),
             destination: destination.to_path_buf(),
             previous_destination,
             proof: VerifiedTransferProof::new(

@@ -9,6 +9,7 @@ mod runner;
 mod verification;
 mod replacement;
 mod transfer;
+mod removal;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, OneWaySource, Peer,
@@ -27,7 +28,7 @@ pub use analysis::{
 pub use evidence::{
     ActionId, ActionJournalEntry, ActionOutcome, ActionReason, FileIdentity,
     JournalEvent, PlanRecord, PreActionState, RecoveryEvidence, RecoveryResolution,
-    RunEvidenceStore, RunExecutionResult, RunLifecycle, RunReport, RunReportItem,
+    RemovalResult, RunEvidenceStore, RunExecutionResult, RunLifecycle, RunReport, RunReportItem,
     RunReportStatus, RunSnapshot, StorageError,
 };
 pub use parser::{
@@ -41,6 +42,7 @@ pub use verification::{
     SourceObservation, VerificationError, VerifiedTransferProof,
 };
 pub use transfer::{ControlledTransfer, TransferError};
+pub use removal::{RecoveryMethod, RemovalReceipt, SafeDeleteError, SafeDeleteExecutor};
 pub use precheck::{
     AccessSnapshot, DestinationNamingPolicy, ExecutionPermit, LocalPrecheckProbe,
     NamingConflict, NamingRule, PathRiskLevel, PathRiskWarning, PrecheckBlocker,
@@ -67,3 +69,6 @@ mod precheck_tests;
 
 #[cfg(test)]
 mod scope_lock_tests;
+
+#[cfg(test)]
+mod removal_tests;
