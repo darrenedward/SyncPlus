@@ -106,9 +106,10 @@ where
     }
 }
 
-/// Transfers one regular file through a same-directory temporary path and
-/// returns only after the source and installed destination have independent
-/// size and SHA-256 proof. The source is never removed by this function.
+/// Transfers one local item through a same-directory temporary path and
+/// returns only after its type, required metadata, and (for regular files)
+/// independent size and SHA-256 proof are verified. The source is never
+/// removed by this function.
 #[cfg(test)]
 pub(crate) fn perform_verified_replacement<F>(
     source: &Path,
@@ -186,7 +187,9 @@ where
         PartialTransferPolicy::KeepPartialForResume => "partial",
     };
     let temporary = temporary_sibling(destination, temporary_kind)?;
-    create_empty_file(&temporary)?;
+    if source_before.metadata().item_type() == crate::ItemType::RegularFile {
+        create_empty_file(&temporary)?;
+    }
 
     if let Err(error) = transfer(&temporary) {
         return Err(cleanup_temporary_according_to_policy(
@@ -205,13 +208,7 @@ where
 
     let result = (|| {
         check_cancelled(&should_cancel)?;
-        sync_file(&temporary)?;
-        let temporary_destination = verify_content_with_cancel(
-            &temporary,
-            &source_before.content(),
-            || should_cancel(),
-        )
-        .map_err(map_verification_error)?;
+        sync_staged_item(&temporary)?;
         check_cancelled(&should_cancel)?;
         apply_metadata_requirements(&temporary, source_before.metadata(), metadata)?;
         let temporary_metadata = FileMetadataProof::capture(&temporary)?;
@@ -221,6 +218,13 @@ where
         {
             return Err(ReplacementError::MetadataMismatch);
         }
+        let temporary_destination = source_before
+            .content_proof()
+            .map(|content| {
+                verify_content_with_cancel(&temporary, &content, || should_cancel())
+                    .map_err(map_verification_error)
+            })
+            .transpose()?;
         let source_after = SourceObservation::capture_with_cancel(source, || should_cancel())
             .map_err(map_verification_error)?;
         if source_after != source_before {
@@ -307,7 +311,7 @@ where
                 destination,
                 previous_destination.as_deref(),
                 Some(&installed_metadata),
-                Some(source_before.content()),
+                source_before.content_proof(),
                 ReplacementError::MetadataMismatch,
             ));
         }
@@ -317,38 +321,36 @@ where
                 destination,
                 previous_destination.as_deref(),
                 Some(&installed_metadata),
-                Some(source_before.content()),
+                source_before.content_proof(),
                 error,
             ));
         }
-        if let Err(error) = sync_file(destination) {
+        if let Err(error) = sync_staged_item(destination) {
             return Err(restore_after_failed_install(
                 destination,
                 previous_destination.as_deref(),
                 Some(&installed_metadata),
-                Some(source_before.content()),
+                source_before.content_proof(),
                 error,
             ));
         }
 
-        let installed_destination = match verify_content_with_cancel(
-            destination,
-            &source_before.content(),
-            || should_cancel(),
-        )
-        .map_err(map_verification_error)
-        {
-            Ok(proof) => proof,
-            Err(error) => {
-                return Err(restore_after_failed_install(
+        let installed_destination = source_before
+            .content_proof()
+            .map(|content| {
+                verify_content_with_cancel(destination, &content, || should_cancel())
+                    .map_err(map_verification_error)
+            })
+            .transpose()
+            .map_err(|error| {
+                restore_after_failed_install(
                     destination,
                     previous_destination.as_deref(),
                     Some(&installed_metadata),
-                    Some(source_before.content()),
+                    source_before.content_proof(),
                     error,
-                ));
-            }
-        };
+                )
+            })?;
         let final_installed_metadata = match FileMetadataProof::capture(destination) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -356,7 +358,7 @@ where
                     destination,
                     previous_destination.as_deref(),
                     Some(&installed_metadata),
-                    Some(source_before.content()),
+                    source_before.content_proof(),
                     ReplacementError::Verification(error),
                 ));
             }
@@ -366,7 +368,7 @@ where
                 destination,
                 previous_destination.as_deref(),
                 Some(&installed_metadata),
-                Some(source_before.content()),
+                source_before.content_proof(),
                 ReplacementError::RecoveryUncertain(
                     "the installed destination changed after final verification".to_owned(),
                 ),
@@ -381,7 +383,7 @@ where
                     destination,
                     previous_destination.as_deref(),
                     Some(&installed_metadata),
-                    Some(source_before.content()),
+                    source_before.content_proof(),
                     error,
                 ));
             }
@@ -391,7 +393,7 @@ where
                 destination,
                 previous_destination.as_deref(),
                 Some(&installed_metadata),
-                Some(source_before.content()),
+                source_before.content_proof(),
                 ReplacementError::Verification(VerificationError::SourceChanged),
             ));
         }
@@ -400,7 +402,7 @@ where
                 destination,
                 previous_destination.as_deref(),
                 Some(&installed_metadata),
-                Some(source_before.content()),
+                source_before.content_proof(),
                 ReplacementError::Cancelled,
             ));
         }
@@ -439,14 +441,22 @@ pub(crate) fn cleanup_partial_transfer_artifacts(root: &Path) -> io::Result<()> 
             let path = entry.path();
             let metadata = fs::symlink_metadata(&path)?;
             if metadata.file_type().is_dir() {
-                visit(&path)?;
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".syncplus-partial-")
+                {
+                    fs::remove_dir_all(&path)?;
+                } else {
+                    visit(&path)?;
+                }
             } else if metadata.file_type().is_file()
                 && entry
                     .file_name()
                     .to_string_lossy()
                     .starts_with(".syncplus-partial-")
             {
-                match fs::remove_file(&path) {
+                match remove_staged_item(&path) {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
@@ -468,10 +478,17 @@ fn apply_metadata_requirements(
         let modified_at = source
             .modified_at()
             .ok_or(ReplacementError::MetadataMismatch)?;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(io_error)?
+        let file = if source.item_type() == crate::ItemType::RegularFile {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(io_error)?
+        } else if source.item_type() == crate::ItemType::Directory {
+            std::fs::File::open(path).map_err(io_error)?
+        } else {
+            return Err(ReplacementError::MetadataMismatch);
+        };
+        file
             .set_modified(modified_at)
             .map_err(io_error)?;
     }
@@ -507,7 +524,7 @@ fn restore_after_failed_install(
             ));
         }
     };
-    if current_metadata.item_type() != crate::ItemType::RegularFile {
+    if expected_content.is_some() && current_metadata.item_type() != crate::ItemType::RegularFile {
         return ReplacementError::RecoveryUncertain(format!(
             "the installed destination changed type before rollback after {original_error}"
         ));
@@ -613,7 +630,7 @@ fn rename_without_replacement(source: &Path, destination: &Path) -> io::Result<(
 }
 
 fn cleanup_temporary(path: &Path, original_error: ReplacementError) -> ReplacementError {
-    match fs::remove_file(path) {
+    match remove_staged_item(path) {
         Ok(()) => original_error,
         Err(error) if error.kind() == io::ErrorKind::NotFound => original_error,
         Err(error) => ReplacementError::RecoveryUncertain(format!(
@@ -633,15 +650,6 @@ fn cleanup_temporary_according_to_policy(
     }
 }
 
-fn create_empty_file(path: &Path) -> Result<(), ReplacementError> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map(|_| ())
-        .map_err(io_error)
-}
-
 fn sync_file(path: &Path) -> Result<(), ReplacementError> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -655,6 +663,41 @@ fn sync_file(path: &Path) -> Result<(), ReplacementError> {
         .map_err(io_error)?
         .sync_all()
         .map_err(io_error)
+}
+
+fn create_empty_file(path: &Path) -> Result<(), ReplacementError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(|_| ())
+        .map_err(io_error)
+}
+
+fn sync_staged_item(path: &Path) -> Result<(), ReplacementError> {
+    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    if metadata.file_type().is_file() {
+        sync_file(path)
+    } else if metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        Ok(())
+    } else {
+        Err(ReplacementError::Verification(
+            VerificationError::UnsupportedItem,
+        ))
+    }
+}
+
+fn remove_staged_item(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
 }
 
 fn io_error(error: io::Error) -> ReplacementError {

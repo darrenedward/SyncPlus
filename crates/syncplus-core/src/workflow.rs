@@ -1085,12 +1085,19 @@ fn safe_delete_reason(error: &SafeDeleteError) -> ActionReason {
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::CString,
         fs,
         path::{Path, PathBuf},
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
         },
+    };
+
+    #[cfg(unix)]
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{symlink, PermissionsExt},
     };
 
     use super::RunWorkflow;
@@ -1153,6 +1160,211 @@ mod tests {
             fs::create_dir_all(parent).expect("fixture parent should be creatable");
         }
         fs::write(path, contents).expect("fixture file should be writable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_item_fidelity_preserves_empty_directories_symlinks_and_executable_files() {
+        let fixture = Fixture::new();
+        write_file(&fixture.source().join("run.sh"), b"#!/bin/sh\necho safe\n");
+        fs::set_permissions(
+            fixture.source().join("run.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .expect("source executable bit should be set");
+        fs::create_dir_all(fixture.source().join("empty")).expect("empty directory");
+        symlink("run.sh", fixture.source().join("run-link"))
+            .expect("source symlink should be creatable");
+        fs::create_dir_all(fixture.destination()).expect("destination should be creatable");
+
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute(
+                RunId::new(1),
+                &fixture.profile(),
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("essential item types should transfer");
+
+        assert_eq!(report.status(), RunReportStatus::Completed, "report: {report:?}");
+        assert!(fs::metadata(fixture.destination().join("empty"))
+            .expect("empty directory should transfer")
+            .is_dir());
+        assert!(fs::read_dir(fixture.destination().join("empty"))
+            .expect("transferred empty directory should be readable")
+            .next()
+            .is_none());
+        assert_eq!(
+            fs::symlink_metadata(fixture.destination().join("run-link"))
+                .expect("symlink should transfer")
+                .file_type()
+                .is_symlink(),
+            true
+        );
+        assert_eq!(
+            fs::read_link(fixture.destination().join("run-link"))
+                .expect("symlink target should be readable"),
+            PathBuf::from("run.sh")
+        );
+        assert_eq!(
+            fs::metadata(fixture.destination().join("run.sh"))
+                .expect("executable should transfer")
+                .permissions()
+                .mode()
+                & 0o111,
+            0o111
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_permission_changes_are_planned_as_overwrites() {
+        let fixture = Fixture::new();
+        let source = fixture.source().join("run.sh");
+        let destination = fixture.destination().join("run.sh");
+        write_file(&source, b"#!/bin/sh\necho same\n");
+        write_file(&destination, b"#!/bin/sh\necho same\n");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755))
+            .expect("source executable bit should be set");
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o644))
+            .expect("destination should start non-executable");
+        let source_modified = fs::metadata(&source)
+            .expect("source metadata")
+            .modified()
+            .expect("source modification time");
+        fs::File::options()
+            .write(true)
+            .open(&destination)
+            .expect("destination should be writable")
+            .set_modified(source_modified)
+            .expect("destination timestamp should match");
+
+        let analysis = FreshAnalysis::analyze(&fixture.profile())
+            .expect("executable metadata difference should be analyzable");
+        assert_eq!(
+            analysis
+                .plan()
+                .action_for("run.sh")
+                .expect("executable difference should be planned")
+                .kind(),
+            PlanActionKind::OverwriteDestination
+        );
+    }
+
+    #[test]
+    fn local_item_fidelity_does_not_copy_excluded_children_when_creating_directories() {
+        let fixture = Fixture::new();
+        write_file(&fixture.source().join("folder/keep.txt"), b"keep");
+        write_file(&fixture.source().join("folder/skip.tmp"), b"skip");
+        write_file(&fixture.destination().join("folder/skip.tmp"), b"existing skip");
+        let profile = fixture.profile().with_exclusion("*.tmp");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute(
+                RunId::new(1),
+                &profile,
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("directory transfer should respect exclusions");
+
+        assert_eq!(
+            fs::read(fixture.destination().join("folder/keep.txt"))
+                .expect("included child should transfer"),
+            b"keep"
+        );
+        assert_eq!(
+            fs::read(fixture.destination().join("folder/skip.tmp"))
+                .expect("excluded destination child should remain"),
+            b"existing skip"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_special_files_remain_visible_and_keep_the_source() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.source()).expect("source should be creatable");
+        let special = fixture.source().join("named-pipe");
+        let special_c = CString::new(special.as_os_str().as_bytes())
+            .expect("fixture path should not contain a NUL byte");
+        let result = unsafe { libc::mkfifo(special_c.as_ptr(), 0o644) };
+        assert_eq!(result, 0, "special fixture should be creatable");
+        fs::create_dir_all(fixture.destination()).expect("destination should be creatable");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute(
+                RunId::new(1),
+                &fixture.profile(),
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("unsupported items should produce a reviewable report");
+
+        assert_eq!(report.status(), RunReportStatus::CompletedWithReviewRequired);
+        assert!(special.exists(), "unsupported source item must be preserved");
+        assert!(!fixture.destination().join("named-pipe").exists());
+        assert!(report
+            .reconciliation()
+            .expect("reconciliation should be persisted")
+            .findings()
+            .iter()
+            .any(|finding| {
+                finding.relative_path() == Path::new("named-pipe")
+                    && finding.kind() == crate::ReconciliationFindingKind::Unverifiable
+            }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_delete_verifies_and_recovers_symlinks_without_following_targets() {
+        let fixture = Fixture::new();
+        write_file(&fixture.root.join("target.txt"), b"target remains");
+        fs::create_dir_all(fixture.source()).expect("source should be creatable");
+        symlink("../target.txt", fixture.source().join("link.txt"))
+            .expect("source symlink should be creatable");
+        fs::create_dir_all(fixture.destination()).expect("destination should be creatable");
+        let trash = fixture.root.join("trash");
+        fs::create_dir_all(&trash).expect("trash should be creatable");
+        let profile = fixture.profile().with_options(SyncOptions {
+            safe_delete: true,
+            deletion_method: Some(DeletionMethod::Trash),
+            ..SyncOptions::default()
+        });
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(&trash))
+            .execute(
+                RunId::new(1),
+                &profile,
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("Safe Delete should support symlink items");
+
+        assert_eq!(report.status(), RunReportStatus::Completed);
+        assert!(!fixture.source().join("link.txt").exists());
+        assert!(fixture.root.join("target.txt").exists());
+        let recovered = trash.join("link.txt");
+        assert!(fs::symlink_metadata(&recovered)
+            .expect("recovered symlink should exist")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_link(recovered).expect("recovered symlink target"),
+            PathBuf::from("../target.txt")
+        );
     }
 
     #[test]

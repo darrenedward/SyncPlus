@@ -123,6 +123,7 @@ pub struct InventorySnapshotItem {
     size: u64,
     modified_at_unix_nanos: Option<i64>,
     readonly: bool,
+    permissions: Option<u32>,
     symlink_target: Option<PathBuf>,
     content_fingerprint: Option<[u8; 32]>,
 }
@@ -136,18 +137,20 @@ impl InventorySnapshotItem {
             size: item.metadata().size(),
             modified_at_unix_nanos: unix_nanos(item.metadata().modified_at()),
             readonly: item.metadata().is_readonly(),
+            permissions: item.metadata().permissions(),
             symlink_target: item.metadata().symlink_target().map(Path::to_path_buf),
             content_fingerprint: item.content_fingerprint().copied(),
         }
     }
 
-    pub(crate) fn from_parts(
+    pub(crate) fn from_parts_with_permissions(
         relative_path: PathBuf,
         item_type: ItemType,
         outcome: AnalysisOutcome,
         size: u64,
         modified_at_unix_nanos: Option<i64>,
         readonly: bool,
+        permissions: Option<u32>,
         symlink_target: Option<PathBuf>,
         content_fingerprint: Option<[u8; 32]>,
     ) -> Self {
@@ -158,6 +161,7 @@ impl InventorySnapshotItem {
             size,
             modified_at_unix_nanos,
             readonly,
+            permissions,
             symlink_target,
             content_fingerprint,
         }
@@ -185,6 +189,14 @@ impl InventorySnapshotItem {
 
     pub const fn is_readonly(&self) -> bool {
         self.readonly
+    }
+
+    pub const fn permissions(&self) -> Option<u32> {
+        self.permissions
+    }
+
+    pub fn executable_permissions(&self) -> Option<u32> {
+        self.permissions.map(|permissions| permissions & 0o111)
     }
 
     pub fn symlink_target(&self) -> Option<&Path> {
@@ -444,6 +456,7 @@ fn source_matches_snapshot(
         || expected.outcome() != current.outcome()
         || expected.size() != current.metadata().size()
         || expected.is_readonly() != current.metadata().is_readonly()
+        || expected.executable_permissions() != current.metadata().executable_permissions()
         || expected.symlink_target() != current.metadata().symlink_target()
         || expected.content_fingerprint() != current.content_fingerprint()
     {
@@ -461,6 +474,9 @@ fn destination_matches_source(
     destination: &InventoryItem,
 ) -> bool {
     if expected.item_type() != destination.item_type() {
+        return false;
+    }
+    if expected.executable_permissions() != destination.metadata().executable_permissions() {
         return false;
     }
     match expected.item_type() {

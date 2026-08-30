@@ -245,22 +245,7 @@ impl SafeDeleteExecutor {
                 return self.fail_unresolved(run_id, action.action_id(), store, io_error(error))
             }
         };
-        let source = match fs::canonicalize(&source) {
-            Ok(path) if path.starts_with(&source_root) => path,
-            Ok(_) => {
-                return self.fail_unresolved(
-                    run_id,
-                    action.action_id(),
-                    store,
-                    SafeDeleteError::InvalidAction(
-                        "the source item resolved outside the selected source root".to_owned(),
-                    ),
-                )
-            }
-            Err(error) => {
-                return self.fail_unresolved(run_id, action.action_id(), store, io_error(error))
-            }
-        };
+        let source = source_root.join(action.relative_path());
         let proof = replacement.proof();
         let metadata_requirements = options.metadata();
         if replacement.metadata_requirements() != metadata_requirements {
@@ -285,7 +270,10 @@ impl SafeDeleteExecutor {
                 SafeDeleteError::Verification(VerificationError::SourceChanged),
             );
         }
-        if proof.source_after().metadata().item_type() != crate::ItemType::RegularFile {
+        if !matches!(
+            proof.source_after().metadata().item_type(),
+            crate::ItemType::RegularFile | crate::ItemType::Symlink
+        ) {
             return self.fail_unresolved(
                 run_id,
                 action.action_id(),
@@ -301,18 +289,16 @@ impl SafeDeleteExecutor {
                 SafeDeleteError::Verification(error),
             );
         }
-        let destination_content =
-            match crate::verify_content(&destination, &proof.installed_destination()) {
-                Ok(content) => content,
-                Err(error) => {
-                    return self.fail_unresolved(
-                        run_id,
-                        action.action_id(),
-                        store,
-                        SafeDeleteError::Verification(error),
-                    )
-                }
-            };
+        let destination_content = match proof.installed_destination_proof() {
+            Some(expected) => Some(
+                crate::verify_content(&destination, &expected)
+                    .map_err(SafeDeleteError::Verification)
+                    .or_else(|error| {
+                        self.fail_unresolved(run_id, action.action_id(), store, error)
+                    })?,
+            ),
+            None => None,
+        };
         let destination_metadata = match FileMetadataProof::capture(&destination) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -373,7 +359,16 @@ impl SafeDeleteExecutor {
             }
             if !same_filesystem {
                 if let Err(error) =
-                    ensure_recovery_space(recovery_root, proof.source_after().content().size())
+                    ensure_recovery_space(
+                        recovery_root,
+                        proof
+                            .source_after()
+                            .content_proof()
+                            .map_or_else(
+                                || proof.source_after().metadata().size(),
+                                |content| content.size(),
+                            ),
+                    )
                 {
                     return self.fail_unresolved(run_id, action.action_id(), store, error);
                 }
@@ -398,10 +393,19 @@ impl SafeDeleteExecutor {
             true,
             true,
             false,
-            Some(proof.source_after().content().size()),
-            Some(destination_content.size()),
-            Some(*proof.source_after().content().sha256()),
-            Some(*destination_content.sha256()),
+            proof
+                .source_after()
+                .content_proof()
+                .map(|content| content.size())
+                .or_else(|| Some(proof.source_after().metadata().size())),
+            destination_content.map(|content| content.size()).or_else(|| {
+                Some(proof.source_after().metadata().size())
+            }),
+            proof
+                .source_after()
+                .content_proof()
+                .map(|content| *content.sha256()),
+            destination_content.map(|content| *content.sha256()),
         );
         store.append_event(
             run_id,
@@ -637,6 +641,13 @@ impl SafeDeleteExecutor {
         {
             use std::os::fd::AsRawFd;
 
+            if proof.source_after().metadata().item_type() != crate::ItemType::RegularFile {
+                return Err(SafeDeleteError::RecoveryUnavailable(
+                    "cross-filesystem recovery currently supports regular files only"
+                        .to_owned(),
+                ));
+            }
+
             let source_size = proof.source_after().content().size();
             ensure_recovery_space(recovery_target, source_size)?;
             let (recovery_parent, recovery_name) =
@@ -837,12 +848,16 @@ fn ensure_journaled_source_proof(
     }
     let source = proof.source_after();
     let planned = entry.plan().pre_action();
-    if planned.item_type() != crate::ItemType::RegularFile
-        || planned.size() != source.content().size()
+    let content_matches = match source.content_proof() {
+        Some(content) => planned.sha256() == Some(content.sha256()),
+        None => planned.sha256().is_none(),
+    };
+    if planned.item_type() != source.metadata().item_type()
+        || planned.size() != source.metadata().size()
         || planned.modified_at_unix_nanos()
             != source.metadata().modified_at_unix_nanos()
         || planned.identity() != source.metadata().identity()
-        || planned.sha256() != Some(source.content().sha256())
+        || !content_matches
     {
         return Err(SafeDeleteError::Verification(
             VerificationError::SourceChanged,
@@ -866,8 +881,11 @@ fn validate_source_item_path(source_root: &Path, relative_path: &Path) -> Result
         ));
     }
     let canonical_root = fs::canonicalize(source_root).map_err(io_error)?;
-    let canonical_source = fs::canonicalize(&source).map_err(io_error)?;
-    if canonical_source.strip_prefix(&canonical_root).is_err() {
+    if source.parent().is_none_or(|parent| {
+        fs::canonicalize(parent)
+            .map(|canonical_parent| !canonical_parent.starts_with(&canonical_root))
+            .unwrap_or(true)
+    }) {
         return Err(SafeDeleteError::InvalidAction(
             "the source item resolves outside the selected source root".to_owned(),
         ));
@@ -901,13 +919,18 @@ fn validate_recovery_root(
             "the recovery root overlaps the selected source root".to_owned(),
         ));
     }
-    let source = fs::canonicalize(source).map_err(io_error)?;
-    if source == recovery_root || source.starts_with(&recovery_root) {
+    let source_metadata = fs::symlink_metadata(source).map_err(io_error)?;
+    let source_for_overlap = if source_metadata.file_type().is_symlink() {
+        source.to_path_buf()
+    } else {
+        fs::canonicalize(source).map_err(io_error)?
+    };
+    if source_for_overlap == recovery_root || source_for_overlap.starts_with(&recovery_root) {
         return Err(SafeDeleteError::RecoveryUnavailable(
             "the recovery root overlaps the source item".to_owned(),
         ));
     }
-    let source_device = device_of(&source)?;
+    let source_device = device_of(source)?;
     let recovery_device = device_of(&recovery_root)?;
     let relative = source.strip_prefix(&source_root).map_err(|_| {
         SafeDeleteError::RecoveryUnavailable(
@@ -1459,6 +1482,25 @@ fn verify_recovery_entry(
 ) -> Result<(), SafeDeleteError> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
+    if proof.source_after().metadata().item_type() == crate::ItemType::Symlink {
+        use std::os::unix::ffi::OsStringExt;
+
+        let entry = PathBuf::from("/proc/self/fd")
+            .join(parent.as_raw_fd().to_string())
+            .join(std::ffi::OsString::from_vec(name.as_bytes().to_vec()));
+        let metadata = FileMetadataProof::capture(&entry).map_err(SafeDeleteError::Verification)?;
+        if !proof
+            .source_after()
+            .metadata()
+            .matches_transfer_metadata(&metadata, metadata_requirements)
+        {
+            return Err(SafeDeleteError::RecoveryUncertain(
+                "the recovered symlink failed metadata verification".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
+
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -1543,7 +1585,7 @@ fn ensure_source_entry_matches(
     parent: &std::os::fd::OwnedFd,
     name: &std::ffi::CString,
     proof: &crate::VerifiedTransferProof,
-) -> Result<std::fs::File, SafeDeleteError> {
+) -> Result<Option<std::fs::File>, SafeDeleteError> {
     use std::{
         os::fd::{AsRawFd, FromRawFd},
     };
@@ -1566,15 +1608,30 @@ fn ensure_source_entry_matches(
         .metadata()
         .identity()
         .ok_or_else(|| SafeDeleteError::Verification(VerificationError::SourceChanged))?;
+    let expected_type = proof.source_after().metadata().item_type();
+    let expected_file_type = match expected_type {
+        crate::ItemType::RegularFile => libc::S_IFREG,
+        crate::ItemType::Symlink => libc::S_IFLNK,
+        _ => {
+            return Err(SafeDeleteError::Verification(
+                VerificationError::UnsupportedItem,
+            ))
+        }
+    };
     if status.st_dev as u64 != expected_identity.device()
         || status.st_ino as u64 != expected_identity.inode()
         || status.st_size < 0
-        || status.st_size as u64 != proof.source_after().content().size()
-        || status.st_mode & libc::S_IFMT != libc::S_IFREG
+        || status.st_size as u64 != proof.source_after().metadata().size()
+        || status.st_mode & libc::S_IFMT != expected_file_type
+        || status.st_mode & 0o7777
+            != proof.source_after().metadata().permissions().unwrap_or_default()
     {
         return Err(SafeDeleteError::Verification(
             VerificationError::SourceChanged,
         ));
+    }
+    if expected_type == crate::ItemType::Symlink {
+        return Ok(None);
     }
     let fd = unsafe {
         libc::openat(
@@ -1615,7 +1672,7 @@ fn ensure_source_entry_matches(
             VerificationError::SourceChanged,
         ));
     }
-    Ok(file)
+    Ok(Some(file))
 }
 
 #[cfg(target_os = "linux")]
@@ -1650,6 +1707,7 @@ fn removal_evidence(
     recovery_present: bool,
     proof: &crate::VerifiedTransferProof,
 ) -> RecoveryEvidence {
+    let content = proof.installed_destination_proof();
     RecoveryEvidence::new(
         now_unix_nanos(),
         recovery_target.map(Path::to_path_buf),
@@ -1657,9 +1715,11 @@ fn removal_evidence(
         true,
         recovery_present,
         None,
-        Some(proof.installed_destination().size()),
+        content
+            .map(|content| content.size())
+            .or_else(|| Some(proof.source_after().metadata().size())),
         None,
-        Some(*proof.installed_destination().sha256()),
+        content.map(|content| *content.sha256()),
     )
 }
 

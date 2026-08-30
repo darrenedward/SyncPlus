@@ -1567,10 +1567,15 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 
 fn local_access(path: &Path, destination: bool) -> AccessSnapshot {
     let target = probe_target(path);
-    let readable = if path.is_dir() {
-        fs::read_dir(path).is_ok()
-    } else {
-        File::open(path).is_ok()
+    let readable = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => fs::read_dir(path).is_ok(),
+        Ok(metadata) if metadata.file_type().is_file() => File::open(path).is_ok(),
+        // Symlinks and unsupported special files are inspected through their
+        // directory entry and must never be opened: opening a FIFO can block
+        // the precheck indefinitely, and following a symlink would violate
+        // the no-follow inventory contract.
+        Ok(_) => true,
+        Err(_) => false,
     };
     let writable = has_access(&target, AccessMode::Write);
     let removable = path

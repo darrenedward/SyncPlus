@@ -872,6 +872,8 @@ impl RunEvidenceStore {
                     ADD COLUMN peer_a_volume_identity BLOB;
                 ALTER TABLE run_snapshots
                     ADD COLUMN peer_b_volume_identity BLOB;
+                ALTER TABLE source_inventory_items
+                    ADD COLUMN permissions INTEGER;
                 ",
             )?;
             transaction.pragma_update(None, "user_version", 7)?;
@@ -955,8 +957,9 @@ impl RunEvidenceStore {
             transaction.execute(
                 "INSERT INTO source_inventory_items (
                     run_id, ordinal, relative_path, item_type, outcome, size,
-                    modified_at_unix_nanos, readonly, symlink_target, content_fingerprint
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    modified_at_unix_nanos, readonly, permissions, symlink_target,
+                    content_fingerprint
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     run_id.value(),
                     ordinal as i64,
@@ -966,6 +969,7 @@ impl RunEvidenceStore {
                     item.size() as i64,
                     item.modified_at_unix_nanos(),
                     bool_to_int(item.is_readonly()),
+                    item.permissions().map(i64::from),
                     item.symlink_target().map(path_to_blob),
                     item.content_fingerprint().map(|hash| hash.to_vec()),
                 ],
@@ -1002,8 +1006,8 @@ impl RunEvidenceStore {
         };
         let mut statement = self.connection.prepare(
             "SELECT relative_path, item_type, outcome, size,
-                    modified_at_unix_nanos, readonly, symlink_target,
-                    content_fingerprint
+                    modified_at_unix_nanos, readonly, permissions,
+                    symlink_target, content_fingerprint
              FROM source_inventory_items WHERE run_id = ?1 ORDER BY ordinal",
         )?;
         let rows = statement
@@ -1015,8 +1019,9 @@ impl RunEvidenceStore {
                     row.get::<_, i64>(3)?,
                     row.get::<_, Option<i64>>(4)?,
                     row.get::<_, bool>(5)?,
-                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Option<i64>>(6)?,
                     row.get::<_, Option<Vec<u8>>>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(8)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1030,6 +1035,7 @@ impl RunEvidenceStore {
                     size,
                     modified_at_unix_nanos,
                     readonly,
+                    permissions,
                     symlink_target,
                     content_fingerprint,
                 )| {
@@ -1038,13 +1044,23 @@ impl RunEvidenceStore {
                             "source inventory contains a negative size".to_owned(),
                         )
                     })?;
-                    Ok(InventorySnapshotItem::from_parts(
+                    Ok(InventorySnapshotItem::from_parts_with_permissions(
                         blob_to_path(&relative_path)?,
                         decode_item_type(&item_type)?,
                         decode_analysis_outcome(&outcome)?,
                         size,
                         modified_at_unix_nanos,
                         readonly,
+                        permissions
+                            .map(|permissions| {
+                                u32::try_from(permissions).map_err(|_| {
+                                    StorageError::CorruptEvidence(
+                                        "source inventory contains invalid permissions"
+                                            .to_owned(),
+                                    )
+                                })
+                            })
+                            .transpose()?,
                         symlink_target
                             .as_deref()
                             .map(blob_to_path)
@@ -1348,6 +1364,14 @@ impl RunEvidenceStore {
                 |row| row.get(0),
             )
             .optional()?;
+        let planned_item_type: Option<String> = transaction
+            .query_row(
+                "SELECT pre_item_type FROM action_events
+                 WHERE run_id = ?1 AND action_id = ?2 AND phase = 'planned'",
+                params![run_id.value(), action_id],
+                |row| row.get(0),
+            )
+            .optional()?;
         let configured_deletion_method: Option<String> = transaction
             .query_row(
                 "SELECT deletion_method FROM run_snapshots WHERE run_id = ?1",
@@ -1361,6 +1385,7 @@ impl RunEvidenceStore {
             has_plan,
             current_phase.as_deref(),
             planned_operation.as_deref(),
+            planned_item_type.as_deref(),
             configured_deletion_method.as_deref(),
         )?;
         validate_transfer_event_against_plan(&transaction, run_id, action_id, &event)?;
@@ -1974,9 +1999,11 @@ fn apply_stored_event(
             })?;
             let deletion_method = decode_deletion_method(method)?;
             validate_replayed_deletion_method(entry, deletion_method, configured_deletion_method)?;
+            let content_proof_required =
+                entry.plan.pre_action().item_type() != ItemType::Symlink;
             if row.proof_metadata_verified != Some(true)
                 || row.proof_destination_size.is_none()
-                || row.proof_destination_sha256.is_none()
+                || (content_proof_required && row.proof_destination_sha256.is_none())
             {
                 return Err(StorageError::CorruptEvidence(
                     "proof boundary is missing metadata or destination content evidence"
@@ -1987,20 +2014,20 @@ fn apply_stored_event(
             let proof_destination_size = row.proof_destination_size.ok_or_else(|| {
                 StorageError::CorruptEvidence("proof boundary has no destination size".to_owned())
             })?;
-            let proof_destination_sha256 =
-                decode_hash(row.proof_destination_sha256.as_deref())?.ok_or_else(|| {
-                    StorageError::CorruptEvidence(
-                        "proof boundary has no destination SHA-256".to_owned(),
-                    )
-                })?;
+            let proof_destination_sha256 = decode_hash(row.proof_destination_sha256.as_deref())?;
+            if content_proof_required && proof_destination_sha256.is_none() {
+                return Err(StorageError::CorruptEvidence(
+                    "proof boundary has no destination SHA-256".to_owned(),
+                ));
+            }
             if !evidence.source_present()
                 || !evidence.destination_present()
                 || evidence.recovery_present()
                 || evidence.recovery_target().is_some()
                 || evidence.source_size().is_none()
-                || evidence.source_sha256().is_none()
+                || (content_proof_required && evidence.source_sha256().is_none())
                 || evidence.destination_size() != Some(proof_destination_size)
-                || evidence.destination_sha256() != Some(&proof_destination_sha256)
+                || evidence.destination_sha256() != proof_destination_sha256.as_ref()
             {
                 return Err(StorageError::CorruptEvidence(
                     "proof boundary has incomplete source or destination evidence".to_owned(),
@@ -2026,7 +2053,7 @@ fn apply_stored_event(
             let evidence = decode_recovery_evidence(&row)?;
             let deletion_method = decode_deletion_method(method)?;
             validate_replayed_deletion_method(entry, deletion_method, configured_deletion_method)?;
-            validate_removal_evidence(deletion_method, &evidence)?;
+            validate_removal_evidence(entry, deletion_method, &evidence)?;
             if let Some(proof) = entry.proof_boundary.as_ref()
                 && (proof.destination_size() != evidence.destination_size()
                     || proof.destination_sha256() != evidence.destination_sha256())
@@ -2170,9 +2197,11 @@ fn validate_replayed_transition(
 }
 
 fn validate_removal_evidence(
+    entry: &ActionJournalEntry,
     deletion_method: DeletionMethod,
     evidence: &RecoveryEvidence,
 ) -> Result<(), StorageError> {
+    let content_proof_required = entry.plan.pre_action().item_type() != ItemType::Symlink;
     let valid_recovery = match deletion_method {
         DeletionMethod::Trash => evidence.recovery_present() && evidence.recovery_target().is_some(),
         DeletionMethod::PermanentRemoval => {
@@ -2182,7 +2211,7 @@ fn validate_removal_evidence(
     if evidence.source_present()
         || !evidence.destination_present()
         || evidence.destination_size().is_none()
-        || evidence.destination_sha256().is_none()
+        || (content_proof_required && evidence.destination_sha256().is_none())
         || !valid_recovery
     {
         return Err(StorageError::CorruptEvidence(
@@ -2202,9 +2231,11 @@ fn validate_transfer_evidence(
         || evidence.recovery_present()
         || evidence.recovery_target().is_some()
         || evidence.source_size() != Some(entry.plan.pre_action().size())
-        || evidence.source_sha256() != entry.plan.pre_action().sha256()
+        || (entry.plan.pre_action().item_type() != ItemType::Symlink
+            && evidence.source_sha256() != entry.plan.pre_action().sha256())
         || evidence.destination_size().is_none()
-        || evidence.destination_sha256().is_none()
+        || (entry.plan.pre_action().item_type() != ItemType::Symlink
+            && evidence.destination_sha256().is_none())
     {
         return Err(StorageError::CorruptEvidence(
             "verified transfer boundary does not match the frozen source proof".to_owned(),
@@ -2278,8 +2309,10 @@ fn validate_event(
     has_plan: bool,
     current_phase: Option<&str>,
     planned_operation: Option<&str>,
+    planned_item_type: Option<&str>,
     configured_deletion_method: Option<&str>,
 ) -> Result<(), StorageError> {
+    let content_proof_required = planned_item_type != Some("symlink");
     if let JournalEvent::TransferVerified {
         evidence,
         metadata_verified,
@@ -2293,9 +2326,9 @@ fn validate_event(
             || evidence.recovery_present()
             || evidence.recovery_target().is_some()
             || evidence.source_size().is_none()
-            || evidence.source_sha256().is_none()
+            || (content_proof_required && evidence.source_sha256().is_none())
             || evidence.destination_size().is_none()
-            || evidence.destination_sha256().is_none()
+            || (content_proof_required && evidence.destination_sha256().is_none())
             || !matches!(current_phase, Some("started" | "progress"))
         {
             return Err(StorageError::InvalidEvent(
@@ -2315,9 +2348,9 @@ fn validate_event(
             || evidence.recovery_present()
             || evidence.recovery_target().is_some()
             || evidence.destination_size().is_none()
-            || evidence.destination_sha256().is_none()
+            || (content_proof_required && evidence.destination_sha256().is_none())
             || evidence.source_size().is_none()
-            || evidence.source_sha256().is_none()
+            || (content_proof_required && evidence.source_sha256().is_none())
         {
             return Err(StorageError::InvalidEvent(
                 "proof boundary is missing independent destination or metadata evidence".to_owned(),
@@ -2395,7 +2428,7 @@ fn validate_event(
         if evidence.source_present()
             || !evidence.destination_present()
             || evidence.destination_size().is_none()
-            || evidence.destination_sha256().is_none()
+            || (content_proof_required && evidence.destination_sha256().is_none())
             || !valid_recovery
         {
             return Err(StorageError::InvalidEvent(
@@ -2596,17 +2629,20 @@ fn validate_removal_result_against_proof(
     let JournalEvent::RemovalCompleted { result, .. } = event else {
         return Ok(());
     };
-    let proof: Option<(Option<i64>, Option<Vec<u8>>)> = transaction
+    let proof: Option<(String, Option<i64>, Option<Vec<u8>>)> = transaction
         .query_row(
-            "SELECT proof_destination_size, proof_destination_sha256
+            "SELECT
+                    (SELECT pre_item_type FROM action_events
+                     WHERE run_id = ?1 AND action_id = ?2 AND phase = 'planned'),
+                    proof_destination_size, proof_destination_sha256
              FROM action_events
              WHERE run_id = ?1 AND action_id = ?2 AND phase = 'proof_boundary'
              ORDER BY sequence DESC LIMIT 1",
             params![run_id.value(), action_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((proof_size, proof_sha256)) = proof else {
+    let Some((item_type, proof_size, proof_sha256)) = proof else {
         return Err(StorageError::InvalidEvent(
             "removal result requires a persisted proof boundary".to_owned(),
         ));
@@ -2614,11 +2650,14 @@ fn validate_removal_result_against_proof(
     let proof_size = proof_size
         .and_then(|size| u64::try_from(size).ok())
         .ok_or_else(|| StorageError::InvalidEvent("proof boundary has no destination size".to_owned()))?;
-    let proof_sha256 = decode_hash(proof_sha256.as_deref())?.ok_or_else(|| {
-        StorageError::InvalidEvent("proof boundary has no destination SHA-256".to_owned())
-    })?;
+    let proof_sha256 = decode_hash(proof_sha256.as_deref())?;
+    if item_type != "symlink" && proof_sha256.is_none() {
+        return Err(StorageError::InvalidEvent(
+            "proof boundary has no destination SHA-256".to_owned(),
+        ));
+    }
     if result.evidence().destination_size() != Some(proof_size)
-        || result.evidence().destination_sha256() != Some(&proof_sha256)
+        || result.evidence().destination_sha256() != proof_sha256.as_ref()
     {
         return Err(StorageError::InvalidEvent(
             "removal result does not match the persisted proof boundary".to_owned(),
@@ -2636,16 +2675,16 @@ fn validate_transfer_event_against_plan(
     let JournalEvent::TransferVerified { evidence, .. } = event else {
         return Ok(());
     };
-    let planned: Option<(Option<i64>, Option<Vec<u8>>)> = transaction
+    let planned: Option<(String, Option<i64>, Option<Vec<u8>>)> = transaction
         .query_row(
-            "SELECT pre_size, pre_sha256
+            "SELECT pre_item_type, pre_size, pre_sha256
              FROM action_events
              WHERE run_id = ?1 AND action_id = ?2 AND phase = 'planned'",
             params![run_id.value(), action_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((size, sha256)) = planned else {
+    let Some((item_type, size, sha256)) = planned else {
         return Err(StorageError::InvalidEvent(
             "verified transfer boundary requires a planned action".to_owned(),
         ));
@@ -2653,10 +2692,13 @@ fn validate_transfer_event_against_plan(
     let size = size
         .and_then(|value| u64::try_from(value).ok())
         .ok_or_else(|| StorageError::InvalidEvent("planned action has no source size".to_owned()))?;
-    let sha256 = decode_hash(sha256.as_deref())?.ok_or_else(|| {
-        StorageError::InvalidEvent("planned action has no source SHA-256".to_owned())
-    })?;
-    if evidence.source_size() != Some(size) || evidence.source_sha256() != Some(&sha256) {
+    let sha256 = decode_hash(sha256.as_deref())?;
+    if item_type != "symlink" && sha256.is_none() {
+        return Err(StorageError::InvalidEvent(
+            "planned action has no source SHA-256".to_owned(),
+        ));
+    }
+    if evidence.source_size() != Some(size) || evidence.source_sha256() != sha256.as_ref() {
         return Err(StorageError::InvalidEvent(
             "verified transfer boundary does not match the planned source".to_owned(),
         ));
