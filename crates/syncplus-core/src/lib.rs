@@ -1,13 +1,14 @@
 mod model;
 mod process;
 mod analysis;
+mod evidence;
 mod precheck;
 mod scope_lock;
 
 pub use model::{
-    ActiveRunState, CoreError, DeletionMethod, OneWaySource, Peer, ProfileSnapshot,
-    ProfileSnapshotId, RunEvent, RunId, RunState, SafetyViolation, SyncMode, SyncOptions,
-    SyncProfile, SyncRun, TerminalOutcome,
+    ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, OneWaySource, Peer,
+    ProfileSnapshot, ProfileSnapshotId, RunEvent, RunId, RunState, SafetyViolation, SyncMode,
+    SyncOptions, SyncProfile, SyncRun, TerminalOutcome,
 };
 pub use process::{
     EnvironmentBinding, ProcessArgument, ProcessInvocation, ProcessSpecError,
@@ -17,6 +18,12 @@ pub use analysis::{
     AnalysisError, AnalysisOutcome, AnalysisRevision, ApprovedSyncScope, ConfirmedPlan,
     FreshAnalysis, InventoryItem, ItemMetadata, ItemType, OneWayPlan, PeerInventory, PeerSide,
     PlanAction, PlanActionKind, PlanError, PlanSummary, ScopeDecision, SourceInventory,
+};
+pub use evidence::{
+    ActionId, ActionJournalEntry, ActionOutcome, ActionReason, FileIdentity,
+    JournalEvent, PlanRecord, PreActionState, RecoveryEvidence, RecoveryResolution,
+    RunEvidenceStore, RunExecutionResult, RunLifecycle, RunReport, RunReportItem,
+    RunReportStatus, RunSnapshot, StorageError,
 };
 pub use precheck::{
     AccessSnapshot, DestinationNamingPolicy, ExecutionPermit, LocalPrecheckProbe,
@@ -39,6 +46,7 @@ mod process_tests;
 mod analysis_tests;
 
 #[cfg(test)]
+mod evidence_tests;
 mod precheck_tests;
 
 #[cfg(test)]

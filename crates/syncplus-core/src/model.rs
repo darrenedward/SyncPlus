@@ -1,5 +1,7 @@
 use std::{fmt, path::Path, path::PathBuf};
 
+use crate::{ProcessSpecError, ProcessSpecification, ValidatedSyncOptions};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunId(u64);
 
@@ -80,6 +82,32 @@ impl Default for SyncOptions {
             destination_cleanup: false,
             deletion_method: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuthorizationSnapshot {
+    allow_unattended_destructive: bool,
+    allow_unattended_permanent_removal: bool,
+}
+
+impl AuthorizationSnapshot {
+    pub const fn new(
+        allow_unattended_destructive: bool,
+        allow_unattended_permanent_removal: bool,
+    ) -> Self {
+        Self {
+            allow_unattended_destructive,
+            allow_unattended_permanent_removal,
+        }
+    }
+
+    pub const fn allow_unattended_destructive(self) -> bool {
+        self.allow_unattended_destructive
+    }
+
+    pub const fn allow_unattended_permanent_removal(self) -> bool {
+        self.allow_unattended_permanent_removal
     }
 }
 
@@ -165,14 +193,23 @@ impl SyncProfile {
 pub struct ProfileSnapshot {
     id: ProfileSnapshotId,
     profile: SyncProfile,
+    validated_options: ValidatedSyncOptions,
+    authorizations: AuthorizationSnapshot,
 }
 
 impl ProfileSnapshot {
-    fn new(id: ProfileSnapshotId, profile: &SyncProfile) -> Self {
-        Self {
+    fn new_with_authorizations(
+        id: ProfileSnapshotId,
+        profile: &SyncProfile,
+        authorizations: AuthorizationSnapshot,
+    ) -> Result<Self, ProcessSpecError> {
+        let validated_options = ProcessSpecification::from_profile(profile)?.options();
+        Ok(Self {
             id,
             profile: profile.clone(),
-        }
+            validated_options,
+            authorizations,
+        })
     }
 
     pub const fn id(&self) -> ProfileSnapshotId {
@@ -181,6 +218,14 @@ impl ProfileSnapshot {
 
     pub fn profile(&self) -> &SyncProfile {
         &self.profile
+    }
+
+    pub const fn validated_options(&self) -> ValidatedSyncOptions {
+        self.validated_options
+    }
+
+    pub const fn authorizations(&self) -> AuthorizationSnapshot {
+        self.authorizations
     }
 }
 
@@ -273,12 +318,24 @@ pub struct SyncRun {
 }
 
 impl SyncRun {
-    pub fn new(id: RunId, profile: &SyncProfile) -> Self {
-        Self {
+    pub fn new(id: RunId, profile: &SyncProfile) -> Result<Self, ProcessSpecError> {
+        Self::new_with_authorizations(id, profile, AuthorizationSnapshot::default())
+    }
+
+    pub fn new_with_authorizations(
+        id: RunId,
+        profile: &SyncProfile,
+        authorizations: AuthorizationSnapshot,
+    ) -> Result<Self, ProcessSpecError> {
+        Ok(Self {
             id,
-            snapshot: ProfileSnapshot::new(ProfileSnapshotId::new(id.value()), profile),
+            snapshot: ProfileSnapshot::new_with_authorizations(
+                ProfileSnapshotId::new(id.value()),
+                profile,
+                authorizations,
+            )?,
             state: RunState::Active(ActiveRunState::IdleEdit),
-        }
+        })
     }
 
     pub const fn id(&self) -> RunId {
