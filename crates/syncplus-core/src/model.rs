@@ -68,11 +68,61 @@ pub enum DeletionMethod {
     PermanentRemoval,
 }
 
+/// Metadata that a transfer must preserve and verify before it can enter a
+/// Safe Delete proof boundary. The default is the essential V1 contract;
+/// timestamps are opt-in because they require an explicit preservation step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataRequirements {
+    file_type: bool,
+    executable_permissions: bool,
+    symlink_targets: bool,
+    timestamps: bool,
+}
+
+impl MetadataRequirements {
+    pub const fn new(
+        file_type: bool,
+        executable_permissions: bool,
+        symlink_targets: bool,
+        timestamps: bool,
+    ) -> Self {
+        Self {
+            file_type,
+            executable_permissions,
+            symlink_targets,
+            timestamps,
+        }
+    }
+
+    pub const fn file_type(self) -> bool {
+        self.file_type
+    }
+
+    pub const fn executable_permissions(self) -> bool {
+        self.executable_permissions
+    }
+
+    pub const fn symlink_targets(self) -> bool {
+        self.symlink_targets
+    }
+
+    pub const fn timestamps(self) -> bool {
+        self.timestamps
+    }
+}
+
+impl Default for MetadataRequirements {
+    fn default() -> Self {
+        Self::new(true, true, true, false)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncOptions {
     pub safe_delete: bool,
     pub destination_cleanup: bool,
     pub deletion_method: Option<DeletionMethod>,
+    pub metadata: MetadataRequirements,
 }
 
 impl Default for SyncOptions {
@@ -81,6 +131,7 @@ impl Default for SyncOptions {
             safe_delete: false,
             destination_cleanup: false,
             deletion_method: None,
+            metadata: MetadataRequirements::default(),
         }
     }
 }

@@ -7,7 +7,7 @@ use std::{
     time::SystemTime,
 };
 
-use crate::{OneWaySource, ProcessSpecError, ProcessSpecification, SyncProfile};
+use crate::{ActionId, OneWaySource, ProcessSpecError, ProcessSpecification, SyncProfile};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +203,7 @@ pub enum PlanActionKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanAction {
+    action_id: ActionId,
     relative_path: PathBuf,
     kind: PlanActionKind,
     consequence: &'static str,
@@ -211,6 +212,10 @@ pub struct PlanAction {
 }
 
 impl PlanAction {
+    pub const fn action_id(&self) -> ActionId {
+        self.action_id
+    }
+
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
     }
@@ -882,6 +887,7 @@ fn build_plan(
         .map(|item| (item.relative_path.clone(), item))
         .collect();
     let mut actions = Vec::new();
+    let mut next_action_id: ActionId = 1;
 
     for source_item in source.included_items() {
         let destination_item = destination_by_path
@@ -902,12 +908,14 @@ fn build_plan(
 
         if let Some(kind) = transfer_kind {
             actions.push(PlanAction {
+                action_id: next_action_id,
                 relative_path: source_item.relative_path.clone(),
                 kind,
                 consequence: consequence_for(kind),
                 source_side,
                 size: data_size(source_item),
             });
+            next_action_id += 1;
         }
 
         let destination_is_eligible_or_absent =
@@ -918,12 +926,14 @@ fn build_plan(
         {
             let kind = PlanActionKind::RemoveSourceAfterVerification;
             actions.push(PlanAction {
+                action_id: next_action_id,
                 relative_path: source_item.relative_path.clone(),
                 kind,
                 consequence: consequence_for(kind),
                 source_side,
                 size: data_size(source_item),
             });
+            next_action_id += 1;
         }
     }
 
@@ -932,12 +942,14 @@ fn build_plan(
             if !source_by_path.contains_key(destination_item.relative_path()) {
                 let kind = PlanActionKind::RemoveDestination;
                 actions.push(PlanAction {
+                    action_id: next_action_id,
                     relative_path: destination_item.relative_path.clone(),
                     kind,
                     consequence: consequence_for(kind),
                     source_side,
                     size: data_size(destination_item),
                 });
+                next_action_id += 1;
             }
         }
     }

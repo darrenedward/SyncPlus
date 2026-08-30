@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{
-    DeletionMethod, OneWaySource, PeerSide, PlanAction, PlanActionKind, SyncMode, SyncOptions,
-    SyncProfile,
+    DeletionMethod, MetadataRequirements, OneWaySource, PeerSide, PlanAction, PlanActionKind,
+    SyncMode, SyncOptions, SyncProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -158,6 +158,7 @@ pub struct ValidatedSyncOptions {
     safe_delete: bool,
     destination_cleanup: bool,
     deletion_method: Option<DeletionMethod>,
+    metadata: MetadataRequirements,
 }
 
 impl ValidatedSyncOptions {
@@ -171,6 +172,10 @@ impl ValidatedSyncOptions {
 
     pub const fn deletion_method(self) -> Option<DeletionMethod> {
         self.deletion_method
+    }
+
+    pub const fn metadata(self) -> MetadataRequirements {
+        self.metadata
     }
 }
 
@@ -192,6 +197,7 @@ impl SyncOptions {
             safe_delete: self.safe_delete,
             destination_cleanup: self.destination_cleanup,
             deletion_method: self.deletion_method,
+            metadata: self.metadata,
         })
     }
 }
@@ -338,9 +344,32 @@ impl ProcessSpecification {
         }
         validate_relative_transfer_path(action.relative_path())?;
         Ok((
-            self.source_root.join(action.relative_path()),
-            self.destination_root.join(action.relative_path()),
+            self.source_path(action)?,
+            self.destination_path(action)?,
         ))
+    }
+
+    pub(crate) fn source_path(&self, action: &PlanAction) -> Result<PathBuf, ProcessSpecError> {
+        if action.source_side() != PeerSide::from(self.source) {
+            return Err(ProcessSpecError::ActionSourceMismatch);
+        }
+        validate_relative_transfer_path(action.relative_path())?;
+        Ok(self.source_root.join(action.relative_path()))
+    }
+
+    pub(crate) fn destination_path(
+        &self,
+        action: &PlanAction,
+    ) -> Result<PathBuf, ProcessSpecError> {
+        if action.source_side() != PeerSide::from(self.source) {
+            return Err(ProcessSpecError::ActionSourceMismatch);
+        }
+        validate_relative_transfer_path(action.relative_path())?;
+        Ok(self.destination_root.join(action.relative_path()))
+    }
+
+    pub(crate) fn source_root(&self) -> &Path {
+        &self.source_root
     }
 
     pub fn preview(&self) -> String {

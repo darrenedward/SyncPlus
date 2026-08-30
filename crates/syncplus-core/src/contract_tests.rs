@@ -24,6 +24,7 @@ fn new_profiles_default_to_non_destructive_one_way_sync() {
             safe_delete: false,
             destination_cleanup: false,
             deletion_method: None,
+            metadata: Default::default(),
         }
     );
 }
@@ -34,6 +35,7 @@ fn invalid_profiles_cannot_create_active_runs() {
         safe_delete: true,
         destination_cleanup: false,
         deletion_method: None,
+        metadata: Default::default(),
     });
 
     assert!(SyncRun::new(RunId::new(8), &invalid).is_err());
