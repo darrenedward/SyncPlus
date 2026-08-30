@@ -193,6 +193,15 @@ impl From<OneWaySource> for PeerSide {
     }
 }
 
+impl PeerSide {
+    pub const fn opposite(self) -> Self {
+        match self {
+            Self::PeerA => Self::PeerB,
+            Self::PeerB => Self::PeerA,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanActionKind {
     CopyToDestination,

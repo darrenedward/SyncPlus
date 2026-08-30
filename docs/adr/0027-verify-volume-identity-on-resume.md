@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Verify external volume identity before resume

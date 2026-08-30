@@ -14,6 +14,7 @@ use crate::{
     ProfileSnapshotId, ReconciliationFindingKind, ReconciliationReason, RetryPolicy, RunId,
     SourceDrainStatus, SourceInventorySnapshot, SyncMode, SyncOptions, SyncProfile,
     ValidatedSyncOptions, CompletionReconciliation, AnalysisOutcome, InventorySnapshotItem,
+    VolumeIdentity,
 };
 
 pub type ActionId = u64;
@@ -25,6 +26,8 @@ pub struct RunSnapshot {
     profile: SyncProfile,
     validated_options: ValidatedSyncOptions,
     authorizations: AuthorizationSnapshot,
+    peer_a_volume_identity: Option<VolumeIdentity>,
+    peer_b_volume_identity: Option<VolumeIdentity>,
 }
 
 impl RunSnapshot {
@@ -32,6 +35,22 @@ impl RunSnapshot {
         run_id: RunId,
         profile: &SyncProfile,
         authorizations: AuthorizationSnapshot,
+    ) -> Result<Self, StorageError> {
+        Self::from_profile_with_volume_identities(
+            run_id,
+            profile,
+            authorizations,
+            None,
+            None,
+        )
+    }
+
+    pub fn from_profile_with_volume_identities(
+        run_id: RunId,
+        profile: &SyncProfile,
+        authorizations: AuthorizationSnapshot,
+        peer_a_volume_identity: Option<VolumeIdentity>,
+        peer_b_volume_identity: Option<VolumeIdentity>,
     ) -> Result<Self, StorageError> {
         let specification =
             ProcessSpecification::from_profile(profile).map_err(StorageError::InvalidProfile)?;
@@ -51,6 +70,8 @@ impl RunSnapshot {
             profile: profile.clone(),
             validated_options: specification.options(),
             authorizations,
+            peer_a_volume_identity,
+            peer_b_volume_identity,
         })
     }
 
@@ -72,6 +93,21 @@ impl RunSnapshot {
 
     pub const fn authorizations(&self) -> AuthorizationSnapshot {
         self.authorizations
+    }
+
+    pub const fn peer_a_volume_identity(&self) -> Option<VolumeIdentity> {
+        self.peer_a_volume_identity
+    }
+
+    pub const fn peer_b_volume_identity(&self) -> Option<VolumeIdentity> {
+        self.peer_b_volume_identity
+    }
+
+    pub const fn volume_identity(&self, side: PeerSide) -> Option<VolumeIdentity> {
+        match side {
+            PeerSide::PeerA => self.peer_a_volume_identity,
+            PeerSide::PeerB => self.peer_b_volume_identity,
+        }
     }
 }
 
@@ -655,7 +691,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 6 {
+        if version > 7 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -826,6 +862,20 @@ impl RunEvidenceStore {
             )?;
             transaction.pragma_update(None, "user_version", 6)?;
             transaction.commit()?;
+            version = 6;
+        }
+        if version == 6 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                ALTER TABLE run_snapshots
+                    ADD COLUMN peer_a_volume_identity BLOB;
+                ALTER TABLE run_snapshots
+                    ADD COLUMN peer_b_volume_identity BLOB;
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 7)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -845,13 +895,14 @@ impl RunEvidenceStore {
             "INSERT INTO run_snapshots (
                 run_id, snapshot_id, profile_name,
                 peer_a_name, peer_a_root, peer_b_name, peer_b_root,
+                peer_a_volume_identity, peer_b_volume_identity,
                 mode, source, safe_delete, destination_cleanup, deletion_method,
                 allow_unattended_destructive, allow_unattended_permanent_removal,
                 metadata_file_type, metadata_executable_permissions,
                 metadata_symlink_targets, metadata_timestamps,
                 partial_transfer_policy, retry_max_attempts,
                 retry_initial_delay_millis
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             params![
                 snapshot.run_id().value(),
                 snapshot.snapshot_id().value(),
@@ -860,6 +911,12 @@ impl RunEvidenceStore {
                 path_to_blob(profile.peer_a().root()),
                 profile.peer_b().name(),
                 path_to_blob(profile.peer_b().root()),
+                snapshot
+                    .peer_a_volume_identity()
+                    .map(volume_identity_to_blob),
+                snapshot
+                    .peer_b_volume_identity()
+                    .map(volume_identity_to_blob),
                 encode_mode(profile.mode()),
                 encode_source(profile.source()),
                 bool_to_int(options.safe_delete()),
@@ -1121,7 +1178,8 @@ impl RunEvidenceStore {
             .connection
             .query_row(
                 "SELECT snapshot_id, profile_name, peer_a_name, peer_a_root,
-                        peer_b_name, peer_b_root, mode, source, safe_delete,
+                        peer_b_name, peer_b_root, peer_a_volume_identity,
+                        peer_b_volume_identity, mode, source, safe_delete,
                         destination_cleanup, deletion_method,
                         allow_unattended_destructive, allow_unattended_permanent_removal,
                         metadata_file_type, metadata_executable_permissions,
@@ -1138,20 +1196,22 @@ impl RunEvidenceStore {
                         row.get::<_, Vec<u8>>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, Vec<u8>>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, bool>(8)?,
-                        row.get::<_, bool>(9)?,
-                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
+                        row.get::<_, Option<Vec<u8>>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, bool>(10)?,
                         row.get::<_, bool>(11)?,
-                        row.get::<_, bool>(12)?,
+                        row.get::<_, Option<String>>(12)?,
                         row.get::<_, bool>(13)?,
                         row.get::<_, bool>(14)?,
                         row.get::<_, bool>(15)?,
                         row.get::<_, bool>(16)?,
-                        row.get::<_, String>(17)?,
-                        row.get::<_, u8>(18)?,
-                        row.get::<_, u64>(19)?,
+                        row.get::<_, bool>(17)?,
+                        row.get::<_, bool>(18)?,
+                        row.get::<_, String>(19)?,
+                        row.get::<_, u8>(20)?,
+                        row.get::<_, u64>(21)?,
                     ))
                 },
             )
@@ -1163,6 +1223,8 @@ impl RunEvidenceStore {
             peer_a_root,
             peer_b_name,
             peer_b_root,
+            peer_a_volume_identity,
+            peer_b_volume_identity,
             mode,
             source,
             safe_delete,
@@ -1218,13 +1280,15 @@ impl RunEvidenceStore {
             ),
         })
         .with_exclusions(exclusions);
-        let mut snapshot = RunSnapshot::from_profile(
+        let mut snapshot = RunSnapshot::from_profile_with_volume_identities(
             run_id,
             &profile,
             AuthorizationSnapshot::new(
                 allow_unattended_destructive,
                 allow_unattended_permanent_removal,
             ),
+            decode_volume_identity(peer_a_volume_identity.as_deref())?,
+            decode_volume_identity(peer_b_volume_identity.as_deref())?,
         )?;
         snapshot.snapshot_id = ProfileSnapshotId::new(snapshot_id);
         if mode != "one_way" {
@@ -3055,6 +3119,20 @@ fn path_to_blob(path: &Path) -> Vec<u8> {
     {
         path.to_string_lossy().as_bytes().to_vec()
     }
+}
+
+fn volume_identity_to_blob(identity: VolumeIdentity) -> Vec<u8> {
+    identity.device().to_le_bytes().to_vec()
+}
+
+fn decode_volume_identity(bytes: Option<&[u8]>) -> Result<Option<VolumeIdentity>, StorageError> {
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+        StorageError::CorruptEvidence("volume identity must contain an 8-byte device number".to_owned())
+    })?;
+    Ok(Some(VolumeIdentity::new(u64::from_le_bytes(bytes))))
 }
 
 fn blob_to_path(bytes: &[u8]) -> Result<PathBuf, StorageError> {
