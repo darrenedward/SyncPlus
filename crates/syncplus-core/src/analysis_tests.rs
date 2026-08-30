@@ -91,10 +91,11 @@ fn hidden_items_are_included_and_inventory_records_identity_type_metadata_and_ou
 }
 
 #[test]
-fn syncplus_partial_artifacts_are_hidden_from_user_inventory() {
+fn only_owned_syncplus_transfer_artifacts_are_hidden_from_user_inventory() {
     let source = TestDirectory::new("partial-artifact-source");
     let destination = TestDirectory::new("partial-artifact-destination");
     write_file(&source.join(".syncplus-partial-123-copy.txt"), b"partial");
+    write_file(&source.join(".syncplus-user-file.txt"), b"user file");
     write_file(&source.join("visible.txt"), b"visible");
 
     let analysis = FreshAnalysis::analyze(&profile(&source, &destination))
@@ -103,6 +104,10 @@ fn syncplus_partial_artifacts_are_hidden_from_user_inventory() {
         .source_inventory()
         .item(".syncplus-partial-123-copy.txt")
         .is_none());
+    assert!(analysis
+        .source_inventory()
+        .item(".syncplus-user-file.txt")
+        .is_some());
     assert!(analysis.source_inventory().item("visible.txt").is_some());
 }
 

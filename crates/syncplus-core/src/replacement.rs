@@ -8,7 +8,8 @@ use std::{
 
 use crate::{
     verify_content, verify_content_with_cancel, FileMetadataProof, MetadataRequirements,
-    PartialTransferPolicy, SourceObservation, VerificationError, VerifiedTransferProof,
+    PartialTransferPolicy, ProcessError, SourceObservation, VerificationError,
+    VerifiedTransferProof,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +50,7 @@ impl VerifiedReplacement {
 pub enum ReplacementError {
     Io(String),
     Transfer(String),
+    Process(ProcessError),
     ProcessExit { exit_code: Option<i32>, signal: Option<i32> },
     Verification(VerificationError),
     MetadataMismatch,
@@ -61,6 +63,7 @@ impl std::fmt::Display for ReplacementError {
         match self {
             Self::Io(reason) => write!(formatter, "replacement filesystem error: {reason}"),
             Self::Transfer(reason) => write!(formatter, "transfer failed: {reason}"),
+            Self::Process(error) => error.fmt(formatter),
             Self::ProcessExit { exit_code, signal } => {
                 write!(formatter, "controlled transfer exited with code {exit_code:?} and signal {signal:?}")
             }
@@ -747,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn keep_partial_for_resume_is_explicit_hidden_and_cleaned_before_resume() {
+    fn keep_partial_for_resume_is_explicit_hidden_and_cleaned_explicitly() {
         let fixture = Fixture::new();
         let source = fixture.path.join("source.txt");
         let destination = fixture.path.join("destination.txt");

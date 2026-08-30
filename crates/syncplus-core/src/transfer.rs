@@ -17,11 +17,9 @@ impl TransferError {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Process(ProcessError::Io(_)) => true,
+            Self::Replacement(ReplacementError::Process(ProcessError::Io(_))) => true,
             Self::Replacement(ReplacementError::ProcessExit { signal, exit_code }) => {
-                signal.is_some() || matches!(exit_code, Some(10 | 11 | 30 | 35))
-            }
-            Self::Replacement(ReplacementError::Transfer(reason)) => {
-                reason.contains("I/O") || reason.contains("timed out")
+                signal.is_none() && matches!(exit_code, Some(10 | 11 | 30 | 35))
             }
             Self::Process(_) => false,
             Self::InvalidProcessSpecification(_)
@@ -36,6 +34,9 @@ impl TransferError {
             self,
             Self::Process(ProcessError::OrphanedProcessGroup)
                 | Self::Process(ProcessError::ProcessGroup(_))
+                | Self::Replacement(ReplacementError::Process(
+                    ProcessError::OrphanedProcessGroup | ProcessError::ProcessGroup(_),
+                ))
                 | Self::Replacement(ReplacementError::ProcessExit {
                     signal: Some(_),
                     ..
@@ -216,7 +217,7 @@ impl ControlledTransfer {
                     .map_err(|error| ReplacementError::Transfer(error.to_string()))?;
                 let outcome = supervisor
                     .run(&invocation, &should_cancel)
-                    .map_err(|error| ReplacementError::Transfer(error.to_string()))?;
+                    .map_err(ReplacementError::Process)?;
                 if outcome.cancelled() {
                     return Err(ReplacementError::Cancelled);
                 }

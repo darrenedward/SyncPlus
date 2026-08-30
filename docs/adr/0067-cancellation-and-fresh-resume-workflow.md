@@ -15,7 +15,7 @@ source and any previous destination version preserved.
 Incomplete transfer files use a SyncPlus-owned hidden name. Cleanup is the
 default policy. **Keep Partial for Resume** is an explicit profile option;
 retained files are excluded from Source Inventory, are never treated as
-verified content, and are cleaned before a resumed transfer begins.
+verified content, and remain until the resumed run completes successfully.
 
 An open journal boundary is classified on restart. Ordinary transfer
 boundaries become an `Interrupted` Action. Boundaries after Safe Delete proof

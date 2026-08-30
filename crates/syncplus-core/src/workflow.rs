@@ -11,16 +11,20 @@ use crate::{
     ActionOutcome, ActionReason, AnalysisError, ConfirmedPlan, ControlledTransfer, ContentProof,
     FileMetadataProof, FreshAnalysis, JournalEvent, OneWayPlan,
     PlanAction, PlanActionKind, PlanRecord, PreActionState, ProcessError, ProcessSpecification,
-    RecoveryEvidence, RecoveryMethod, ReplacementError, RetryPolicy, RunEvidenceStore, RunId,
-    RunReport, RunReportStatus, RunSnapshot, SafeDeleteError,
+    PrecheckErrorKind, PrecheckFailure, PrecheckLease, PrecheckProbe, RecoveryEvidence,
+    RecoveryMethod, ReplacementError, RetryPolicy, RunEvidenceStore, RunId, RunPrecheck,
+    RunReport, RunReportStatus, RunSnapshot, SafeDeleteError, ScopeLockOwner,
+    PeerScopeLockRegistry,
     StorageError, TransferError, VerificationError, VerifiedReplacement,
 };
 
 #[derive(Debug)]
 pub enum WorkflowError {
     Analysis(AnalysisError),
+    Precheck(PrecheckFailure),
     Storage(StorageError),
     Verification(VerificationError),
+    ConfirmationRequired,
     InvalidRun(String),
     Io(String),
 }
@@ -29,8 +33,12 @@ impl std::fmt::Display for WorkflowError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Analysis(error) => error.fmt(formatter),
+            Self::Precheck(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
             Self::Verification(error) => error.fmt(formatter),
+            Self::ConfirmationRequired => {
+                formatter.write_str("explicit Execution Confirmation was not given")
+            }
             Self::InvalidRun(reason) => write!(formatter, "invalid Sync Run: {reason}"),
             Self::Io(reason) => write!(formatter, "Sync Run filesystem operation failed: {reason}"),
         }
@@ -61,6 +69,7 @@ impl From<VerificationError> for WorkflowError {
 pub struct RunWorkflow {
     transfer: ControlledTransfer,
     recovery_method: RecoveryMethod,
+    scope_locks: PeerScopeLockRegistry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +83,7 @@ impl RunWorkflow {
         Self {
             transfer: ControlledTransfer::default(),
             recovery_method,
+            scope_locks: PeerScopeLockRegistry::new(),
         }
     }
 
@@ -84,31 +94,58 @@ impl RunWorkflow {
         Self {
             transfer: ControlledTransfer::new(supervisor),
             recovery_method,
+            scope_locks: PeerScopeLockRegistry::new(),
         }
     }
 
-    /// Analyze, confirm, and execute one reviewed run. Callers that have a
-    /// separate UI confirmation should use `execute_confirmed` after calling
-    /// `FreshAnalysis::confirm` at the confirmation boundary.
-    pub fn execute<F>(
+    /// Construct a workflow that shares Peer Scope Locks with other manual,
+    /// scheduled, or background workflows in the process.
+    pub fn with_scope_lock_registry(
+        supervisor: crate::ProcessSupervisor,
+        recovery_method: RecoveryMethod,
+        scope_locks: PeerScopeLockRegistry,
+    ) -> Self {
+        Self {
+            transfer: ControlledTransfer::new(supervisor),
+            recovery_method,
+            scope_locks,
+        }
+    }
+
+    /// Run the complete safety lifecycle: Run Precheck, Fresh Analysis,
+    /// explicit Execution Confirmation, and execution while the peer scopes
+    /// remain locked. The confirmation callback is the UI's final approval;
+    /// it runs after the plan has been freshly revalidated.
+    pub fn execute<P, C, F>(
         &self,
         run_id: RunId,
         profile: &crate::SyncProfile,
+        probe: &P,
+        confirm: C,
         store: &mut RunEvidenceStore,
         should_cancel: F,
     ) -> Result<RunReport, WorkflowError>
     where
+        P: PrecheckProbe,
+        C: FnOnce(&ConfirmedPlan) -> bool,
         F: Fn() -> bool,
     {
+        let _lease = self.acquire_precheck(run_id, profile, probe)?;
         let analysis = FreshAnalysis::analyze(profile)?;
         let confirmed = analysis.confirm(profile)?;
-        self.execute_confirmed(run_id, &confirmed, store, should_cancel)
+        if !confirm(&confirmed) {
+            return Err(WorkflowError::ConfirmationRequired);
+        }
+        self.recheck_precheck(profile, probe)?;
+        let report = self.execute_confirmed(run_id, &confirmed, store, should_cancel)?;
+        self.cleanup_partials_after_success(&confirmed, &report)?;
+        Ok(report)
     }
 
     /// Execute only a plan that has passed the Fresh Analysis confirmation
     /// gate. Every action is planned durably before the first filesystem
     /// mutation, and cancellation settles the remaining planned actions.
-    pub fn execute_confirmed<F>(
+    fn execute_confirmed<F>(
         &self,
         run_id: RunId,
         confirmed: &ConfirmedPlan,
@@ -154,13 +191,21 @@ impl RunWorkflow {
     /// Analysis creates a new Sync Run for the remaining current scope.
     /// Completed filesystem work is not replayed unless Fresh Analysis shows
     /// that the current peers require it again.
-    pub fn resume<F>(
+    /// Resume an incomplete run through the same precheck, lock, Fresh
+    /// Analysis, and explicit confirmation gates as a new run. The old run's
+    /// open action boundaries are classified before this method creates a new
+    /// Sync Run.
+    pub fn resume<P, C, F>(
         &self,
         run_id: RunId,
+        probe: &P,
+        confirm: C,
         store: &mut RunEvidenceStore,
         should_cancel: F,
     ) -> Result<RunReport, WorkflowError>
     where
+        P: PrecheckProbe,
+        C: FnOnce(&ConfirmedPlan) -> bool,
         F: Fn() -> bool,
     {
         let report = store.load_report(run_id)?;
@@ -178,7 +223,10 @@ impl RunWorkflow {
             ));
         }
 
-        self.classify_open_actions(run_id, report.snapshot().profile(), &report, store)?;
+        let profile = report.snapshot().profile().clone();
+        let next_run_id = store.next_run_id()?;
+        let _lease = self.acquire_precheck(next_run_id, &profile, probe)?;
+        self.classify_open_actions(run_id, &profile, &report, store)?;
         let reopened = store.load_report(run_id)?;
         if reopened.status() == RunReportStatus::RecoveryReview {
             return Err(WorkflowError::InvalidRun(
@@ -189,10 +237,61 @@ impl RunWorkflow {
         let profile = reopened.snapshot().profile().clone();
         let analysis = FreshAnalysis::analyze(&profile)?;
         let confirmed = analysis.confirm(&profile)?;
-        cleanup_partial_transfer_artifacts(destination_root(&profile))
-            .map_err(|error| WorkflowError::Io(error.to_string()))?;
-        let next_run_id = store.next_run_id()?;
-        self.execute_confirmed(next_run_id, &confirmed, store, should_cancel)
+        if !confirm(&confirmed) {
+            return Err(WorkflowError::ConfirmationRequired);
+        }
+        self.recheck_precheck(&profile, probe)?;
+        let report = self.execute_confirmed(next_run_id, &confirmed, store, should_cancel)?;
+        self.cleanup_partials_after_success(&confirmed, &report)?;
+        Ok(report)
+    }
+
+    fn acquire_precheck<P: PrecheckProbe>(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        probe: &P,
+    ) -> Result<PrecheckLease, WorkflowError> {
+        RunPrecheck::check_and_lock(
+            profile,
+            probe,
+            &self.scope_locks,
+            ScopeLockOwner::new(profile.name(), run_id),
+        )
+        .map_err(WorkflowError::Precheck)
+    }
+
+    fn recheck_precheck<P: PrecheckProbe>(
+        &self,
+        profile: &crate::SyncProfile,
+        probe: &P,
+    ) -> Result<(), WorkflowError> {
+        let result = RunPrecheck::check(profile, probe).map_err(|error| {
+            WorkflowError::Precheck(match error {
+                PrecheckErrorKind::InvalidSpecification(error) => {
+                    PrecheckFailure::InvalidSpecification(error)
+                }
+                PrecheckErrorKind::Probe(error) => PrecheckFailure::Probe(error),
+            })
+        })?;
+        result
+            .require_passed()
+            .map_err(|blocked| WorkflowError::Precheck(PrecheckFailure::Blocked(blocked)))
+    }
+
+    fn cleanup_partials_after_success(
+        &self,
+        confirmed: &ConfirmedPlan,
+        report: &RunReport,
+    ) -> Result<(), WorkflowError> {
+        if confirmed.plan().specification().options().partial_transfer_policy()
+            == crate::PartialTransferPolicy::KeepPartialForResume
+            && report.status() == RunReportStatus::Completed
+        {
+            cleanup_partial_transfer_artifacts(destination_root(confirmed.profile()))
+                .map_err(|error| WorkflowError::Io(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn persist_plan(
@@ -660,6 +759,9 @@ fn transfer_reason(error: &TransferError) -> ActionReason {
             ActionReason::VerificationMismatch
         }
         TransferError::Replacement(ReplacementError::RecoveryUncertain(_))
+        | TransferError::Replacement(ReplacementError::Process(
+            ProcessError::OrphanedProcessGroup | ProcessError::ProcessGroup(_),
+        ))
         | TransferError::Process(ProcessError::OrphanedProcessGroup)
         | TransferError::Process(ProcessError::ProcessGroup(_)) => {
             ActionReason::InterruptedBoundary
@@ -703,7 +805,9 @@ mod tests {
         ActionOutcome, AuthorizationSnapshot, ContentProof, DeletionMethod, FreshAnalysis,
         ItemType, JournalEvent, OneWaySource, Peer, PeerSide, PlanActionKind, PlanRecord,
         PreActionState, ProcessError, RecoveryEvidence, RecoveryMethod, RetryPolicy,
-        RunEvidenceStore, RunId, RunReportStatus, SyncOptions, SyncProfile,
+        LocalPrecheckProbe, PartialTransferPolicy, PeerScope, PeerScopeLockRegistry,
+        PrecheckFailure,
+        RunEvidenceStore, RunId, RunReportStatus, ScopeLockOwner, SyncOptions, SyncProfile,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(1);
@@ -756,6 +860,67 @@ mod tests {
             fs::create_dir_all(parent).expect("fixture parent should be creatable");
         }
         fs::write(path, contents).expect("fixture file should be writable");
+    }
+
+    #[test]
+    fn workflow_requires_explicit_confirmation_before_journaling_or_mutation() {
+        let fixture = Fixture::new();
+        write_file(&fixture.source().join("pending.txt"), b"pending");
+        fs::create_dir_all(fixture.destination()).expect("destination should be creatable");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let error = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute(
+                RunId::new(1),
+                &fixture.profile(),
+                &LocalPrecheckProbe::default(),
+                |_| false,
+                &mut store,
+                || false,
+            )
+            .expect_err("execution must stop without final user approval");
+
+        assert!(matches!(error, super::WorkflowError::ConfirmationRequired));
+        assert!(!fixture.destination().join("pending.txt").exists());
+        assert!(store.load_report(RunId::new(1)).is_err());
+    }
+
+    #[test]
+    fn workflow_holds_a_shared_peer_scope_lock_before_execution() {
+        let fixture = Fixture::new();
+        write_file(&fixture.source().join("pending.txt"), b"pending");
+        fs::create_dir_all(fixture.destination()).expect("destination should be creatable");
+        let registry = PeerScopeLockRegistry::new();
+        let held = registry
+            .acquire(
+                ScopeLockOwner::new("other profile", RunId::new(99)),
+                [PeerScope::new(fixture.source()), PeerScope::new(fixture.destination())],
+            )
+            .expect("fixture lock should be acquired");
+        let workflow = RunWorkflow::with_scope_lock_registry(
+            crate::ProcessSupervisor::default(),
+            RecoveryMethod::trash(fixture.root.join("trash")),
+            registry,
+        );
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let error = workflow
+            .execute(
+                RunId::new(1),
+                &fixture.profile(),
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect_err("overlapping scope must block before mutation");
+
+        assert!(matches!(
+            error,
+            super::WorkflowError::Precheck(PrecheckFailure::ScopeLocked(_))
+        ));
+        assert!(!fixture.destination().join("pending.txt").exists());
+        drop(held);
     }
 
     fn plan_record_for_source(action_id: u64, path: &Path, relative: &str) -> PlanRecord {
@@ -816,6 +981,76 @@ mod tests {
     }
 
     #[test]
+    fn keep_partial_remains_until_a_resumed_run_completes() {
+        let fixture = Fixture::new();
+        let source = fixture.source().join("large.bin");
+        let destination = fixture.destination().join("large.bin");
+        write_file(&source, &vec![0x2a; 32 * 1024 * 1024]);
+        write_file(&destination, b"previous destination");
+        let profile = fixture.profile().with_options(SyncOptions {
+            partial_transfer_policy: PartialTransferPolicy::KeepPartialForResume,
+            ..SyncOptions::default()
+        });
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+        let calls = AtomicUsize::new(0);
+        let workflow = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")));
+
+        let cancelled = workflow
+            .execute(
+                RunId::new(1),
+                &profile,
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || calls.fetch_add(1, Ordering::Relaxed) >= 516,
+            )
+            .expect("cancellation should produce a durable report");
+        assert_eq!(cancelled.status(), RunReportStatus::Cancelled);
+        assert!(fs::read_dir(fixture.destination())
+            .expect("destination should be readable")
+            .any(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".syncplus-partial-")
+            }));
+
+        let resumed = workflow
+            .resume(
+                RunId::new(1),
+                &LocalPrecheckProbe::default(),
+                |_| {
+                    assert!(fs::read_dir(fixture.destination())
+                        .expect("destination should be readable")
+                        .any(|entry| {
+                            entry
+                                .expect("directory entry")
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(".syncplus-partial-")
+                        }));
+                    true
+                },
+                &mut store,
+                || false,
+            )
+            .expect("resume should finish the retained partial transfer");
+
+        assert_eq!(resumed.status(), RunReportStatus::Completed);
+        assert_eq!(fs::read(destination).expect("destination should be installed"), vec![0x2a; 32 * 1024 * 1024]);
+        assert!(!fs::read_dir(fixture.destination())
+            .expect("destination should be readable")
+            .any(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".syncplus-partial-")
+            }));
+    }
+
+    #[test]
     fn cancellation_before_execution_marks_all_remaining_actions_cancelled() {
         let fixture = Fixture::new();
         write_file(&fixture.source().join("a.txt"), b"a");
@@ -827,6 +1062,8 @@ mod tests {
             .execute(
                 RunId::new(1),
                 &fixture.profile(),
+                &LocalPrecheckProbe::default(),
+                |_| true,
                 &mut store,
                 || true,
             )
@@ -891,7 +1128,14 @@ mod tests {
         fs::create_dir_all(&trash).expect("trash should be creatable");
         let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
         let report = RunWorkflow::new(RecoveryMethod::trash(&trash))
-            .execute(RunId::new(1), &profile, &mut store, || false)
+            .execute(
+                RunId::new(1),
+                &profile,
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
             .expect("Safe Delete should reverify equal content before removal");
 
         assert_eq!(report.status(), RunReportStatus::Completed);
@@ -949,7 +1193,13 @@ mod tests {
             .expect("persist recovery review");
 
         let error = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
-            .resume(run_id, &mut store, || false)
+            .resume(
+                run_id,
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
             .expect_err("an unresolved Recovery Review must not be bypassed");
         assert!(matches!(error, super::WorkflowError::InvalidRun(_)));
         assert!(!fixture.destination().join("uncertain.txt").exists());
@@ -998,7 +1248,13 @@ mod tests {
             .expect("start interrupted action");
 
         let resumed = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
-            .resume(RunId::new(1), &mut store, || false)
+            .resume(
+                RunId::new(1),
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
             .expect("resume should create a fresh run");
 
         assert_eq!(resumed.run_id(), RunId::new(2));
