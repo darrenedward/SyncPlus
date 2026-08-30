@@ -232,7 +232,7 @@ impl FileMetadataProof {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceObservation {
     metadata: FileMetadataProof,
-    content: ContentProof,
+    content: Option<ContentProof>,
 }
 
 impl SourceObservation {
@@ -248,12 +248,18 @@ impl SourceObservation {
         F: FnMut() -> bool,
     {
         let before = FileMetadataProof::capture(path)?;
-        if before.item_type != ItemType::RegularFile {
+        if before.item_type == ItemType::Unsupported {
             return Err(VerificationError::UnsupportedItem);
         }
-        let content = ContentProof::from_path_with_cancel(path, &mut cancelled)?;
+        let content = if before.item_type == ItemType::RegularFile {
+            Some(ContentProof::from_path_with_cancel(path, &mut cancelled)?)
+        } else {
+            None
+        };
         let after = FileMetadataProof::capture(path)?;
-        if !before.same_as(&after) || before.size != content.size {
+        if !before.same_as(&after)
+            || content.is_some_and(|content| before.size != content.size)
+        {
             return Err(VerificationError::SourceChanged);
         }
         Ok(Self {
@@ -266,13 +272,24 @@ impl SourceObservation {
         &self.metadata
     }
 
-    pub const fn content(&self) -> ContentProof {
+    pub fn content(&self) -> ContentProof {
+        self.content
+            .expect("content proofs are only available for regular files")
+    }
+
+    pub const fn content_proof(&self) -> Option<ContentProof> {
         self.content
     }
 
     pub fn recheck(&self, path: &Path) -> Result<(), VerificationError> {
         let current = Self::capture(path)?;
-        if self.metadata.same_as(&current.metadata) && self.content.matches(&current.content) {
+        if self.metadata.same_as(&current.metadata)
+            && match (self.content, current.content) {
+                (Some(expected), Some(actual)) => expected.matches(&actual),
+                (None, None) => true,
+                (Some(_), None) | (None, Some(_)) => false,
+            }
+        {
             Ok(())
         } else {
             Err(VerificationError::SourceChanged)
@@ -283,17 +300,17 @@ impl SourceObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedTransferProof {
     source_before: SourceObservation,
-    temporary_destination: ContentProof,
+    temporary_destination: Option<ContentProof>,
     source_after: SourceObservation,
-    installed_destination: ContentProof,
+    installed_destination: Option<ContentProof>,
 }
 
 impl VerifiedTransferProof {
     pub(crate) fn new(
         source_before: SourceObservation,
-        temporary_destination: ContentProof,
+        temporary_destination: Option<ContentProof>,
         source_after: SourceObservation,
-        installed_destination: ContentProof,
+        installed_destination: Option<ContentProof>,
     ) -> Self {
         Self {
             source_before,
@@ -307,7 +324,12 @@ impl VerifiedTransferProof {
         &self.source_before
     }
 
-    pub const fn temporary_destination(&self) -> ContentProof {
+    pub fn temporary_destination(&self) -> ContentProof {
+        self.temporary_destination
+            .expect("content proofs are only available for regular files")
+    }
+
+    pub const fn temporary_destination_proof(&self) -> Option<ContentProof> {
         self.temporary_destination
     }
 
@@ -315,7 +337,12 @@ impl VerifiedTransferProof {
         &self.source_after
     }
 
-    pub const fn installed_destination(&self) -> ContentProof {
+    pub fn installed_destination(&self) -> ContentProof {
+        self.installed_destination
+            .expect("content proofs are only available for regular files")
+    }
+
+    pub const fn installed_destination_proof(&self) -> Option<ContentProof> {
         self.installed_destination
     }
 

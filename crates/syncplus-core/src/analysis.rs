@@ -1,14 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    fs::{self, DirEntry, File, Metadata},
-    io::Read,
+    fs::{self, DirEntry, Metadata},
     path::{Path, PathBuf},
     time::SystemTime,
 };
 
-use crate::{ActionId, OneWaySource, ProcessSpecError, ProcessSpecification, SyncProfile};
-use sha2::{Digest, Sha256};
+use crate::{
+    ActionId, ContentProof, OneWaySource, ProcessSpecError, ProcessSpecification, SyncProfile,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemType {
@@ -23,6 +23,7 @@ pub struct ItemMetadata {
     size: u64,
     modified_at: Option<SystemTime>,
     readonly: bool,
+    permissions: Option<u32>,
     symlink_target: Option<PathBuf>,
 }
 
@@ -37,6 +38,14 @@ impl ItemMetadata {
 
     pub const fn is_readonly(&self) -> bool {
         self.readonly
+    }
+
+    pub const fn permissions(&self) -> Option<u32> {
+        self.permissions
+    }
+
+    pub fn executable_permissions(&self) -> Option<u32> {
+        self.permissions.map(|permissions| permissions & 0o111)
     }
 
     pub fn symlink_target(&self) -> Option<&Path> {
@@ -762,10 +771,14 @@ fn walk_directory(
         let content_fingerprint = if outcome == AnalysisOutcome::Included
             && item_type == ItemType::RegularFile
         {
-            Some(file_fingerprint(&absolute_path).map_err(|_| AnalysisError::ReadFileContents {
-                peer: peer.name().to_owned(),
-                path: relative_path.clone(),
-            })?)
+            Some(
+                *ContentProof::from_path(&absolute_path)
+                    .map_err(|_| AnalysisError::ReadFileContents {
+                        peer: peer.name().to_owned(),
+                        path: relative_path.clone(),
+                    })?
+                    .sha256(),
+            )
         } else {
             None
         };
@@ -822,8 +835,21 @@ fn metadata_snapshot(path: &Path, metadata: &Metadata) -> Result<ItemMetadata, (
         size: metadata.len(),
         modified_at: metadata.modified().ok(),
         readonly: metadata.permissions().readonly(),
+        permissions: permissions(metadata),
         symlink_target,
     })
+}
+
+#[cfg(unix)]
+fn permissions(metadata: &Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(metadata.mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn permissions(_metadata: &Metadata) -> Option<u32> {
+    None
 }
 
 fn matches_exclusion(relative_path: &Path, item_type: ItemType, pattern: &str) -> bool {
@@ -991,8 +1017,18 @@ fn build_plan(
 }
 
 fn same_item_state(source_item: &InventoryItem, destination_item: &InventoryItem) -> bool {
-    if source_item.item_type != destination_item.item_type
-        || source_item.metadata != destination_item.metadata
+    if source_item.item_type != destination_item.item_type {
+        return false;
+    }
+
+    let source_metadata = &source_item.metadata;
+    let destination_metadata = &destination_item.metadata;
+    if source_metadata.size != destination_metadata.size
+        || source_metadata.modified_at != destination_metadata.modified_at
+        || source_metadata.readonly != destination_metadata.readonly
+        || source_metadata.executable_permissions()
+            != destination_metadata.executable_permissions()
+        || source_metadata.symlink_target != destination_metadata.symlink_target
     {
         return false;
     }
@@ -1025,21 +1061,6 @@ fn data_size(item: &InventoryItem) -> Option<u64> {
     (item.item_type == ItemType::RegularFile).then_some(item.metadata.size)
 }
 
-fn file_fingerprint(path: &Path) -> Result<[u8; 32], ()> {
-    let mut file = File::open(path).map_err(|_| ())?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-
-    loop {
-        let read = file.read(&mut buffer).map_err(|_| ())?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok(hasher.finalize().into())
-}
 
 fn summary_for(actions: &[PlanAction], source: &SourceInventory) -> PlanSummary {
     let mut summary = PlanSummary {
