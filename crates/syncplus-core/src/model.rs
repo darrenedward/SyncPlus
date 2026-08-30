@@ -1,5 +1,7 @@
 use std::{fmt, path::Path, path::PathBuf};
 
+use crate::ValidatedSyncOptions;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunId(u64);
 
@@ -80,6 +82,32 @@ impl Default for SyncOptions {
             destination_cleanup: false,
             deletion_method: None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AuthorizationSnapshot {
+    allow_unattended_destructive: bool,
+    allow_unattended_permanent_removal: bool,
+}
+
+impl AuthorizationSnapshot {
+    pub const fn new(
+        allow_unattended_destructive: bool,
+        allow_unattended_permanent_removal: bool,
+    ) -> Self {
+        Self {
+            allow_unattended_destructive,
+            allow_unattended_permanent_removal,
+        }
+    }
+
+    pub const fn allow_unattended_destructive(self) -> bool {
+        self.allow_unattended_destructive
+    }
+
+    pub const fn allow_unattended_permanent_removal(self) -> bool {
+        self.allow_unattended_permanent_removal
     }
 }
 
@@ -165,13 +193,25 @@ impl SyncProfile {
 pub struct ProfileSnapshot {
     id: ProfileSnapshotId,
     profile: SyncProfile,
+    validated_options: Option<ValidatedSyncOptions>,
+    authorizations: AuthorizationSnapshot,
 }
 
 impl ProfileSnapshot {
     fn new(id: ProfileSnapshotId, profile: &SyncProfile) -> Self {
+        Self::new_with_authorizations(id, profile, AuthorizationSnapshot::default())
+    }
+
+    fn new_with_authorizations(
+        id: ProfileSnapshotId,
+        profile: &SyncProfile,
+        authorizations: AuthorizationSnapshot,
+    ) -> Self {
         Self {
             id,
             profile: profile.clone(),
+            validated_options: profile.options().validate().ok(),
+            authorizations,
         }
     }
 
@@ -181,6 +221,14 @@ impl ProfileSnapshot {
 
     pub fn profile(&self) -> &SyncProfile {
         &self.profile
+    }
+
+    pub const fn validated_options(&self) -> Option<ValidatedSyncOptions> {
+        self.validated_options
+    }
+
+    pub const fn authorizations(&self) -> AuthorizationSnapshot {
+        self.authorizations
     }
 }
 
@@ -277,6 +325,22 @@ impl SyncRun {
         Self {
             id,
             snapshot: ProfileSnapshot::new(ProfileSnapshotId::new(id.value()), profile),
+            state: RunState::Active(ActiveRunState::IdleEdit),
+        }
+    }
+
+    pub fn new_with_authorizations(
+        id: RunId,
+        profile: &SyncProfile,
+        authorizations: AuthorizationSnapshot,
+    ) -> Self {
+        Self {
+            id,
+            snapshot: ProfileSnapshot::new_with_authorizations(
+                ProfileSnapshotId::new(id.value()),
+                profile,
+                authorizations,
+            ),
             state: RunState::Active(ActiveRunState::IdleEdit),
         }
     }
