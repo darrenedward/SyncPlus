@@ -10,8 +10,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
     AuthorizationSnapshot, DeletionMethod, ItemType, MetadataRequirements, OneWaySource, Peer,
-    PeerSide, PlanActionKind, ProcessSpecError, ProcessSpecification, ProfileSnapshotId, RunId,
-    SyncMode, SyncOptions, SyncProfile, ValidatedSyncOptions,
+    PeerSide, PartialTransferPolicy, PlanActionKind, ProcessSpecError, ProcessSpecification,
+    ProfileSnapshotId, RetryPolicy, RunId, SyncMode, SyncOptions, SyncProfile,
+    ValidatedSyncOptions,
 };
 
 pub type ActionId = u64;
@@ -349,6 +350,7 @@ pub enum JournalEvent {
         reason: ActionReason,
     },
     Cancelled { action_id: ActionId },
+    Interrupted { action_id: ActionId },
     Deferred { action_id: ActionId },
     Unresolved {
         action_id: ActionId,
@@ -371,6 +373,7 @@ pub enum ActionOutcome {
     Completed,
     Failed(ActionReason),
     Cancelled,
+    Interrupted,
     Deferred,
     Unresolved(ActionReason),
     RecoveryReview(ActionReason),
@@ -393,6 +396,14 @@ pub struct ActionJournalEntry {
 impl ActionJournalEntry {
     pub fn plan(&self) -> &PlanRecord {
         &self.plan
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        self.plan.relative_path()
+    }
+
+    pub const fn operation(&self) -> PlanActionKind {
+        self.plan.operation()
     }
 
     pub const fn started(&self) -> bool {
@@ -465,6 +476,7 @@ pub enum RunReportStatus {
     Completed,
     Failed,
     Cancelled,
+    Interrupted,
     CompletedWithReviewRequired,
     RecoveryReview,
     ReviewCleared,
@@ -477,6 +489,7 @@ pub enum RunExecutionResult {
     Succeeded,
     Failed,
     Cancelled,
+    Interrupted,
     RecoveryReview,
 }
 
@@ -623,7 +636,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 4 {
+        if version > 5 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -735,6 +748,22 @@ impl RunEvidenceStore {
             )?;
             transaction.pragma_update(None, "user_version", 4)?;
             transaction.commit()?;
+            version = 4;
+        }
+        if version == 4 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                ALTER TABLE run_snapshots
+                    ADD COLUMN partial_transfer_policy TEXT NOT NULL DEFAULT 'cleanup';
+                ALTER TABLE run_snapshots
+                    ADD COLUMN retry_max_attempts INTEGER NOT NULL DEFAULT 3;
+                ALTER TABLE run_snapshots
+                    ADD COLUMN retry_initial_delay_millis INTEGER NOT NULL DEFAULT 100;
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 5)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -757,8 +786,10 @@ impl RunEvidenceStore {
                 mode, source, safe_delete, destination_cleanup, deletion_method,
                 allow_unattended_destructive, allow_unattended_permanent_removal,
                 metadata_file_type, metadata_executable_permissions,
-                metadata_symlink_targets, metadata_timestamps
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                metadata_symlink_targets, metadata_timestamps,
+                partial_transfer_policy, retry_max_attempts,
+                retry_initial_delay_millis
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 snapshot.run_id().value(),
                 snapshot.snapshot_id().value(),
@@ -778,6 +809,9 @@ impl RunEvidenceStore {
                 bool_to_int(options.metadata().executable_permissions()),
                 bool_to_int(options.metadata().symlink_targets()),
                 bool_to_int(options.metadata().timestamps()),
+                encode_partial_transfer_policy(options.partial_transfer_policy()),
+                options.retry_policy().max_attempts(),
+                options.retry_policy().initial_delay().as_millis() as u64,
             ],
         )?;
         for (ordinal, pattern) in profile.exclusions().iter().enumerate() {
@@ -790,6 +824,15 @@ impl RunEvidenceStore {
         Ok(())
     }
 
+    pub fn next_run_id(&self) -> Result<RunId, StorageError> {
+        let next: u64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(run_id), 0) + 1 FROM run_snapshots",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(RunId::new(next))
+    }
+
     pub fn load_snapshot(&self, run_id: RunId) -> Result<RunSnapshot, StorageError> {
         let row = self
             .connection
@@ -799,7 +842,9 @@ impl RunEvidenceStore {
                         destination_cleanup, deletion_method,
                         allow_unattended_destructive, allow_unattended_permanent_removal,
                         metadata_file_type, metadata_executable_permissions,
-                        metadata_symlink_targets, metadata_timestamps
+                        metadata_symlink_targets, metadata_timestamps,
+                        partial_transfer_policy, retry_max_attempts,
+                        retry_initial_delay_millis
                  FROM run_snapshots WHERE run_id = ?1",
                 params![run_id.value()],
                 |row| {
@@ -821,6 +866,9 @@ impl RunEvidenceStore {
                         row.get::<_, bool>(14)?,
                         row.get::<_, bool>(15)?,
                         row.get::<_, bool>(16)?,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, u8>(18)?,
+                        row.get::<_, u64>(19)?,
                     ))
                 },
             )
@@ -843,6 +891,9 @@ impl RunEvidenceStore {
             metadata_executable_permissions,
             metadata_symlink_targets,
             metadata_timestamps,
+            partial_transfer_policy,
+            retry_max_attempts,
+            retry_initial_delay_millis,
         )) = row
         else {
             return Err(StorageError::InvalidEvent(format!(
@@ -876,6 +927,11 @@ impl RunEvidenceStore {
                 metadata_executable_permissions,
                 metadata_symlink_targets,
                 metadata_timestamps,
+            ),
+            partial_transfer_policy: decode_partial_transfer_policy(&partial_transfer_policy)?,
+            retry_policy: RetryPolicy::new(
+                retry_max_attempts,
+                std::time::Duration::from_millis(retry_initial_delay_millis),
             ),
         })
         .with_exclusions(exclusions);
@@ -1110,6 +1166,7 @@ impl RunEvidenceStore {
                 item.outcome(),
                 ActionOutcome::Failed(_)
                     | ActionOutcome::Cancelled
+                    | ActionOutcome::Interrupted
                     | ActionOutcome::Deferred
                     | ActionOutcome::Unresolved(_)
                     | ActionOutcome::RecoveryReview(_)
@@ -1313,6 +1370,11 @@ impl EventFields {
             JournalEvent::Cancelled { .. } => {
                 let mut fields = empty();
                 fields.phase = "cancelled";
+                fields
+            }
+            JournalEvent::Interrupted { .. } => {
+                let mut fields = empty();
+                fields.phase = "interrupted";
                 fields
             }
             JournalEvent::Deferred { .. } => {
@@ -1617,6 +1679,7 @@ fn apply_stored_event(
             )?)?);
         }
         "cancelled" => entry.outcome = ActionOutcome::Cancelled,
+        "interrupted" => entry.outcome = ActionOutcome::Interrupted,
         "deferred" => entry.outcome = ActionOutcome::Deferred,
         "unresolved" => {
             entry.outcome = ActionOutcome::Unresolved(decode_reason(
@@ -1712,7 +1775,11 @@ fn validate_replayed_transition(
                 && entry.recovery_evidence.is_some()
                 && entry.recovery_resolution_evidence.is_none()
         }
-        "completed" | "failed" | "cancelled" | "deferred" | "unresolved" => matches!(
+        "cancelled" | "interrupted" => {
+            entry.last_phase == "planned"
+                || matches!(entry.last_phase.as_str(), "started" | "progress")
+        }
+        "completed" | "failed" | "deferred" | "unresolved" => matches!(
             entry.last_phase.as_str(),
             "started" | "progress" | "transfer_verified" | "proof_boundary" | "removal_started"
         ),
@@ -1926,6 +1993,7 @@ fn validate_event(
         | JournalEvent::Completed { .. }
         | JournalEvent::Failed { .. }
         | JournalEvent::Cancelled { .. }
+        | JournalEvent::Interrupted { .. }
         | JournalEvent::Deferred { .. }
         | JournalEvent::Unresolved { .. }
         | JournalEvent::RecoveryReview { .. }
@@ -1973,6 +2041,7 @@ fn validate_event(
         JournalEvent::Completed { .. } => "completed",
         JournalEvent::Failed { .. } => "failed",
         JournalEvent::Cancelled { .. } => "cancelled",
+        JournalEvent::Interrupted { .. } => "interrupted",
         JournalEvent::Deferred { .. } => "deferred",
         JournalEvent::Unresolved { .. } => "unresolved",
         JournalEvent::RecoveryReview { .. } => "recovery_review",
@@ -2002,6 +2071,7 @@ fn validate_event(
             "completed"
                 | "failed"
                 | "cancelled"
+                | "interrupted"
                 | "deferred"
                 | "unresolved"
                 | "removal_completed"
@@ -2019,7 +2089,7 @@ fn validate_event(
         "removal_started" if current_phase == Some("proof_boundary") => Ok(()),
         "removal_completed" if current_phase == Some("removal_started") => Ok(()),
         "recovery_resolved" if current_phase == Some("recovery_review") => Ok(()),
-        "completed" | "failed" | "cancelled" | "deferred" | "unresolved"
+        "completed" | "failed" | "deferred" | "unresolved"
             if matches!(
                 current_phase,
                 Some(
@@ -2028,6 +2098,16 @@ fn validate_event(
                         | "transfer_verified"
                         | "proof_boundary"
                         | "removal_started",
+                )
+            ) =>
+        {
+            Ok(())
+        }
+        "cancelled" | "interrupted"
+            if matches!(
+                current_phase,
+                Some(
+                    "planned" | "started" | "progress",
                 )
             ) =>
         {
@@ -2059,6 +2139,12 @@ fn validate_action_order(
     action_id: ActionId,
     event: &JournalEvent,
 ) -> Result<(), StorageError> {
+    // These boundaries only say that no mutation was started for the action.
+    // They must remain recordable for the rest of the plan when an earlier
+    // action enters Recovery Review and blocks further mutating work.
+    if matches!(event, JournalEvent::Cancelled { .. } | JournalEvent::Interrupted { .. }) {
+        return Ok(());
+    }
     if !event_advances_action(event) {
         return Ok(());
     }
@@ -2214,6 +2300,7 @@ fn is_settled_phase(phase: &str) -> bool {
         "completed"
             | "failed"
             | "cancelled"
+            | "interrupted"
             | "deferred"
             | "unresolved"
             | "removal_completed"
@@ -2236,6 +2323,12 @@ fn report_status(items: &[RunReportItem], review_cleared: bool) -> RunReportStat
         .any(|item| matches!(item.outcome(), ActionOutcome::Failed(_)))
     {
         return RunReportStatus::Failed;
+    }
+    if items
+        .iter()
+        .any(|item| matches!(item.outcome(), ActionOutcome::Interrupted))
+    {
+        return RunReportStatus::Interrupted;
     }
     if items
         .iter()
@@ -2282,6 +2375,12 @@ fn execution_result(items: &[RunReportItem]) -> RunExecutionResult {
     }
     if items
         .iter()
+        .any(|item| matches!(item.outcome(), ActionOutcome::Interrupted))
+    {
+        return RunExecutionResult::Interrupted;
+    }
+    if items
+        .iter()
         .any(|item| matches!(item.outcome(), ActionOutcome::Cancelled))
     {
         return RunExecutionResult::Cancelled;
@@ -2302,6 +2401,7 @@ fn event_phase(event: &JournalEvent) -> &'static str {
         JournalEvent::Completed { .. } => "completed",
         JournalEvent::Failed { .. } => "failed",
         JournalEvent::Cancelled { .. } => "cancelled",
+        JournalEvent::Interrupted { .. } => "interrupted",
         JournalEvent::Deferred { .. } => "deferred",
         JournalEvent::Unresolved { .. } => "unresolved",
         JournalEvent::RecoveryReview { .. } => "recovery_review",
@@ -2321,6 +2421,7 @@ fn event_action_id(event: &JournalEvent) -> ActionId {
         | JournalEvent::Completed { action_id }
         | JournalEvent::Failed { action_id, .. }
         | JournalEvent::Cancelled { action_id }
+        | JournalEvent::Interrupted { action_id }
         | JournalEvent::Deferred { action_id }
         | JournalEvent::Unresolved { action_id, .. }
         | JournalEvent::RecoveryReview { action_id, .. }
@@ -2353,6 +2454,23 @@ fn encode_deletion_method(method: DeletionMethod) -> &'static str {
     match method {
         DeletionMethod::Trash => "trash",
         DeletionMethod::PermanentRemoval => "permanent_removal",
+    }
+}
+
+fn encode_partial_transfer_policy(policy: PartialTransferPolicy) -> &'static str {
+    match policy {
+        PartialTransferPolicy::Cleanup => "cleanup",
+        PartialTransferPolicy::KeepPartialForResume => "keep_partial_for_resume",
+    }
+}
+
+fn decode_partial_transfer_policy(value: &str) -> Result<PartialTransferPolicy, StorageError> {
+    match value {
+        "cleanup" => Ok(PartialTransferPolicy::Cleanup),
+        "keep_partial_for_resume" => Ok(PartialTransferPolicy::KeepPartialForResume),
+        _ => Err(StorageError::CorruptEvidence(format!(
+            "unsupported partial transfer policy {value}"
+        ))),
     }
 }
 

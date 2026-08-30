@@ -25,6 +25,8 @@ fn new_profiles_default_to_non_destructive_one_way_sync() {
             destination_cleanup: false,
             deletion_method: None,
             metadata: Default::default(),
+            partial_transfer_policy: Default::default(),
+            retry_policy: Default::default(),
         }
     );
 }
@@ -36,6 +38,8 @@ fn invalid_profiles_cannot_create_active_runs() {
         destination_cleanup: false,
         deletion_method: None,
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     });
 
     assert!(SyncRun::new(RunId::new(8), &invalid).is_err());

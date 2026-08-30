@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{
-    DeletionMethod, MetadataRequirements, OneWaySource, PeerSide, PlanAction, PlanActionKind,
-    SyncMode, SyncOptions, SyncProfile,
+    DeletionMethod, MetadataRequirements, OneWaySource, PartialTransferPolicy, PeerSide,
+    PlanAction, PlanActionKind, RetryPolicy, SyncMode, SyncOptions, SyncProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,6 +115,7 @@ pub enum ProcessSpecError {
     ActionNotAllowed { kind: PlanActionKind },
     ActionSourceMismatch,
     InvalidTransferPath { path: PathBuf },
+    InvalidRetryPolicy { max_attempts: u8 },
 }
 
 impl fmt::Display for ProcessSpecError {
@@ -147,6 +148,9 @@ impl fmt::Display for ProcessSpecError {
             Self::InvalidTransferPath { path } => {
                 write!(formatter, "transfer path is not a normalized relative item path: {path:?}")
             }
+            Self::InvalidRetryPolicy { max_attempts } => {
+                write!(formatter, "retry policy must allow between 1 and 10 attempts, got {max_attempts}")
+            }
         }
     }
 }
@@ -159,6 +163,8 @@ pub struct ValidatedSyncOptions {
     destination_cleanup: bool,
     deletion_method: Option<DeletionMethod>,
     metadata: MetadataRequirements,
+    partial_transfer_policy: PartialTransferPolicy,
+    retry_policy: RetryPolicy,
 }
 
 impl ValidatedSyncOptions {
@@ -177,6 +183,14 @@ impl ValidatedSyncOptions {
     pub const fn metadata(self) -> MetadataRequirements {
         self.metadata
     }
+
+    pub const fn partial_transfer_policy(self) -> PartialTransferPolicy {
+        self.partial_transfer_policy
+    }
+
+    pub const fn retry_policy(self) -> RetryPolicy {
+        self.retry_policy
+    }
 }
 
 impl SyncOptions {
@@ -193,11 +207,19 @@ impl SyncOptions {
             });
         }
 
+        if !(1..=10).contains(&self.retry_policy.max_attempts()) {
+            return Err(ProcessSpecError::InvalidRetryPolicy {
+                max_attempts: self.retry_policy.max_attempts(),
+            });
+        }
+
         Ok(ValidatedSyncOptions {
             safe_delete: self.safe_delete,
             destination_cleanup: self.destination_cleanup,
             deletion_method: self.deletion_method,
             metadata: self.metadata,
+            partial_transfer_policy: self.partial_transfer_policy,
+            retry_policy: self.retry_policy,
         })
     }
 }

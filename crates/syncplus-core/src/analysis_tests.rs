@@ -91,6 +91,22 @@ fn hidden_items_are_included_and_inventory_records_identity_type_metadata_and_ou
 }
 
 #[test]
+fn syncplus_partial_artifacts_are_hidden_from_user_inventory() {
+    let source = TestDirectory::new("partial-artifact-source");
+    let destination = TestDirectory::new("partial-artifact-destination");
+    write_file(&source.join(".syncplus-partial-123-copy.txt"), b"partial");
+    write_file(&source.join("visible.txt"), b"visible");
+
+    let analysis = FreshAnalysis::analyze(&profile(&source, &destination))
+        .expect("reserved partial artifacts should not affect analysis");
+    assert!(analysis
+        .source_inventory()
+        .item(".syncplus-partial-123-copy.txt")
+        .is_none());
+    assert!(analysis.source_inventory().item("visible.txt").is_some());
+}
+
+#[test]
 fn exclusions_are_recorded_outside_scope_and_never_become_candidates() {
     let source = TestDirectory::new("excluded-source");
     let destination = TestDirectory::new("excluded-destination");
@@ -108,6 +124,8 @@ fn exclusions_are_recorded_outside_scope_and_never_become_candidates() {
             destination_cleanup: true,
             deletion_method: None,
             metadata: Default::default(),
+            partial_transfer_policy: Default::default(),
+            retry_policy: Default::default(),
         });
     let analysis = FreshAnalysis::analyze(&profile).expect("exclusions should be analyzable");
 
@@ -194,6 +212,8 @@ fn plan_summary_reports_action_counts_and_applicable_sizes() {
             destination_cleanup: true,
             deletion_method: None,
             metadata: Default::default(),
+            partial_transfer_policy: Default::default(),
+            retry_policy: Default::default(),
         }),
     )
     .expect("the summary should be based on a valid process specification");
@@ -279,6 +299,8 @@ fn safe_delete_and_destination_cleanup_actions_follow_validated_process_options(
         destination_cleanup: true,
         deletion_method: Some(DeletionMethod::Trash),
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     });
 
     let analysis = FreshAnalysis::analyze(&profile).expect("explicit destructive options are valid");
