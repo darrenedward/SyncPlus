@@ -1,8 +1,8 @@
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use crate::{
-    DeletionMethod, OneWaySource, ProcessArgument, ProcessSpecError, ProcessSpecification, Peer,
-    RsyncFlag, SyncOptions, SyncProfile,
+    DeletionMethod, FreshAnalysis, OneWaySource, ProcessArgument, ProcessSpecError,
+    ProcessSpecification, Peer, RsyncFlag, SyncOptions, SyncProfile,
 };
 
 fn profile(source: PathBuf, destination: PathBuf) -> SyncProfile {
@@ -150,6 +150,65 @@ fn preview_and_invocation_come_from_the_same_validated_specification() {
     }
     assert!(preview.contains("SYNCPLUS_TOKEN=<redacted>"));
     assert!(!preview.contains("secret-value"));
+}
+
+#[test]
+fn item_invocation_uses_typed_paths_without_tree_cleanup() {
+    let specification = ProcessSpecification::from_profile(&profile(
+        PathBuf::from("/source"),
+        PathBuf::from("/destination"),
+    ))
+    .expect("valid profile should produce a specification");
+    let invocation = specification
+        .item_invocation(
+            &PathBuf::from("/source/file with spaces"),
+            &PathBuf::from("/destination/.syncplus-temporary"),
+        )
+        .expect("valid item paths should produce a typed invocation");
+
+    assert_eq!(invocation.program(), std::ffi::OsStr::new("rsync"));
+    assert!(invocation
+        .arguments()
+        .iter()
+        .any(|argument| argument == "/source/file with spaces"));
+    assert!(invocation
+        .arguments()
+        .iter()
+        .any(|argument| argument == "/destination/.syncplus-temporary"));
+    assert!(!invocation
+        .arguments()
+        .iter()
+        .any(|argument| argument == "--delete"));
+}
+
+#[test]
+fn transfer_paths_are_bound_to_the_validated_plan_scope() {
+    let root = std::env::temp_dir().join(format!(
+        "syncplus-process-scope-{}",
+        std::process::id()
+    ));
+    let source = root.join("source");
+    let destination = root.join("destination");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(source.join("approved.txt"), b"approved").unwrap();
+
+    let profile = profile(source.clone(), destination.clone());
+    let analysis = FreshAnalysis::analyze(&profile).expect("analysis should succeed");
+    let action = analysis
+        .plan()
+        .actions()
+        .first()
+        .expect("the source item should have a copy action");
+    let (resolved_source, resolved_destination) = analysis
+        .specification()
+        .transfer_paths(action)
+        .expect("a plan action should resolve inside the profile roots");
+
+    assert_eq!(resolved_source, source.join("approved.txt"));
+    assert_eq!(resolved_destination, destination.join("approved.txt"));
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

@@ -4,6 +4,11 @@ mod analysis;
 mod evidence;
 mod precheck;
 mod scope_lock;
+mod parser;
+mod runner;
+mod verification;
+mod replacement;
+mod transfer;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, OneWaySource, Peer,
@@ -25,6 +30,17 @@ pub use evidence::{
     RunEvidenceStore, RunExecutionResult, RunLifecycle, RunReport, RunReportItem,
     RunReportStatus, RunSnapshot, StorageError,
 };
+pub use parser::{
+    ItemizedRecord, ParseDiagnostic, ParsedOutput, ParsedTransferOutput, ProgressRecord,
+    TransferOutputParser,
+};
+pub use replacement::{ReplacementError, VerifiedReplacement};
+pub use runner::{ProcessError, ProcessOutcome, ProcessSupervisor};
+pub use verification::{
+    verify_content, verify_content_with_cancel, ContentProof, FileMetadataProof,
+    SourceObservation, VerificationError, VerifiedTransferProof,
+};
+pub use transfer::{ControlledTransfer, TransferError};
 pub use precheck::{
     AccessSnapshot, DestinationNamingPolicy, ExecutionPermit, LocalPrecheckProbe,
     NamingConflict, NamingRule, PathRiskLevel, PathRiskWarning, PrecheckBlocker,

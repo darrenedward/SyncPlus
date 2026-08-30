@@ -315,6 +315,7 @@ impl PlanSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     ActionOutsideApprovedScope { path: PathBuf },
+    ActionNotInPlan { path: PathBuf },
     ActionNotAllowed { kind: PlanActionKind },
     SummaryMismatch,
 }
@@ -324,6 +325,9 @@ impl fmt::Display for PlanError {
         match self {
             Self::ActionOutsideApprovedScope { path } => {
                 write!(formatter, "plan action is outside the approved scope: {path:?}")
+            }
+            Self::ActionNotInPlan { path } => {
+                write!(formatter, "plan does not contain the requested action: {path:?}")
             }
             Self::ActionNotAllowed { kind } => {
                 write!(formatter, "plan action is not allowed by the process specification: {kind:?}")
