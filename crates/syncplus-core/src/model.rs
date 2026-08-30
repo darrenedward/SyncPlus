@@ -348,6 +348,7 @@ pub enum TerminalOutcome {
     CompletedWithReviewRequired,
     Failed,
     Cancelled,
+    Interrupted,
     Blocked,
     RecoveryReview,
     ReviewCleared,
@@ -381,6 +382,7 @@ pub enum RunEvent {
     Blocked,
     Failed,
     Cancelled,
+    Interrupted,
     RecoveryReview,
 }
 
@@ -479,13 +481,18 @@ impl SyncRun {
 fn next_state(state: RunState, event: RunEvent) -> Option<RunState> {
     if matches!(
         event,
-        RunEvent::Blocked | RunEvent::Failed | RunEvent::Cancelled | RunEvent::RecoveryReview
+        RunEvent::Blocked
+            | RunEvent::Failed
+            | RunEvent::Cancelled
+            | RunEvent::Interrupted
+            | RunEvent::RecoveryReview
     ) {
         return match state {
             RunState::Active(_) | RunState::PendingReview => Some(RunState::Terminal(match event {
                 RunEvent::Blocked => TerminalOutcome::Blocked,
                 RunEvent::Failed => TerminalOutcome::Failed,
                 RunEvent::Cancelled => TerminalOutcome::Cancelled,
+                RunEvent::Interrupted => TerminalOutcome::Interrupted,
                 RunEvent::RecoveryReview => TerminalOutcome::RecoveryReview,
                 _ => unreachable!("the event was checked above"),
             })),

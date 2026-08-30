@@ -80,12 +80,24 @@ fn every_required_terminal_outcome_is_typed() {
         TerminalOutcome::CompletedWithReviewRequired,
         TerminalOutcome::Failed,
         TerminalOutcome::Cancelled,
+        TerminalOutcome::Interrupted,
         TerminalOutcome::Blocked,
         TerminalOutcome::RecoveryReview,
         TerminalOutcome::ReviewCleared,
     ];
 
-    assert_eq!(outcomes.len(), 7);
+    assert_eq!(outcomes.len(), 8);
+
+    let interrupted = SyncRun::new(RunId::new(9), &profile())
+        .expect("valid profile")
+        .transition(RunEvent::BeginPrecheck)
+        .expect("precheck starts from edit")
+        .transition(RunEvent::Interrupted)
+        .expect("an interrupted run must be terminal");
+    assert_eq!(
+        interrupted.outcome(),
+        Some(TerminalOutcome::Interrupted)
+    );
 }
 
 #[test]
