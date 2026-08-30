@@ -56,6 +56,10 @@ _Avoid_: Mirror, bidirectional sync
 A user-selected policy that changes how a Sync Run is planned or applied, such as progress display, resumable transfer behavior, or source cleanup. An option may be implemented using one or more rsync arguments and application-level steps.
 _Avoid_: Raw flag, command-line switch
 
+**Metadata Requirements**:
+The frozen set of file metadata that a Sync Run must preserve and verify before an action can enter the Verified Removal boundary. V1 requires file type, executable permissions, and symlink targets by default; timestamps are an explicit supported option. Unsupported specialist metadata remains a future Advanced option and cannot be silently ignored.
+_Avoid_: Best-effort metadata, metadata inferred from a successful process
+
 **Safe Delete**:
 A Sync Option that permits source removal only after the destination result has been verified. It is distinct from rsync's destination-deletion behavior.
 _Avoid_: `--delete`, force delete

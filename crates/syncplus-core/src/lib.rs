@@ -12,7 +12,8 @@ mod transfer;
 mod removal;
 
 pub use model::{
-    ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, OneWaySource, Peer,
+    ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
+    OneWaySource, Peer,
     ProfileSnapshot, ProfileSnapshotId, RunEvent, RunId, RunState, SafetyViolation, SyncMode,
     SyncOptions, SyncProfile, SyncRun, TerminalOutcome,
 };

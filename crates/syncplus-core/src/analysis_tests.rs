@@ -107,6 +107,7 @@ fn exclusions_are_recorded_outside_scope_and_never_become_candidates() {
             safe_delete: false,
             destination_cleanup: true,
             deletion_method: None,
+            metadata: Default::default(),
         });
     let analysis = FreshAnalysis::analyze(&profile).expect("exclusions should be analyzable");
 
@@ -192,6 +193,7 @@ fn plan_summary_reports_action_counts_and_applicable_sizes() {
             safe_delete: false,
             destination_cleanup: true,
             deletion_method: None,
+            metadata: Default::default(),
         }),
     )
     .expect("the summary should be based on a valid process specification");
@@ -276,6 +278,7 @@ fn safe_delete_and_destination_cleanup_actions_follow_validated_process_options(
         safe_delete: true,
         destination_cleanup: true,
         deletion_method: Some(DeletionMethod::Trash),
+        metadata: Default::default(),
     });
 
     let analysis = FreshAnalysis::analyze(&profile).expect("explicit destructive options are valid");

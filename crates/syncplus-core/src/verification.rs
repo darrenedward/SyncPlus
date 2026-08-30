@@ -3,12 +3,12 @@ use std::{
     fs::{self, Metadata, OpenOptions},
     io::{self, Read},
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use sha2::{Digest, Sha256};
 
-use crate::{FileIdentity, ItemType};
+use crate::{FileIdentity, ItemType, MetadataRequirements};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContentProof {
@@ -157,10 +157,18 @@ impl FileMetadataProof {
         self == other
     }
 
-    pub(crate) fn matches_transfer_metadata(&self, other: &Self) -> bool {
-        self.item_type == other.item_type
-            && self.symlink_target == other.symlink_target
-            && executable_permissions(self.permissions) == executable_permissions(other.permissions)
+    pub(crate) fn matches_transfer_metadata(
+        &self,
+        other: &Self,
+        requirements: MetadataRequirements,
+    ) -> bool {
+        (!requirements.file_type() || self.item_type == other.item_type)
+            && (!requirements.symlink_targets() || self.symlink_target == other.symlink_target)
+            && (!requirements.executable_permissions()
+                || executable_permissions(self.permissions)
+                    == executable_permissions(other.permissions))
+            && (!requirements.timestamps()
+                || self.modified_at_unix_nanos == other.modified_at_unix_nanos)
     }
 
     pub(crate) fn matches_open_file_metadata(&self, metadata: &Metadata) -> bool {
@@ -172,10 +180,27 @@ impl FileMetadataProof {
             && self.permissions == permissions(metadata)
     }
 
-    pub(crate) fn matches_open_transfer_metadata(&self, metadata: &Metadata) -> bool {
-        self.item_type == ItemType::RegularFile
-            && metadata.file_type().is_file()
-            && executable_permissions(self.permissions) == executable_permissions(permissions(metadata))
+    pub(crate) fn matches_open_transfer_metadata(
+        &self,
+        metadata: &Metadata,
+        requirements: MetadataRequirements,
+    ) -> bool {
+        (!requirements.file_type() || self.item_type == ItemType::RegularFile)
+            && (!requirements.file_type() || metadata.file_type().is_file())
+            && (!requirements.executable_permissions()
+                || executable_permissions(self.permissions)
+                    == executable_permissions(permissions(metadata)))
+            && (!requirements.timestamps()
+                || self.modified_at_unix_nanos == modified_at_unix_nanos(metadata))
+    }
+
+    pub(crate) fn modified_at(&self) -> Option<SystemTime> {
+        let nanos = self.modified_at_unix_nanos?;
+        if nanos >= 0 {
+            UNIX_EPOCH.checked_add(Duration::from_nanos(nanos as u64))
+        } else {
+            UNIX_EPOCH.checked_sub(Duration::from_nanos(nanos.unsigned_abs()))
+        }
     }
 
     fn from_metadata(path: &Path, metadata: &Metadata) -> Self {

@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    verify_content, verify_content_with_cancel, FileMetadataProof, SourceObservation,
-    VerificationError, VerifiedTransferProof,
+    verify_content, verify_content_with_cancel, FileMetadataProof, MetadataRequirements,
+    SourceObservation, VerificationError, VerifiedTransferProof,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,7 @@ pub struct VerifiedReplacement {
     destination: PathBuf,
     previous_destination: Option<PathBuf>,
     proof: VerifiedTransferProof,
+    metadata: MetadataRequirements,
 }
 
 impl VerifiedReplacement {
@@ -37,6 +38,10 @@ impl VerifiedReplacement {
 
     pub fn proof(&self) -> &VerifiedTransferProof {
         &self.proof
+    }
+
+    pub const fn metadata_requirements(&self) -> MetadataRequirements {
+        self.metadata
     }
 }
 
@@ -122,6 +127,26 @@ where
     C: Fn() -> bool,
     F: FnOnce(&Path) -> Result<(), ReplacementError>,
 {
+    perform_verified_replacement_with_cancel_and_metadata(
+        source,
+        destination,
+        MetadataRequirements::default(),
+        should_cancel,
+        transfer,
+    )
+}
+
+pub(crate) fn perform_verified_replacement_with_cancel_and_metadata<C, F>(
+    source: &Path,
+    destination: &Path,
+    metadata: MetadataRequirements,
+    should_cancel: C,
+    transfer: F,
+) -> Result<VerifiedReplacement, ReplacementError>
+where
+    C: Fn() -> bool,
+    F: FnOnce(&Path) -> Result<(), ReplacementError>,
+{
     check_cancelled(&should_cancel)?;
     let source_before = SourceObservation::capture_with_cancel(source, || should_cancel())
         .map_err(map_verification_error)?;
@@ -145,10 +170,11 @@ where
         )
         .map_err(map_verification_error)?;
         check_cancelled(&should_cancel)?;
+        apply_metadata_requirements(&temporary, source_before.metadata(), metadata)?;
         let temporary_metadata = FileMetadataProof::capture(&temporary)?;
         if !source_before
             .metadata()
-            .matches_transfer_metadata(&temporary_metadata)
+            .matches_transfer_metadata(&temporary_metadata, metadata)
         {
             return Err(ReplacementError::MetadataMismatch);
         }
@@ -232,7 +258,7 @@ where
         };
         if !source_before
             .metadata()
-            .matches_transfer_metadata(&installed_metadata)
+            .matches_transfer_metadata(&installed_metadata, metadata)
         {
             return Err(restore_after_failed_install(
                 destination,
@@ -345,6 +371,7 @@ where
                 final_source,
                 installed_destination,
             ),
+            metadata,
         })
     })();
 
@@ -352,6 +379,25 @@ where
         Ok(replacement) => Ok(replacement),
         Err(error) => Err(cleanup_temporary(&temporary, error)),
     }
+}
+
+fn apply_metadata_requirements(
+    path: &Path,
+    source: &FileMetadataProof,
+    requirements: MetadataRequirements,
+) -> Result<(), ReplacementError> {
+    if requirements.timestamps() {
+        let modified_at = source
+            .modified_at()
+            .ok_or(ReplacementError::MetadataMismatch)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(io_error)?
+            .set_modified(modified_at)
+            .map_err(io_error)?;
+    }
+    Ok(())
 }
 
 fn restore_after_failed_install(

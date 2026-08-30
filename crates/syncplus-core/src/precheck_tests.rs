@@ -141,6 +141,7 @@ fn path_warning_is_advisory_and_only_safe_delete_receives_it() {
         safe_delete: true,
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
+        metadata: Default::default(),
     });
     let result = RunPrecheck::check(&safe_delete, &probe).expect("safe delete should precheck");
     assert_eq!(result.warnings().len(), 1);

@@ -118,6 +118,55 @@ pub struct SafeDeleteExecutor {
     recovery_method: RecoveryMethod,
 }
 
+struct RemovalAttempt {
+    result: RemovalResult,
+    #[cfg(target_os = "linux")]
+    source_guard: SourcePreservationGuard,
+}
+
+#[cfg(target_os = "linux")]
+struct SourcePreservationGuard {
+    parent: std::os::fd::OwnedFd,
+    name: std::ffi::CString,
+    retain_on_drop: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl SourcePreservationGuard {
+    fn retain(&mut self) {
+        self.retain_on_drop = true;
+    }
+
+    fn cleanup(&mut self) -> Result<(), SafeDeleteError> {
+        use std::os::fd::AsRawFd;
+
+        let result = unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) };
+        if result == 0 || io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
+            self.retain_on_drop = true;
+            Ok(())
+        } else {
+            self.retain_on_drop = true;
+            Err(SafeDeleteError::RecoveryUncertain(format!(
+                "source preservation guard could not be cleaned up: {}",
+                io::Error::last_os_error()
+            )))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SourcePreservationGuard {
+    fn drop(&mut self) {
+        if !self.retain_on_drop {
+            use std::os::fd::AsRawFd;
+
+            unsafe {
+                libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0);
+            }
+        }
+    }
+}
+
 impl SafeDeleteExecutor {
     pub fn new(recovery_method: RecoveryMethod) -> Self {
         Self { recovery_method }
@@ -157,9 +206,8 @@ impl SafeDeleteExecutor {
                 "only source-removal actions can enter the Safe Delete proof boundary".to_owned(),
             ));
         }
-        let selected_method = plan
-            .specification()
-            .options()
+        let options = plan.specification().options();
+        let selected_method = options
             .deletion_method()
             .ok_or_else(|| {
                 SafeDeleteError::InvalidPlan(
@@ -214,6 +262,21 @@ impl SafeDeleteExecutor {
             }
         };
         let proof = replacement.proof();
+        let metadata_requirements = options.metadata();
+        if replacement.metadata_requirements() != metadata_requirements {
+            return self.fail_unresolved(
+                run_id,
+                action.action_id(),
+                store,
+                SafeDeleteError::InvalidAction(
+                    "transfer proof metadata requirements do not match the frozen profile"
+                        .to_owned(),
+                ),
+            );
+        }
+        if let Err(error) = ensure_journaled_source_proof(run_id, action.action_id(), proof, store) {
+            return self.fail_unresolved(run_id, action.action_id(), store, error);
+        }
         if proof.source_before() != proof.source_after() {
             return self.fail_unresolved(
                 run_id,
@@ -264,7 +327,7 @@ impl SafeDeleteExecutor {
         if !proof
             .source_after()
             .metadata()
-            .matches_transfer_metadata(&destination_metadata)
+            .matches_transfer_metadata(&destination_metadata, metadata_requirements)
         {
             return self.fail_unresolved(
                 run_id,
@@ -329,7 +392,7 @@ impl SafeDeleteExecutor {
             None
         };
 
-        let proof_evidence = RecoveryEvidence::new(
+        let transfer_evidence = RecoveryEvidence::new(
             now_unix_nanos(),
             None,
             true,
@@ -342,10 +405,18 @@ impl SafeDeleteExecutor {
         );
         store.append_event(
             run_id,
+            JournalEvent::TransferVerified {
+                action_id: action.action_id(),
+                evidence: transfer_evidence.clone(),
+                metadata_verified: true,
+            },
+        )?;
+        store.append_event(
+            run_id,
             JournalEvent::ProofBoundary {
                 action_id: action.action_id(),
                 deletion_method: selected_method,
-                evidence: proof_evidence,
+                evidence: transfer_evidence,
                 metadata_verified: true,
             },
         )?;
@@ -357,13 +428,14 @@ impl SafeDeleteExecutor {
             },
         )?;
 
-        let removal = match self.perform_removal(
+        let mut attempt = match self.perform_removal(
             &source_root,
             &source,
             action.relative_path(),
             proof,
+            metadata_requirements,
         ) {
-            Ok(removal) => removal,
+            Ok(attempt) => attempt,
             Err(error) => {
                 return self.record_failure(
                     run_id,
@@ -376,17 +448,41 @@ impl SafeDeleteExecutor {
                 )
             }
         };
-        store.append_event(
+        if let Err(storage_error) = store.append_event(
             run_id,
             JournalEvent::RemovalCompleted {
                 action_id: action.action_id(),
-                result: removal.clone(),
+                result: attempt.result.clone(),
             },
-        )?;
+        ) {
+            let journal_failure = SafeDeleteError::RecoveryUncertain(format!(
+                "RemovalCompleted journal write failed after filesystem mutation: {storage_error}"
+            ));
+            let review = self.append_failure_event(
+                run_id,
+                action.action_id(),
+                store,
+                Some(&source),
+                Some(&destination),
+                recovery_target.as_deref(),
+                &journal_failure,
+                true,
+            );
+            return match review {
+                Ok(()) => Err(journal_failure),
+                Err(review_error) => Err(review_error),
+            };
+        }
+        #[cfg(target_os = "linux")]
+        let _ = attempt.source_guard.cleanup();
         Ok(RemovalReceipt {
             action_id: action.action_id(),
             deletion_method: selected_method,
-            recovery_target: removal.evidence().recovery_target().map(Path::to_path_buf),
+            recovery_target: attempt
+                .result
+                .evidence()
+                .recovery_target()
+                .map(Path::to_path_buf),
         })
     }
 
@@ -396,7 +492,8 @@ impl SafeDeleteExecutor {
         source: &Path,
         relative_path: &Path,
         proof: &crate::VerifiedTransferProof,
-    ) -> Result<RemovalResult, SafeDeleteError> {
+        metadata_requirements: crate::MetadataRequirements,
+    ) -> Result<RemovalAttempt, SafeDeleteError> {
         match self.recovery_method.recovery_root() {
             Some(recovery_root) => {
                 let (recovery_root, recovery_target, same_filesystem) =
@@ -409,6 +506,7 @@ impl SafeDeleteExecutor {
                         source,
                         &recovery_target,
                         proof,
+                        metadata_requirements,
                     )
                 } else {
                     self.copy_to_cross_filesystem_recovery(
@@ -418,6 +516,7 @@ impl SafeDeleteExecutor {
                         source,
                         &recovery_target,
                         proof,
+                        metadata_requirements,
                     )
                 }
             }
@@ -435,7 +534,8 @@ impl SafeDeleteExecutor {
         _source: &Path,
         recovery_target: &Path,
         proof: &crate::VerifiedTransferProof,
-    ) -> Result<RemovalResult, SafeDeleteError> {
+        metadata_requirements: crate::MetadataRequirements,
+    ) -> Result<RemovalAttempt, SafeDeleteError> {
         #[cfg(target_os = "linux")]
         {
             use std::os::fd::AsRawFd;
@@ -444,41 +544,52 @@ impl SafeDeleteExecutor {
             let (recovery_parent, recovery_name) =
                 open_or_create_relative_parent(recovery_root, relative_path)?;
             let source_lock = ensure_source_entry_matches(&source_parent, &source_name, proof)?;
-            rename_at_noreplace(
+            let mut source_guard = match create_source_guard(&source_parent, &source_name) {
+                Ok(guard) => guard,
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = rename_at_noreplace(
                 source_parent.as_raw_fd(),
                 &source_name,
                 recovery_parent.as_raw_fd(),
                 &recovery_name,
-            )?;
+            ) {
+                source_guard.retain();
+                return Err(error);
+            }
             let verification = ensure_entry_absent(&source_parent, &source_name)
-                .and_then(|()| verify_recovery_entry(&recovery_parent, &recovery_name, proof));
+                .and_then(|()| {
+                    verify_recovery_entry(
+                        &recovery_parent,
+                        &recovery_name,
+                        proof,
+                        metadata_requirements,
+                    )
+                });
             if let Err(error) = verification {
                 drop(source_lock);
-                let rollback = rename_at_noreplace(
-                    recovery_parent.as_raw_fd(),
-                    &recovery_name,
-                    source_parent.as_raw_fd(),
-                    &source_name,
-                )
-                .and_then(|()| {
-                    let _restored_lock =
-                        ensure_source_entry_matches(&source_parent, &source_name, proof)?;
-                    ensure_entry_absent(&recovery_parent, &recovery_name)
-                });
-                return match rollback {
-                    Ok(()) => Err(SafeDeleteError::RecoveryUnavailable(format!(
+                if restore_source_from_guard(&source_guard, &source_parent, &source_name, proof)
+                    .is_ok()
+                {
+                    let _ = source_guard.cleanup();
+                    return Err(SafeDeleteError::RecoveryUnavailable(format!(
                         "recovery verification failed and the source was restored: {error}"
-                    ))),
-                    Err(rollback_error) => Err(SafeDeleteError::RecoveryUncertain(format!(
-                        "recovery verification failed: {error}; source restoration is uncertain: {rollback_error}"
-                    ))),
-                };
+                    )));
+                }
+                source_guard.retain();
+                return Err(SafeDeleteError::RecoveryUncertain(format!(
+                    "recovery verification failed and the source restoration is uncertain: {error}"
+                )));
             }
             drop(source_lock);
-            Ok(RemovalResult::new(
-                DeletionMethod::Trash,
-                removal_evidence(Some(recovery_target), true, proof),
-            ))
+            source_guard.retain();
+            Ok(RemovalAttempt {
+                result: RemovalResult::new(
+                    DeletionMethod::Trash,
+                    removal_evidence(Some(recovery_target), true, proof),
+                ),
+                source_guard,
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -504,7 +615,8 @@ impl SafeDeleteExecutor {
         _source: &Path,
         recovery_target: &Path,
         proof: &crate::VerifiedTransferProof,
-    ) -> Result<RemovalResult, SafeDeleteError> {
+        metadata_requirements: crate::MetadataRequirements,
+    ) -> Result<RemovalAttempt, SafeDeleteError> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (
@@ -513,7 +625,8 @@ impl SafeDeleteExecutor {
                 relative_path,
                 _source,
                 recovery_target,
-                proof,
+            proof,
+            metadata_requirements,
             );
             return Err(SafeDeleteError::RecoveryUnavailable(
                 "descriptor-relative cross-filesystem recovery is supported only on Linux"
@@ -528,11 +641,19 @@ impl SafeDeleteExecutor {
             ensure_recovery_space(recovery_target, source_size)?;
             let (recovery_parent, recovery_name) =
                 open_or_create_relative_parent(recovery_root, relative_path)?;
+            let mut source_guard =
+                create_source_guard_for_path(source_root, relative_path, proof)?;
             let (mut temporary, temporary_name) =
                 create_recovery_temporary(&recovery_parent, &recovery_name)?;
             let copy_result = (|| {
-                copy_source_without_following(source_root, relative_path, &mut temporary, proof)?;
-                verify_recovery_file(&mut temporary, proof)?;
+                copy_source_without_following(
+                    source_root,
+                    relative_path,
+                    &mut temporary,
+                    proof,
+                    metadata_requirements,
+                )?;
+                verify_recovery_file(&mut temporary, proof, metadata_requirements)?;
                 temporary.sync_all().map_err(io_error)?;
                 rename_at_noreplace(
                     recovery_parent.as_raw_fd(),
@@ -541,16 +662,30 @@ impl SafeDeleteExecutor {
                     &recovery_name,
                 )
                 .map_err(|error| SafeDeleteError::RecoveryUncertain(error.to_string()))?;
-                verify_recovery_entry(&recovery_parent, &recovery_name, proof)?;
-                remove_source_exact(source_root, relative_path, proof)?;
+                verify_recovery_entry(
+                    &recovery_parent,
+                    &recovery_name,
+                    proof,
+                    metadata_requirements,
+                )?;
+                remove_source_exact(source_root, relative_path, proof, &source_guard)?;
                 Ok(())
             })();
             match copy_result {
-                Ok(()) => Ok(RemovalResult::new(
-                    DeletionMethod::Trash,
-                    removal_evidence(Some(recovery_target), true, proof),
-                )),
+                Ok(()) => {
+                    source_guard.retain();
+                    Ok(RemovalAttempt {
+                        result: RemovalResult::new(
+                            DeletionMethod::Trash,
+                            removal_evidence(Some(recovery_target), true, proof),
+                        ),
+                        source_guard,
+                    })
+                }
                 Err(error) => {
+                    if matches!(error, SafeDeleteError::RecoveryUncertain(_)) {
+                        source_guard.retain();
+                    }
                     cleanup_recovery_temporary(&recovery_parent, &temporary_name);
                     Err(error)
                 }
@@ -676,6 +811,42 @@ fn ensure_prior_source_removals_settled(
                 action_id
             )));
         }
+    }
+    Ok(())
+}
+
+fn ensure_journaled_source_proof(
+    run_id: RunId,
+    action_id: ActionId,
+    proof: &crate::VerifiedTransferProof,
+    store: &RunEvidenceStore,
+) -> Result<(), SafeDeleteError> {
+    let journal = store.load_journal(run_id)?;
+    let entry = journal
+        .iter()
+        .find(|entry| entry.plan().action_id() == action_id)
+        .ok_or_else(|| {
+            SafeDeleteError::InvalidAction(format!(
+                "Safe Delete action {action_id} must have a durable plan boundary"
+            ))
+        })?;
+    if !entry.started() || !matches!(entry.outcome(), ActionOutcome::InProgress) {
+        return Err(SafeDeleteError::InvalidAction(format!(
+            "Safe Delete action {action_id} is not in a transferable journal state"
+        )));
+    }
+    let source = proof.source_after();
+    let planned = entry.plan().pre_action();
+    if planned.item_type() != crate::ItemType::RegularFile
+        || planned.size() != source.content().size()
+        || planned.modified_at_unix_nanos()
+            != source.metadata().modified_at_unix_nanos()
+        || planned.identity() != source.metadata().identity()
+        || planned.sha256() != Some(source.content().sha256())
+    {
+        return Err(SafeDeleteError::Verification(
+            VerificationError::SourceChanged,
+        ));
     }
     Ok(())
 }
@@ -808,6 +979,121 @@ fn available_space(path: &Path) -> Result<u64, SafeDeleteError> {
 }
 
 static NEXT_RECOVERY_TEMPORARY: AtomicU64 = AtomicU64::new(1);
+#[cfg(target_os = "linux")]
+static NEXT_SOURCE_GUARD: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(target_os = "linux")]
+fn create_source_guard_for_path(
+    source_root: &Path,
+    relative_path: &Path,
+    proof: &crate::VerifiedTransferProof,
+) -> Result<SourcePreservationGuard, SafeDeleteError> {
+    let (parent, name) = open_relative_parent(source_root, relative_path)?;
+    let source_lock = ensure_source_entry_matches(&parent, &name, proof)?;
+    let guard = create_source_guard(&parent, &name);
+    drop(source_lock);
+    guard
+}
+
+#[cfg(target_os = "linux")]
+fn create_source_guard(
+    parent: &std::os::fd::OwnedFd,
+    source_name: &std::ffi::CString,
+) -> Result<SourcePreservationGuard, SafeDeleteError> {
+    use std::{
+        ffi::{CString, OsStr},
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+
+    for _ in 0..1024 {
+        let sequence = NEXT_SOURCE_GUARD.fetch_add(1, Ordering::Relaxed);
+        let mut name = std::ffi::OsString::from(".syncplus-source-guard-");
+        name.push(sequence.to_string());
+        name.push("-");
+        name.push(OsStr::from_bytes(source_name.to_bytes()));
+        let guard_name = CString::new(name.as_os_str().as_bytes())
+            .map_err(|_| SafeDeleteError::InvalidAction("path contains NUL".to_owned()))?;
+        let result = unsafe {
+            libc::linkat(
+                parent.as_raw_fd(),
+                source_name.as_ptr(),
+                parent.as_raw_fd(),
+                guard_name.as_ptr(),
+                0,
+            )
+        };
+        if result == 0 {
+            return Ok(SourcePreservationGuard {
+                parent: parent.try_clone().map_err(io_error)?,
+                name: guard_name,
+                retain_on_drop: false,
+            });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(SafeDeleteError::RecoveryUnavailable(format!(
+                "the source could not be protected before removal: {error}"
+            )));
+        }
+    }
+    Err(SafeDeleteError::RecoveryUnavailable(
+        "could not allocate a source preservation guard".to_owned(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn restore_source_from_guard(
+    guard: &SourcePreservationGuard,
+    source_parent: &std::os::fd::OwnedFd,
+    source_name: &std::ffi::CString,
+    proof: &crate::VerifiedTransferProof,
+) -> Result<(), SafeDeleteError> {
+    use std::os::fd::AsRawFd;
+
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            status.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Err(SafeDeleteError::RecoveryUncertain(
+            "the source path was recreated before restoration".to_owned(),
+        ));
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() != io::ErrorKind::NotFound {
+        return Err(SafeDeleteError::RecoveryUncertain(format!(
+            "the source path could not be inspected during restoration: {error}"
+        )));
+    }
+    let result = unsafe {
+        libc::linkat(
+            guard.parent.as_raw_fd(),
+            guard.name.as_ptr(),
+            source_parent.as_raw_fd(),
+            source_name.as_ptr(),
+            0,
+        )
+    };
+    if result != 0 {
+        return Err(SafeDeleteError::RecoveryUncertain(format!(
+            "the original source could not be restored: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let restored = ensure_source_entry_matches(source_parent, source_name, proof);
+    match restored {
+        Ok(file) => {
+            drop(file);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn create_recovery_temporary(
@@ -862,6 +1148,7 @@ fn copy_source_without_following(
     relative_path: &Path,
     destination_file: &mut std::fs::File,
     proof: &crate::VerifiedTransferProof,
+    metadata_requirements: crate::MetadataRequirements,
 ) -> Result<(), SafeDeleteError> {
     let mut source_file = open_source_file(source_root, relative_path)?;
     let source_metadata = source_file.metadata().map_err(io_error)?;
@@ -891,6 +1178,18 @@ fn copy_source_without_following(
         use std::os::unix::fs::PermissionsExt;
         destination_file
             .set_permissions(fs::Permissions::from_mode(permissions))
+            .map_err(io_error)?;
+    }
+    if metadata_requirements.timestamps() {
+        let modified_at = proof
+            .source_after()
+            .metadata()
+            .modified_at()
+            .ok_or_else(|| {
+                SafeDeleteError::Verification(VerificationError::HashMismatch)
+            })?;
+        destination_file
+            .set_modified(modified_at)
             .map_err(io_error)?;
     }
     Ok(())
@@ -944,9 +1243,10 @@ fn remove_source_exact(
     source_root: &Path,
     relative_path: &Path,
     proof: &crate::VerifiedTransferProof,
+    source_guard: &SourcePreservationGuard,
 ) -> Result<(), SafeDeleteError> {
     let (source_parent, source_name) = open_relative_parent(source_root, relative_path)?;
-    let _source_lock = ensure_source_entry_matches(&source_parent, &source_name, proof)?;
+    let source_lock = ensure_source_entry_matches(&source_parent, &source_name, proof)?;
     let result = unsafe {
         libc::unlinkat(
             std::os::fd::AsRawFd::as_raw_fd(&source_parent),
@@ -955,12 +1255,18 @@ fn remove_source_exact(
         )
     };
     if result != 0 {
+        let removal_error = io::Error::last_os_error();
+        drop(source_lock);
+        let _ = restore_source_from_guard(source_guard, &source_parent, &source_name, proof);
         return Err(SafeDeleteError::RecoveryUncertain(format!(
-            "source removal returned an uncertain result: {}",
-            io::Error::last_os_error()
+            "source removal returned an uncertain result: {removal_error}"
         )));
     }
-    ensure_entry_absent(&source_parent, &source_name)?;
+    drop(source_lock);
+    if let Err(error) = ensure_entry_absent(&source_parent, &source_name) {
+        let _ = restore_source_from_guard(source_guard, &source_parent, &source_name, proof);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -969,6 +1275,7 @@ fn remove_source_exact(
     _source_root: &Path,
     _relative_path: &Path,
     _proof: &crate::VerifiedTransferProof,
+    _source_guard: &(),
 ) -> Result<(), SafeDeleteError> {
     Err(SafeDeleteError::RecoveryUnavailable(
         "safe descriptor-relative source removal is supported only on Linux".to_owned(),
@@ -1148,6 +1455,7 @@ fn verify_recovery_entry(
     parent: &std::os::fd::OwnedFd,
     name: &std::ffi::CString,
     proof: &crate::VerifiedTransferProof,
+    metadata_requirements: crate::MetadataRequirements,
 ) -> Result<(), SafeDeleteError> {
     use std::os::fd::{AsRawFd, FromRawFd};
 
@@ -1165,18 +1473,19 @@ fn verify_recovery_entry(
         )));
     }
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    verify_recovery_file(&mut file, proof)
+    verify_recovery_file(&mut file, proof, metadata_requirements)
 }
 
 fn verify_recovery_file(
     file: &mut std::fs::File,
     proof: &crate::VerifiedTransferProof,
+    metadata_requirements: crate::MetadataRequirements,
 ) -> Result<(), SafeDeleteError> {
     let opened_metadata = file.metadata().map_err(io_error)?;
     if !proof
         .source_after()
         .metadata()
-        .matches_open_transfer_metadata(&opened_metadata)
+        .matches_open_transfer_metadata(&opened_metadata, metadata_requirements)
     {
         return Err(SafeDeleteError::RecoveryUncertain(
             "the recovery item failed metadata verification".to_owned(),
@@ -1189,7 +1498,7 @@ fn verify_recovery_file(
         || !proof
             .source_after()
             .metadata()
-            .matches_open_transfer_metadata(&finished_metadata)
+            .matches_open_transfer_metadata(&finished_metadata, metadata_requirements)
     {
         return Err(SafeDeleteError::RecoveryUncertain(
             "the recovery item failed content or metadata verification".to_owned(),

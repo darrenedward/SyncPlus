@@ -2,12 +2,13 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use crate::{
-    AuthorizationSnapshot, DeletionMethod, FreshAnalysis, JournalEvent, OneWaySource, Peer,
-    PlanActionKind, PlanRecord, PreActionState, RecoveryMethod, RunEvidenceStore, RunId,
-    SafeDeleteExecutor, SyncOptions, SyncProfile,
+    AuthorizationSnapshot, DeletionMethod, FreshAnalysis, JournalEvent, MetadataRequirements,
+    OneWaySource, Peer, PlanActionKind, PlanRecord, PreActionState, RecoveryMethod,
+    RunEvidenceStore, RunId, SafeDeleteExecutor, SyncOptions, SyncProfile,
 };
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -49,6 +50,7 @@ fn profile(source: &TestDirectory, destination: &TestDirectory) -> SyncProfile {
         safe_delete: true,
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
+        metadata: Default::default(),
     })
 }
 
@@ -97,9 +99,13 @@ fn begin_store(
     source: &TestDirectory,
     destination: &TestDirectory,
 ) -> RunEvidenceStore {
+    begin_store_for_profile(run_id, &profile(source, destination))
+}
+
+fn begin_store_for_profile(run_id: RunId, profile: &SyncProfile) -> RunEvidenceStore {
     let snapshot = crate::RunSnapshot::from_profile(
         run_id,
-        &profile(source, destination),
+        profile,
         AuthorizationSnapshot::default(),
     )
     .expect("test snapshot should be valid");
@@ -165,6 +171,137 @@ fn verified_source_is_moved_to_recovery_and_journaled_before_next_item() {
     ));
     assert!(report.items()[0].journal().proof_boundary().is_some());
     assert!(report.items()[0].journal().removal_result().is_some());
+}
+
+#[test]
+fn enabled_timestamp_metadata_is_applied_before_verified_removal() {
+    let source = TestDirectory::new("timestamp-source");
+    let destination = TestDirectory::new("timestamp-destination");
+    let recovery = TestDirectory::new("timestamp-recovery");
+    let source_path = source.join("item.txt");
+    let destination_path = destination.join("item.txt");
+    let modified_at = UNIX_EPOCH + Duration::from_secs(7_654);
+    fs::write(&source_path, b"timestamped").expect("source should be writable");
+    fs::File::open(&source_path)
+        .expect("source should open")
+        .set_modified(modified_at)
+        .expect("source timestamp should be settable");
+    let metadata = MetadataRequirements::new(true, true, true, true);
+    let profile = profile(&source, &destination).with_options(SyncOptions {
+        safe_delete: true,
+        destination_cleanup: false,
+        deletion_method: Some(DeletionMethod::Trash),
+        metadata,
+    });
+    let analysis = FreshAnalysis::analyze(&profile).expect("profile should be analyzable");
+    let action = analysis
+        .plan()
+        .actions()
+        .iter()
+        .find(|action| action.kind() == PlanActionKind::RemoveSourceAfterVerification)
+        .expect("removal action");
+    let replacement = crate::replacement::perform_verified_replacement_with_cancel_and_metadata(
+        &source_path,
+        &destination_path,
+        metadata,
+        || false,
+        |temporary| {
+            fs::copy(&source_path, temporary)
+                .map(|_| ())
+                .map_err(|error| crate::ReplacementError::Io(error.to_string()))
+        },
+    )
+    .expect("timestamp metadata should be preserved");
+    let run_id = RunId::new(107);
+    let mut store = begin_store_for_profile(run_id, &profile);
+    assert_eq!(
+        store
+            .load_snapshot(run_id)
+            .expect("snapshot should load")
+            .validated_options()
+            .metadata(),
+        metadata
+    );
+    record_started(&mut store, run_id, action, &replacement);
+
+    SafeDeleteExecutor::new(RecoveryMethod::trash(recovery.path.clone()))
+        .settle_one(run_id, analysis.plan(), action, &replacement, &mut store)
+        .expect("verified removal should settle");
+
+    assert!(!source_path.exists(), "source should be removed");
+    let destination_metadata = crate::FileMetadataProof::capture(&destination_path)
+        .expect("destination metadata");
+    let recovery_metadata = crate::FileMetadataProof::capture(&recovery.join("item.txt"))
+        .expect("recovery metadata");
+    assert_eq!(
+        destination_metadata.modified_at_unix_nanos(),
+        recovery_metadata.modified_at_unix_nanos()
+    );
+    assert_eq!(
+        destination_metadata.modified_at_unix_nanos(),
+        Some(
+            modified_at
+                .duration_since(UNIX_EPOCH)
+                .expect("timestamp should be after epoch")
+                .as_nanos() as i64,
+        )
+    );
+}
+
+#[test]
+fn journal_failure_after_filesystem_removal_records_recovery_review() {
+    let source = TestDirectory::new("journal-failure-source");
+    let destination = TestDirectory::new("journal-failure-destination");
+    let recovery = TestDirectory::new("journal-failure-recovery");
+    fs::write(source.join("item.txt"), b"journal boundary").expect("source should be writable");
+    let analysis = FreshAnalysis::analyze(&profile(&source, &destination))
+        .expect("test peers should be analyzable");
+    let action = analysis
+        .plan()
+        .actions()
+        .iter()
+        .find(|action| action.kind() == PlanActionKind::RemoveSourceAfterVerification)
+        .expect("removal action");
+    let source_path = source.join("item.txt");
+    let recovery_path = recovery.join("item.txt");
+    let replacement = crate::replacement::perform_verified_replacement(
+        &source_path,
+        &destination.join("item.txt"),
+        |temporary| {
+            fs::copy(&source_path, temporary)
+                .map(|_| ())
+                .map_err(|error| crate::ReplacementError::Io(error.to_string()))
+        },
+    )
+    .expect("transfer proof");
+    let run_id = RunId::new(108);
+    let mut store = begin_store(run_id, &source, &destination);
+    record_started(&mut store, run_id, action, &replacement);
+    store.fail_next_event_phase_for_test("removal_completed");
+
+    let error = SafeDeleteExecutor::new(RecoveryMethod::trash(recovery.path.clone()))
+        .settle_one(run_id, analysis.plan(), action, &replacement, &mut store)
+        .expect_err("injected journal failure should be returned");
+    assert!(matches!(error, crate::SafeDeleteError::RecoveryUncertain(_)));
+    assert!(!source_path.exists());
+    assert_eq!(fs::read(&recovery_path).expect("recovery item"), b"journal boundary");
+    assert!(
+        fs::read_dir(&source.path)
+            .expect("source directory")
+            .flatten()
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".syncplus-source-guard-")),
+        "the preservation guard must remain while the result is under review"
+    );
+    let report = store.load_report(run_id).expect("recovery review should load");
+    assert!(matches!(
+        report.items()[0].outcome(),
+        crate::ActionOutcome::RecoveryReview(_)
+    ));
+    assert!(report.items()[0].journal().recovery_evidence().is_some());
+    assert!(report.items()[0].journal().removal_result().is_none());
 }
 
 #[test]
@@ -514,6 +651,16 @@ fn interruption_after_removal_start_requires_recovery_review() {
         Some(*proof.source_after().content().sha256()),
         Some(*proof.installed_destination().sha256()),
     );
+    store
+        .append_event(
+            run_id,
+            JournalEvent::TransferVerified {
+                action_id: action.action_id(),
+                evidence: evidence.clone(),
+                metadata_verified: true,
+            },
+        )
+        .expect("verified transfer boundary");
     store
         .append_event(
             run_id,

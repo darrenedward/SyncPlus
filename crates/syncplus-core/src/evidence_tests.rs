@@ -76,6 +76,7 @@ fn persisted_snapshot_remains_unchanged_when_the_profile_is_edited() {
         safe_delete: true,
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
+        metadata: Default::default(),
     });
     assert_ne!(edited, *original.profile());
 
@@ -91,6 +92,7 @@ fn active_sync_run_owns_validated_options_and_authorizations_from_start() {
         safe_delete: true,
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
+        metadata: Default::default(),
     });
     let run = SyncRun::new_with_authorizations(
         RunId::new(5),
@@ -365,6 +367,7 @@ fn safe_delete_actions_cannot_settle_through_generic_completed_event() {
         safe_delete: true,
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
+        metadata: Default::default(),
     });
     let run_id = RunId::new(11);
     let snapshot = RunSnapshot::from_profile(
@@ -407,6 +410,7 @@ fn journal_replay_rejects_corrupt_generic_completion_for_safe_delete() {
         safe_delete: true,
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
+        metadata: Default::default(),
     });
     let run_id = RunId::new(12);
     let snapshot = RunSnapshot::from_profile(
@@ -469,6 +473,7 @@ fn journal_replay_rejects_corrupt_recovery_completion_for_safe_delete() {
         safe_delete: true,
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
+        metadata: Default::default(),
     });
     let run_id = RunId::new(13);
     let snapshot = RunSnapshot::from_profile(
