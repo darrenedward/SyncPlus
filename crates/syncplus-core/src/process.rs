@@ -173,6 +173,7 @@ impl SyncOptions {
 pub struct ProcessSpecification {
     arguments: Vec<ProcessArgument>,
     options: ValidatedSyncOptions,
+    source: OneWaySource,
     secret_bindings: Vec<EnvironmentBinding>,
 }
 
@@ -214,6 +215,7 @@ impl ProcessSpecification {
         Ok(Self {
             arguments,
             options,
+            source: profile.source(),
             secret_bindings: Vec::new(),
         })
     }
@@ -224,6 +226,17 @@ impl ProcessSpecification {
 
     pub const fn options(&self) -> ValidatedSyncOptions {
         self.options
+    }
+
+    pub const fn source(&self) -> OneWaySource {
+        self.source
+    }
+
+    pub fn exclusions(&self) -> impl Iterator<Item = &str> {
+        self.arguments.iter().filter_map(|argument| match argument {
+            ProcessArgument::ExclusionPattern(pattern) => Some(pattern.as_str()),
+            ProcessArgument::Flag(_) | ProcessArgument::PeerPath(_) => None,
+        })
     }
 
     pub fn with_secret_binding(
