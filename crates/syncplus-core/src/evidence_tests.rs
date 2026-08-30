@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, time::Duration};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{params, Connection};
@@ -6,8 +6,8 @@ use rusqlite::{params, Connection};
 use crate::{
     ActionOutcome, ActionReason, AuthorizationSnapshot, DeletionMethod, FileIdentity, ItemType,
     JournalEvent, OneWaySource, Peer, PeerSide, PlanActionKind, PlanRecord, PreActionState, RecoveryEvidence,
-    RecoveryResolution, RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle, RunReportStatus,
-    RunSnapshot, SyncOptions, SyncProfile, SyncRun,
+    PartialTransferPolicy, RecoveryResolution, RetryPolicy, RunEvidenceStore, RunExecutionResult,
+    RunId, RunLifecycle, RunReportStatus, RunSnapshot, SyncOptions, SyncProfile, SyncRun,
 };
 
 fn profile() -> SyncProfile {
@@ -77,6 +77,8 @@ fn persisted_snapshot_remains_unchanged_when_the_profile_is_edited() {
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     });
     assert_ne!(edited, *original.profile());
 
@@ -93,6 +95,8 @@ fn active_sync_run_owns_validated_options_and_authorizations_from_start() {
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     });
     let run = SyncRun::new_with_authorizations(
         RunId::new(5),
@@ -106,6 +110,82 @@ fn active_sync_run_owns_validated_options_and_authorizations_from_start() {
         true
     );
     assert_eq!(run.snapshot().profile(), &profile);
+}
+
+#[test]
+fn interrupted_action_is_durable_and_remains_open_for_resume() {
+    let path = TestDatabase::new();
+    let run_id = RunId::new(14);
+    let mut store = RunEvidenceStore::open(path.path()).expect("open evidence store");
+    store
+        .begin_run(&RunSnapshot::from_profile(
+            run_id,
+            &profile(),
+            AuthorizationSnapshot::default(),
+        )
+        .expect("snapshot"))
+        .expect("persist snapshot");
+    store
+        .append_event(run_id, JournalEvent::Planned { action: action(1) })
+        .expect("persist plan");
+    store
+        .append_event(run_id, JournalEvent::Started { action_id: 1 })
+        .expect("persist start");
+    store
+        .append_event(
+            run_id,
+            JournalEvent::Progress {
+                action_id: 1,
+                completed_bytes: 21,
+            },
+        )
+        .expect("persist progress");
+    store
+        .append_event(run_id, JournalEvent::Interrupted { action_id: 1 })
+        .expect("persist interruption");
+
+    let report = store.load_report(run_id).expect("load interrupted report");
+    assert_eq!(report.status(), RunReportStatus::Interrupted);
+    assert_eq!(report.execution_result(), RunExecutionResult::Interrupted);
+    assert_eq!(report.items()[0].progress_bytes(), 21);
+    assert!(matches!(
+        report.items()[0].outcome(),
+        ActionOutcome::Interrupted
+    ));
+}
+
+#[test]
+fn retry_and_partial_policies_are_frozen_in_the_run_snapshot() {
+    let path = TestDatabase::new();
+    let options = SyncOptions {
+        partial_transfer_policy: PartialTransferPolicy::KeepPartialForResume,
+        retry_policy: RetryPolicy::new(5, Duration::from_millis(250)),
+        ..SyncOptions::default()
+    };
+    let original = SyncProfile::new(
+        "policy profile",
+        Peer::new("source", PathBuf::from("/source")),
+        Peer::new("destination", PathBuf::from("/destination")),
+    )
+    .with_options(options);
+    let snapshot = RunSnapshot::from_profile(
+        RunId::new(15),
+        &original,
+        AuthorizationSnapshot::default(),
+    )
+    .expect("policy profile should be valid");
+    let mut store = RunEvidenceStore::open(path.path()).expect("open evidence store");
+    store.begin_run(&snapshot).expect("persist snapshot");
+
+    let restored = store.load_snapshot(RunId::new(15)).expect("restore snapshot");
+    assert_eq!(restored, snapshot);
+    assert_eq!(
+        restored
+            .validated_options()
+            .partial_transfer_policy(),
+        PartialTransferPolicy::KeepPartialForResume
+    );
+    assert_eq!(restored.validated_options().retry_policy(), options.retry_policy);
 }
 
 #[test]
@@ -368,6 +448,8 @@ fn safe_delete_actions_cannot_settle_through_generic_completed_event() {
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     });
     let run_id = RunId::new(11);
     let snapshot = RunSnapshot::from_profile(
@@ -411,6 +493,8 @@ fn journal_replay_rejects_corrupt_generic_completion_for_safe_delete() {
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     });
     let run_id = RunId::new(12);
     let snapshot = RunSnapshot::from_profile(
@@ -474,6 +558,8 @@ fn journal_replay_rejects_corrupt_recovery_completion_for_safe_delete() {
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     });
     let run_id = RunId::new(13);
     let snapshot = RunSnapshot::from_profile(

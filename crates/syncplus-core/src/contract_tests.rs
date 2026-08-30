@@ -25,6 +25,8 @@ fn new_profiles_default_to_non_destructive_one_way_sync() {
             destination_cleanup: false,
             deletion_method: None,
             metadata: Default::default(),
+            partial_transfer_policy: Default::default(),
+            retry_policy: Default::default(),
         }
     );
 }
@@ -36,6 +38,8 @@ fn invalid_profiles_cannot_create_active_runs() {
         destination_cleanup: false,
         deletion_method: None,
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     });
 
     assert!(SyncRun::new(RunId::new(8), &invalid).is_err());
@@ -76,12 +80,24 @@ fn every_required_terminal_outcome_is_typed() {
         TerminalOutcome::CompletedWithReviewRequired,
         TerminalOutcome::Failed,
         TerminalOutcome::Cancelled,
+        TerminalOutcome::Interrupted,
         TerminalOutcome::Blocked,
         TerminalOutcome::RecoveryReview,
         TerminalOutcome::ReviewCleared,
     ];
 
-    assert_eq!(outcomes.len(), 7);
+    assert_eq!(outcomes.len(), 8);
+
+    let interrupted = SyncRun::new(RunId::new(9), &profile())
+        .expect("valid profile")
+        .transition(RunEvent::BeginPrecheck)
+        .expect("precheck starts from edit")
+        .transition(RunEvent::Interrupted)
+        .expect("an interrupted run must be terminal");
+    assert_eq!(
+        interrupted.outcome(),
+        Some(TerminalOutcome::Interrupted)
+    );
 }
 
 #[test]

@@ -51,6 +51,8 @@ fn profile(source: &TestDirectory, destination: &TestDirectory) -> SyncProfile {
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     })
 }
 
@@ -192,6 +194,8 @@ fn enabled_timestamp_metadata_is_applied_before_verified_removal() {
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
         metadata,
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     });
     let analysis = FreshAnalysis::analyze(&profile).expect("profile should be analyzable");
     let action = analysis

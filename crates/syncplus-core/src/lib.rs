@@ -10,12 +10,13 @@ mod verification;
 mod replacement;
 mod transfer;
 mod removal;
+mod workflow;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
-    OneWaySource, Peer,
-    ProfileSnapshot, ProfileSnapshotId, RunEvent, RunId, RunState, SafetyViolation, SyncMode,
-    SyncOptions, SyncProfile, SyncRun, TerminalOutcome,
+    OneWaySource, PartialTransferPolicy, Peer, ProfileSnapshot, ProfileSnapshotId, RetryPolicy,
+    RunEvent, RunId, RunState, SafetyViolation, SyncMode, SyncOptions, SyncProfile, SyncRun,
+    TerminalOutcome,
 };
 pub use process::{
     EnvironmentBinding, ProcessArgument, ProcessInvocation, ProcessSpecError,
@@ -44,6 +45,7 @@ pub use verification::{
 };
 pub use transfer::{ControlledTransfer, TransferError};
 pub use removal::{RecoveryMethod, RemovalReceipt, SafeDeleteError, SafeDeleteExecutor};
+pub use workflow::{RunWorkflow, WorkflowError};
 pub use precheck::{
     AccessSnapshot, DestinationNamingPolicy, ExecutionPermit, LocalPrecheckProbe,
     NamingConflict, NamingRule, PathRiskLevel, PathRiskWarning, PrecheckBlocker,
@@ -66,6 +68,7 @@ mod analysis_tests;
 
 #[cfg(test)]
 mod evidence_tests;
+#[cfg(test)]
 mod precheck_tests;
 
 #[cfg(test)]

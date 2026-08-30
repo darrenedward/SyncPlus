@@ -78,6 +78,8 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::Trash),
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     }
     .validate()
     .expect("Safe Delete with an explicit recovery method is valid");
@@ -89,6 +91,8 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
         destination_cleanup: false,
         deletion_method: None,
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     }
     .validate()
     .expect_err("Safe Delete without a recovery method is ambiguous");
@@ -102,6 +106,8 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
         destination_cleanup: false,
         deletion_method: Some(DeletionMethod::PermanentRemoval),
         metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
     }
     .validate()
     .expect_err("a deletion method without a destructive action is ambiguous");
@@ -116,6 +122,8 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
             destination_cleanup: true,
             deletion_method: None,
             metadata: Default::default(),
+            partial_transfer_policy: Default::default(),
+            retry_policy: Default::default(),
         });
     let specification = ProcessSpecification::from_profile(&destination_cleanup)
         .expect("destination cleanup must be enabled only by explicit profile configuration");
@@ -129,6 +137,8 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
             destination_cleanup: false,
             deletion_method: Some(DeletionMethod::Trash),
             metadata: Default::default(),
+            partial_transfer_policy: Default::default(),
+            retry_policy: Default::default(),
         });
     let specification = ProcessSpecification::from_profile(&safe_delete)
         .expect("Safe Delete must be valid with an explicit recovery method");

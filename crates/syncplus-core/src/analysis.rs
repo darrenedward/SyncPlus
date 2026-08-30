@@ -499,11 +499,16 @@ impl std::error::Error for AnalysisError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmedPlan {
     plan: OneWayPlan,
+    profile: SyncProfile,
 }
 
 impl ConfirmedPlan {
     pub fn plan(&self) -> &OneWayPlan {
         &self.plan
+    }
+
+    pub fn profile(&self) -> &SyncProfile {
+        &self.profile
     }
 }
 
@@ -595,6 +600,7 @@ impl FreshAnalysis {
 
         Ok(ConfirmedPlan {
             plan: self.plan.clone(),
+            profile: current_profile.clone(),
         })
     }
 }
@@ -714,6 +720,9 @@ fn walk_directory(
     entries.sort_by_key(DirEntry::file_name);
 
     for entry in entries {
+        if is_syncplus_internal_artifact(&entry.file_name()) {
+            continue;
+        }
         let absolute_path = entry.path();
         let relative_path = relative_directory.join(entry.file_name());
         let metadata = fs::symlink_metadata(&absolute_path).map_err(|_| {
@@ -773,6 +782,11 @@ fn walk_directory(
     }
 
     Ok(())
+}
+
+fn is_syncplus_internal_artifact(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with(".syncplus-partial-") || name.starts_with(".syncplus-temporary-")
 }
 
 fn item_type(metadata: &Metadata) -> ItemType {

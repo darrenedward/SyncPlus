@@ -198,7 +198,7 @@ A new analysis of an Interrupted Run's remaining scope against the current peers
 _Avoid_: Continue blindly, replay
 
 **Action Journal**:
-The durable per-path record of a Sync Run's planned action, pre-action state, start, progress, and final outcome. It distinguishes completed, cancelled, failed, deferred, and unresolved work.
+The durable per-path record of a Sync Run's planned action, pre-action state, start, progress, and final outcome. It distinguishes completed, cancelled, interrupted, failed, deferred, and unresolved work; an open boundary is classified before a safe resume.
 _Avoid_: Terminal log, aggregate count only
 
 **Cancelled Action**:

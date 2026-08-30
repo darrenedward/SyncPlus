@@ -1,4 +1,9 @@
-use std::{fmt, path::Path, path::PathBuf};
+use std::{
+    fmt,
+    path::Path,
+    path::PathBuf,
+    time::Duration,
+};
 
 use crate::{ProcessSpecError, ProcessSpecification, ValidatedSyncOptions};
 
@@ -68,6 +73,47 @@ pub enum DeletionMethod {
     PermanentRemoval,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialTransferPolicy {
+    Cleanup,
+    KeepPartialForResume,
+}
+
+impl Default for PartialTransferPolicy {
+    fn default() -> Self {
+        Self::Cleanup
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryPolicy {
+    max_attempts: u8,
+    initial_delay: Duration,
+}
+
+impl RetryPolicy {
+    pub const fn new(max_attempts: u8, initial_delay: Duration) -> Self {
+        Self {
+            max_attempts,
+            initial_delay,
+        }
+    }
+
+    pub const fn max_attempts(self) -> u8 {
+        self.max_attempts
+    }
+
+    pub const fn initial_delay(self) -> Duration {
+        self.initial_delay
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self::new(3, Duration::from_millis(100))
+    }
+}
+
 /// Metadata that a transfer must preserve and verify before it can enter a
 /// Safe Delete proof boundary. The default is the essential V1 contract;
 /// timestamps are opt-in because they require an explicit preservation step.
@@ -123,6 +169,8 @@ pub struct SyncOptions {
     pub destination_cleanup: bool,
     pub deletion_method: Option<DeletionMethod>,
     pub metadata: MetadataRequirements,
+    pub partial_transfer_policy: PartialTransferPolicy,
+    pub retry_policy: RetryPolicy,
 }
 
 impl Default for SyncOptions {
@@ -132,6 +180,8 @@ impl Default for SyncOptions {
             destination_cleanup: false,
             deletion_method: None,
             metadata: MetadataRequirements::default(),
+            partial_transfer_policy: PartialTransferPolicy::Cleanup,
+            retry_policy: RetryPolicy::default(),
         }
     }
 }
@@ -298,6 +348,7 @@ pub enum TerminalOutcome {
     CompletedWithReviewRequired,
     Failed,
     Cancelled,
+    Interrupted,
     Blocked,
     RecoveryReview,
     ReviewCleared,
@@ -331,6 +382,7 @@ pub enum RunEvent {
     Blocked,
     Failed,
     Cancelled,
+    Interrupted,
     RecoveryReview,
 }
 
@@ -429,13 +481,18 @@ impl SyncRun {
 fn next_state(state: RunState, event: RunEvent) -> Option<RunState> {
     if matches!(
         event,
-        RunEvent::Blocked | RunEvent::Failed | RunEvent::Cancelled | RunEvent::RecoveryReview
+        RunEvent::Blocked
+            | RunEvent::Failed
+            | RunEvent::Cancelled
+            | RunEvent::Interrupted
+            | RunEvent::RecoveryReview
     ) {
         return match state {
             RunState::Active(_) | RunState::PendingReview => Some(RunState::Terminal(match event {
                 RunEvent::Blocked => TerminalOutcome::Blocked,
                 RunEvent::Failed => TerminalOutcome::Failed,
                 RunEvent::Cancelled => TerminalOutcome::Cancelled,
+                RunEvent::Interrupted => TerminalOutcome::Interrupted,
                 RunEvent::RecoveryReview => TerminalOutcome::RecoveryReview,
                 _ => unreachable!("the event was checked above"),
             })),

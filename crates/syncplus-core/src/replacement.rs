@@ -8,7 +8,8 @@ use std::{
 
 use crate::{
     verify_content, verify_content_with_cancel, FileMetadataProof, MetadataRequirements,
-    SourceObservation, VerificationError, VerifiedTransferProof,
+    PartialTransferPolicy, ProcessError, SourceObservation, VerificationError,
+    VerifiedTransferProof,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +50,8 @@ impl VerifiedReplacement {
 pub enum ReplacementError {
     Io(String),
     Transfer(String),
+    Process(ProcessError),
+    ProcessExit { exit_code: Option<i32>, signal: Option<i32> },
     Verification(VerificationError),
     MetadataMismatch,
     Cancelled,
@@ -60,6 +63,10 @@ impl std::fmt::Display for ReplacementError {
         match self {
             Self::Io(reason) => write!(formatter, "replacement filesystem error: {reason}"),
             Self::Transfer(reason) => write!(formatter, "transfer failed: {reason}"),
+            Self::Process(error) => error.fmt(formatter),
+            Self::ProcessExit { exit_code, signal } => {
+                write!(formatter, "controlled transfer exited with code {exit_code:?} and signal {signal:?}")
+            }
             Self::Verification(error) => error.fmt(formatter),
             Self::MetadataMismatch => {
                 formatter.write_str("transferred file type or executable permissions did not match")
@@ -117,6 +124,7 @@ where
 /// The cancellation-aware replacement boundary. Cancellation is checked at
 /// every point where a transfer could otherwise cross into an installation or
 /// rollback decision, and hashing uses the same callback while reading data.
+#[cfg(test)]
 pub(crate) fn perform_verified_replacement_with_cancel<C, F>(
     source: &Path,
     destination: &Path,
@@ -136,6 +144,7 @@ where
     )
 }
 
+#[cfg(test)]
 pub(crate) fn perform_verified_replacement_with_cancel_and_metadata<C, F>(
     source: &Path,
     destination: &Path,
@@ -147,17 +156,51 @@ where
     C: Fn() -> bool,
     F: FnOnce(&Path) -> Result<(), ReplacementError>,
 {
+    perform_verified_replacement_with_cancel_and_metadata_and_partial(
+        source,
+        destination,
+        metadata,
+        PartialTransferPolicy::Cleanup,
+        should_cancel,
+        transfer,
+    )
+}
+
+pub(crate) fn perform_verified_replacement_with_cancel_and_metadata_and_partial<C, F>(
+    source: &Path,
+    destination: &Path,
+    metadata: MetadataRequirements,
+    partial_policy: PartialTransferPolicy,
+    should_cancel: C,
+    transfer: F,
+) -> Result<VerifiedReplacement, ReplacementError>
+where
+    C: Fn() -> bool,
+    F: FnOnce(&Path) -> Result<(), ReplacementError>,
+{
     check_cancelled(&should_cancel)?;
     let source_before = SourceObservation::capture_with_cancel(source, || should_cancel())
         .map_err(map_verification_error)?;
-    let temporary = temporary_sibling(destination, "temporary")?;
+    let temporary_kind = match partial_policy {
+        PartialTransferPolicy::Cleanup => "temporary",
+        PartialTransferPolicy::KeepPartialForResume => "partial",
+    };
+    let temporary = temporary_sibling(destination, temporary_kind)?;
     create_empty_file(&temporary)?;
 
     if let Err(error) = transfer(&temporary) {
-        return Err(cleanup_temporary(&temporary, error));
+        return Err(cleanup_temporary_according_to_policy(
+            &temporary,
+            error,
+            partial_policy,
+        ));
     }
     if let Err(error) = check_cancelled(&should_cancel) {
-        return Err(cleanup_temporary(&temporary, error));
+        return Err(cleanup_temporary_according_to_policy(
+            &temporary,
+            error,
+            partial_policy,
+        ));
     }
 
     let result = (|| {
@@ -377,8 +420,43 @@ where
 
     match result {
         Ok(replacement) => Ok(replacement),
-        Err(error) => Err(cleanup_temporary(&temporary, error)),
+        Err(error) => Err(cleanup_temporary_according_to_policy(
+            &temporary,
+            error,
+            partial_policy,
+        )),
     }
+}
+
+/// Remove only SyncPlus-owned incomplete transfer artifacts. These files are
+/// intentionally hidden and excluded from analysis while they await a
+/// resume; callers invoke this only after Fresh Analysis and before a new
+/// verified transfer.
+pub(crate) fn cleanup_partial_transfer_artifacts(root: &Path) -> io::Result<()> {
+    fn visit(directory: &Path) -> io::Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_dir() {
+                visit(&path)?;
+            } else if metadata.file_type().is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".syncplus-partial-")
+            {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    visit(root)
 }
 
 fn apply_metadata_requirements(
@@ -544,6 +622,17 @@ fn cleanup_temporary(path: &Path, original_error: ReplacementError) -> Replaceme
     }
 }
 
+fn cleanup_temporary_according_to_policy(
+    path: &Path,
+    original_error: ReplacementError,
+    policy: PartialTransferPolicy,
+) -> ReplacementError {
+    match policy {
+        PartialTransferPolicy::Cleanup => cleanup_temporary(path, original_error),
+        PartialTransferPolicy::KeepPartialForResume => original_error,
+    }
+}
+
 fn create_empty_file(path: &Path) -> Result<(), ReplacementError> {
     OpenOptions::new()
         .write(true)
@@ -600,8 +689,11 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::{
-        perform_verified_replacement, perform_verified_replacement_with_cancel, ReplacementError,
+        cleanup_partial_transfer_artifacts, perform_verified_replacement,
+        perform_verified_replacement_with_cancel,
+        perform_verified_replacement_with_cancel_and_metadata_and_partial, ReplacementError,
     };
+    use crate::{MetadataRequirements, PartialTransferPolicy};
 
     #[test]
     fn old_destination_survives_until_verified_replacement_is_installed() {
@@ -655,6 +747,47 @@ mod tests {
         assert_eq!(error, ReplacementError::Cancelled);
         assert_eq!(fs::read(&source).unwrap(), b"source bytes");
         assert_eq!(fs::read(&destination).unwrap(), b"old bytes");
+    }
+
+    #[test]
+    fn keep_partial_for_resume_is_explicit_hidden_and_cleaned_explicitly() {
+        let fixture = Fixture::new();
+        let source = fixture.path.join("source.txt");
+        let destination = fixture.path.join("destination.txt");
+        fs::write(&source, b"complete source bytes").unwrap();
+        fs::write(&destination, b"old destination bytes").unwrap();
+
+        let error = perform_verified_replacement_with_cancel_and_metadata_and_partial(
+            &source,
+            &destination,
+            MetadataRequirements::default(),
+            PartialTransferPolicy::KeepPartialForResume,
+            || false,
+            |temporary| {
+                fs::write(temporary, b"incomplete bytes").map_err(|error| {
+                    ReplacementError::Transfer(error.to_string())
+                })?;
+                Err(ReplacementError::Transfer("transient transfer failure".to_owned()))
+            },
+        )
+        .expect_err("failed transfer should not install partial content");
+        assert!(matches!(error, ReplacementError::Transfer(_)));
+        assert_eq!(fs::read(&source).unwrap(), b"complete source bytes");
+        assert_eq!(fs::read(&destination).unwrap(), b"old destination bytes");
+
+        let partials: Vec<_> = fs::read_dir(&fixture.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".syncplus-partial-")
+            })
+            .collect();
+        assert_eq!(partials.len(), 1);
+        cleanup_partial_transfer_artifacts(&fixture.path).unwrap();
+        assert!(!partials[0].exists());
     }
 
     #[cfg(unix)]
