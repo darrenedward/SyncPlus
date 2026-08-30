@@ -11,8 +11,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::{
     AuthorizationSnapshot, DeletionMethod, ItemType, MetadataRequirements, OneWaySource, Peer,
     PeerSide, PartialTransferPolicy, PlanActionKind, ProcessSpecError, ProcessSpecification,
-    ProfileSnapshotId, RetryPolicy, RunId, SyncMode, SyncOptions, SyncProfile,
-    ValidatedSyncOptions,
+    ProfileSnapshotId, ReconciliationFindingKind, ReconciliationReason, RetryPolicy, RunId,
+    SourceDrainStatus, SourceInventorySnapshot, SyncMode, SyncOptions, SyncProfile,
+    ValidatedSyncOptions, CompletionReconciliation, AnalysisOutcome, InventorySnapshotItem,
 };
 
 pub type ActionId = u64;
@@ -477,6 +478,7 @@ pub enum RunReportStatus {
     Failed,
     Cancelled,
     Interrupted,
+    Blocked,
     CompletedWithReviewRequired,
     RecoveryReview,
     ReviewCleared,
@@ -490,6 +492,7 @@ pub enum RunExecutionResult {
     Failed,
     Cancelled,
     Interrupted,
+    Blocked,
     RecoveryReview,
 }
 
@@ -508,6 +511,9 @@ pub struct RunReport {
     status: RunReportStatus,
     execution_result: RunExecutionResult,
     lifecycle: RunLifecycle,
+    blocked_reason: Option<String>,
+    reconciliation: Option<CompletionReconciliation>,
+    reconciliation_required: bool,
 }
 
 impl RunReport {
@@ -535,9 +541,22 @@ impl RunReport {
         self.lifecycle
     }
 
-    pub const fn can_mark_review_cleared(&self) -> bool {
+    pub fn blocked_reason(&self) -> Option<&str> {
+        self.blocked_reason.as_deref()
+    }
+
+    pub fn reconciliation(&self) -> Option<&CompletionReconciliation> {
+        self.reconciliation.as_ref()
+    }
+
+    pub fn can_mark_review_cleared(&self) -> bool {
         matches!(self.lifecycle, RunLifecycle::Open)
             && matches!(self.execution_result, RunExecutionResult::Succeeded)
+            && (!self.reconciliation_required
+                || self
+                    .reconciliation
+                    .as_ref()
+                    .is_some_and(|reconciliation| !reconciliation.requires_review()))
     }
 }
 
@@ -636,7 +655,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 5 {
+        if version > 6 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -764,6 +783,49 @@ impl RunEvidenceStore {
             )?;
             transaction.pragma_update(None, "user_version", 5)?;
             transaction.commit()?;
+            version = 5;
+        }
+        if version == 5 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                ALTER TABLE run_snapshots ADD COLUMN blocked_reason TEXT;
+                ALTER TABLE run_snapshots
+                    ADD COLUMN source_inventory_recorded INTEGER NOT NULL DEFAULT 0;
+                CREATE TABLE source_inventory_items (
+                    run_id INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    relative_path BLOB NOT NULL,
+                    item_type TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    modified_at_unix_nanos INTEGER,
+                    readonly INTEGER NOT NULL,
+                    symlink_target BLOB,
+                    content_fingerprint BLOB,
+                    PRIMARY KEY (run_id, ordinal),
+                    UNIQUE (run_id, relative_path),
+                    FOREIGN KEY (run_id) REFERENCES run_snapshots(run_id) ON DELETE CASCADE
+                );
+                CREATE TABLE reconciliation_runs (
+                    run_id INTEGER PRIMARY KEY,
+                    source_drain_status TEXT NOT NULL,
+                    FOREIGN KEY (run_id) REFERENCES run_snapshots(run_id) ON DELETE CASCADE
+                );
+                CREATE TABLE reconciliation_findings (
+                    run_id INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    relative_path BLOB NOT NULL,
+                    kind TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    action_reason TEXT,
+                    PRIMARY KEY (run_id, ordinal),
+                    FOREIGN KEY (run_id) REFERENCES run_snapshots(run_id) ON DELETE CASCADE
+                );
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 6)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -821,6 +883,227 @@ impl RunEvidenceStore {
             )?;
         }
         transaction.commit()?;
+        Ok(())
+    }
+
+    /// Persist the frozen Source Inventory before any filesystem mutation.
+    /// Inventory metadata and hashes are evidence, never file contents.
+    pub fn record_source_inventory(
+        &mut self,
+        run_id: RunId,
+        inventory: &SourceInventorySnapshot,
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.transaction()?;
+        for (ordinal, item) in inventory.items().iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO source_inventory_items (
+                    run_id, ordinal, relative_path, item_type, outcome, size,
+                    modified_at_unix_nanos, readonly, symlink_target, content_fingerprint
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    run_id.value(),
+                    ordinal as i64,
+                    path_to_blob(item.relative_path()),
+                    encode_item_type(item.item_type()),
+                    encode_analysis_outcome(item.outcome()),
+                    item.size() as i64,
+                    item.modified_at_unix_nanos(),
+                    bool_to_int(item.is_readonly()),
+                    item.symlink_target().map(path_to_blob),
+                    item.content_fingerprint().map(|hash| hash.to_vec()),
+                ],
+            )?;
+        }
+        let changed = transaction.execute(
+            "UPDATE run_snapshots SET source_inventory_recorded = 1 WHERE run_id = ?1",
+            params![run_id.value()],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::InvalidEvent(format!(
+                "run {} does not exist",
+                run_id.value()
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn load_source_inventory(
+        &self,
+        run_id: RunId,
+    ) -> Result<SourceInventorySnapshot, StorageError> {
+        let snapshot = self.load_snapshot(run_id)?;
+        let (peer_name, root) = match snapshot.profile().source() {
+            OneWaySource::PeerA => (
+                snapshot.profile().peer_a().name().to_owned(),
+                snapshot.profile().peer_a().root().to_path_buf(),
+            ),
+            OneWaySource::PeerB => (
+                snapshot.profile().peer_b().name().to_owned(),
+                snapshot.profile().peer_b().root().to_path_buf(),
+            ),
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT relative_path, item_type, outcome, size,
+                    modified_at_unix_nanos, readonly, symlink_target,
+                    content_fingerprint
+             FROM source_inventory_items WHERE run_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = statement
+            .query_map(params![run_id.value()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let items = rows
+            .into_iter()
+            .map(
+                |(
+                    relative_path,
+                    item_type,
+                    outcome,
+                    size,
+                    modified_at_unix_nanos,
+                    readonly,
+                    symlink_target,
+                    content_fingerprint,
+                )| {
+                    let size = u64::try_from(size).map_err(|_| {
+                        StorageError::CorruptEvidence(
+                            "source inventory contains a negative size".to_owned(),
+                        )
+                    })?;
+                    Ok(InventorySnapshotItem::from_parts(
+                        blob_to_path(&relative_path)?,
+                        decode_item_type(&item_type)?,
+                        decode_analysis_outcome(&outcome)?,
+                        size,
+                        modified_at_unix_nanos,
+                        readonly,
+                        symlink_target
+                            .as_deref()
+                            .map(blob_to_path)
+                            .transpose()?,
+                        decode_hash(content_fingerprint.as_deref())?,
+                    ))
+                },
+            )
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        Ok(SourceInventorySnapshot::from_parts(peer_name, root, items))
+    }
+
+    /// Persist the independent Completion Reconciliation result as durable
+    /// report evidence. Re-running reconciliation replaces only this final
+    /// derived record; the immutable inventory and action journal remain.
+    pub fn record_reconciliation(
+        &mut self,
+        run_id: RunId,
+        reconciliation: &CompletionReconciliation,
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO reconciliation_runs
+                (run_id, source_drain_status) VALUES (?1, ?2)",
+            params![
+                run_id.value(),
+                encode_source_drain_status(reconciliation.source_drain_status()),
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM reconciliation_findings WHERE run_id = ?1",
+            params![run_id.value()],
+        )?;
+        for (ordinal, finding) in reconciliation.findings().iter().enumerate() {
+            let (reason, action_reason) = encode_reconciliation_reason(finding.reason());
+            transaction.execute(
+                "INSERT INTO reconciliation_findings (
+                    run_id, ordinal, relative_path, kind, reason, action_reason
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    run_id.value(),
+                    ordinal as i64,
+                    path_to_blob(finding.relative_path()),
+                    encode_finding_kind(finding.kind()),
+                    reason,
+                    action_reason,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn load_reconciliation(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<CompletionReconciliation>, StorageError> {
+        let source_drain_status: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT source_drain_status FROM reconciliation_runs WHERE run_id = ?1",
+                params![run_id.value()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(source_drain_status) = source_drain_status else {
+            return Ok(None);
+        };
+        let mut statement = self.connection.prepare(
+            "SELECT relative_path, kind, reason, action_reason
+             FROM reconciliation_findings WHERE run_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = statement
+            .query_map(params![run_id.value()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let findings = rows
+            .into_iter()
+            .map(|(relative_path, kind, reason, action_reason)| {
+                let kind = decode_finding_kind(&kind)?;
+                let parsed_reason = decode_reconciliation_reason(&reason, action_reason.as_deref())?;
+                if parsed_reason.kind() != kind {
+                    return Err(StorageError::CorruptEvidence(
+                        "reconciliation finding kind and reason differ".to_owned(),
+                    ));
+                }
+                Ok(crate::ReconciliationFinding::from_parts(
+                    blob_to_path(&relative_path)?,
+                    parsed_reason,
+                ))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        Ok(Some(CompletionReconciliation::from_parts(
+            decode_source_drain_status(&source_drain_status)?,
+            findings,
+        )))
+    }
+
+    /// Record a fail-closed pre-mutation block in the run report.
+    pub fn mark_blocked(&mut self, run_id: RunId, reason: &str) -> Result<(), StorageError> {
+        let changed = self.connection.execute(
+            "UPDATE run_snapshots SET blocked_reason = ?1 WHERE run_id = ?2",
+            params![reason, run_id.value()],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::InvalidEvent(format!(
+                "run {} does not exist",
+                run_id.value()
+            )));
+        }
         Ok(())
     }
 
@@ -1153,14 +1436,37 @@ impl RunEvidenceStore {
             params![run_id.value()],
             |row| row.get(0),
         )?;
+        let blocked_reason: Option<String> = self.connection.query_row(
+            "SELECT blocked_reason FROM run_snapshots WHERE run_id = ?1",
+            params![run_id.value()],
+            |row| row.get(0),
+        )?;
+        let reconciliation = self.load_reconciliation(run_id)?;
+        let inventory_recorded: bool = self.connection.query_row(
+            "SELECT source_inventory_recorded FROM run_snapshots WHERE run_id = ?1",
+            params![run_id.value()],
+            |row| row.get(0),
+        )?;
         let items: Vec<_> = journal
             .into_iter()
             .map(|journal| RunReportItem { journal })
             .collect();
-        let status = report_status(&items, review_cleared);
-        let execution_result = execution_result(&items);
+        let status = report_status(
+            &items,
+            review_cleared,
+            blocked_reason.is_some(),
+            reconciliation.as_ref(),
+            inventory_recorded,
+        );
+        let execution_result = execution_result(&items, blocked_reason.is_some(), reconciliation.is_some());
         let lifecycle = if review_cleared {
             RunLifecycle::ReviewCleared
+        } else if blocked_reason.is_some()
+            || reconciliation
+                .as_ref()
+                .is_some_and(CompletionReconciliation::requires_review)
+        {
+            RunLifecycle::ReviewRequired
         } else if items.iter().any(|item| {
             matches!(
                 item.outcome(),
@@ -1183,6 +1489,9 @@ impl RunEvidenceStore {
             status,
             execution_result,
             lifecycle,
+            blocked_reason,
+            reconciliation,
+            reconciliation_required: inventory_recorded,
         })
     }
 
@@ -1192,7 +1501,8 @@ impl RunEvidenceStore {
         let report = self.load_report(run_id)?;
         if !report.can_mark_review_cleared() {
             return Err(StorageError::InvalidEvent(
-                "Review-Cleared requires every action to be successfully settled".to_owned(),
+                "Review-Cleared requires settled actions and a reconciliation with no findings"
+                    .to_owned(),
             ));
         }
         self.connection.execute(
@@ -2308,8 +2618,19 @@ fn is_settled_phase(phase: &str) -> bool {
     )
 }
 
-fn report_status(items: &[RunReportItem], review_cleared: bool) -> RunReportStatus {
-    if items.is_empty() || items.iter().any(|item| matches!(item.outcome(), ActionOutcome::InProgress)) {
+fn report_status(
+    items: &[RunReportItem],
+    review_cleared: bool,
+    blocked: bool,
+    reconciliation: Option<&CompletionReconciliation>,
+    inventory_recorded: bool,
+) -> RunReportStatus {
+    if blocked {
+        return RunReportStatus::Blocked;
+    }
+    if items.iter().any(|item| matches!(item.outcome(), ActionOutcome::InProgress))
+        || (items.is_empty() && inventory_recorded && reconciliation.is_none())
+    {
         return RunReportStatus::InProgress;
     }
     if items
@@ -2341,7 +2662,9 @@ fn report_status(items: &[RunReportItem], review_cleared: bool) -> RunReportStat
             item.outcome(),
             ActionOutcome::Deferred | ActionOutcome::Unresolved(_)
         )
-    }) {
+    }) || reconciliation.is_some_and(CompletionReconciliation::requires_review)
+        || (inventory_recorded && reconciliation.is_none())
+    {
         return RunReportStatus::CompletedWithReviewRequired;
     }
     if review_cleared {
@@ -2351,8 +2674,15 @@ fn report_status(items: &[RunReportItem], review_cleared: bool) -> RunReportStat
     }
 }
 
-fn execution_result(items: &[RunReportItem]) -> RunExecutionResult {
-    if items.is_empty() {
+fn execution_result(
+    items: &[RunReportItem],
+    blocked: bool,
+    reconciliation_recorded: bool,
+) -> RunExecutionResult {
+    if blocked {
+        return RunExecutionResult::Blocked;
+    }
+    if items.is_empty() && !reconciliation_recorded {
         return RunExecutionResult::NotStarted;
     }
     if items
@@ -2534,6 +2864,107 @@ fn decode_item_type(item_type: &str) -> Result<ItemType, StorageError> {
         "symlink" => Ok(ItemType::Symlink),
         "unsupported" => Ok(ItemType::Unsupported),
         value => Err(StorageError::CorruptEvidence(format!("unknown item type {value}"))),
+    }
+}
+
+fn encode_analysis_outcome(outcome: AnalysisOutcome) -> &'static str {
+    match outcome {
+        AnalysisOutcome::Included => "included",
+        AnalysisOutcome::Excluded => "excluded",
+        AnalysisOutcome::Unsupported => "unsupported",
+    }
+}
+
+fn decode_analysis_outcome(outcome: &str) -> Result<AnalysisOutcome, StorageError> {
+    match outcome {
+        "included" => Ok(AnalysisOutcome::Included),
+        "excluded" => Ok(AnalysisOutcome::Excluded),
+        "unsupported" => Ok(AnalysisOutcome::Unsupported),
+        value => Err(StorageError::CorruptEvidence(format!(
+            "unknown analysis outcome {value}"
+        ))),
+    }
+}
+
+fn encode_source_drain_status(status: SourceDrainStatus) -> &'static str {
+    match status {
+        SourceDrainStatus::NotApplicable => "not_applicable",
+        SourceDrainStatus::Drained => "drained",
+        SourceDrainStatus::NotEmpty => "not_empty",
+    }
+}
+
+fn decode_source_drain_status(status: &str) -> Result<SourceDrainStatus, StorageError> {
+    match status {
+        "not_applicable" => Ok(SourceDrainStatus::NotApplicable),
+        "drained" => Ok(SourceDrainStatus::Drained),
+        "not_empty" => Ok(SourceDrainStatus::NotEmpty),
+        value => Err(StorageError::CorruptEvidence(format!(
+            "unknown Source Drain status {value}"
+        ))),
+    }
+}
+
+fn encode_finding_kind(kind: ReconciliationFindingKind) -> &'static str {
+    match kind {
+        ReconciliationFindingKind::Unexplained => "unexplained",
+        ReconciliationFindingKind::Excluded => "excluded",
+        ReconciliationFindingKind::NewlyAppeared => "newly_appeared",
+        ReconciliationFindingKind::Changed => "changed",
+        ReconciliationFindingKind::Failed => "failed",
+        ReconciliationFindingKind::Unavailable => "unavailable",
+        ReconciliationFindingKind::Unverifiable => "unverifiable",
+    }
+}
+
+fn decode_finding_kind(kind: &str) -> Result<ReconciliationFindingKind, StorageError> {
+    match kind {
+        "unexplained" => Ok(ReconciliationFindingKind::Unexplained),
+        "excluded" => Ok(ReconciliationFindingKind::Excluded),
+        "newly_appeared" => Ok(ReconciliationFindingKind::NewlyAppeared),
+        "changed" => Ok(ReconciliationFindingKind::Changed),
+        "failed" => Ok(ReconciliationFindingKind::Failed),
+        "unavailable" => Ok(ReconciliationFindingKind::Unavailable),
+        "unverifiable" => Ok(ReconciliationFindingKind::Unverifiable),
+        value => Err(StorageError::CorruptEvidence(format!(
+            "unknown reconciliation finding kind {value}"
+        ))),
+    }
+}
+
+fn encode_reconciliation_reason(reason: &ReconciliationReason) -> (&'static str, Option<&'static str>) {
+    match reason {
+        ReconciliationReason::Unexplained => ("unexplained", None),
+        ReconciliationReason::Excluded => ("excluded", None),
+        ReconciliationReason::NewlyAppeared => ("newly_appeared", None),
+        ReconciliationReason::Changed => ("changed", None),
+        ReconciliationReason::Failed(action_reason) => ("failed", Some(encode_reason(*action_reason))),
+        ReconciliationReason::Unavailable => ("unavailable", None),
+        ReconciliationReason::Unverifiable => ("unverifiable", None),
+    }
+}
+
+fn decode_reconciliation_reason(
+    reason: &str,
+    action_reason: Option<&str>,
+) -> Result<ReconciliationReason, StorageError> {
+    match reason {
+        "unexplained" => Ok(ReconciliationReason::Unexplained),
+        "excluded" => Ok(ReconciliationReason::Excluded),
+        "newly_appeared" => Ok(ReconciliationReason::NewlyAppeared),
+        "changed" => Ok(ReconciliationReason::Changed),
+        "failed" => Ok(ReconciliationReason::Failed(decode_reason(
+            action_reason.ok_or_else(|| {
+                StorageError::CorruptEvidence(
+                    "failed reconciliation finding has no action reason".to_owned(),
+                )
+            })?,
+        )?)),
+        "unavailable" => Ok(ReconciliationReason::Unavailable),
+        "unverifiable" => Ok(ReconciliationReason::Unverifiable),
+        value => Err(StorageError::CorruptEvidence(format!(
+            "unknown reconciliation reason {value}"
+        ))),
     }
 }
 
