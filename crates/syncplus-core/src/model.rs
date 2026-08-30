@@ -1,6 +1,6 @@
 use std::{fmt, path::Path, path::PathBuf};
 
-use crate::ValidatedSyncOptions;
+use crate::{ProcessSpecError, ProcessSpecification, ValidatedSyncOptions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunId(u64);
@@ -193,26 +193,23 @@ impl SyncProfile {
 pub struct ProfileSnapshot {
     id: ProfileSnapshotId,
     profile: SyncProfile,
-    validated_options: Option<ValidatedSyncOptions>,
+    validated_options: ValidatedSyncOptions,
     authorizations: AuthorizationSnapshot,
 }
 
 impl ProfileSnapshot {
-    fn new(id: ProfileSnapshotId, profile: &SyncProfile) -> Self {
-        Self::new_with_authorizations(id, profile, AuthorizationSnapshot::default())
-    }
-
     fn new_with_authorizations(
         id: ProfileSnapshotId,
         profile: &SyncProfile,
         authorizations: AuthorizationSnapshot,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ProcessSpecError> {
+        let validated_options = ProcessSpecification::from_profile(profile)?.options();
+        Ok(Self {
             id,
             profile: profile.clone(),
-            validated_options: profile.options().validate().ok(),
+            validated_options,
             authorizations,
-        }
+        })
     }
 
     pub const fn id(&self) -> ProfileSnapshotId {
@@ -223,7 +220,7 @@ impl ProfileSnapshot {
         &self.profile
     }
 
-    pub const fn validated_options(&self) -> Option<ValidatedSyncOptions> {
+    pub const fn validated_options(&self) -> ValidatedSyncOptions {
         self.validated_options
     }
 
@@ -321,28 +318,24 @@ pub struct SyncRun {
 }
 
 impl SyncRun {
-    pub fn new(id: RunId, profile: &SyncProfile) -> Self {
-        Self {
-            id,
-            snapshot: ProfileSnapshot::new(ProfileSnapshotId::new(id.value()), profile),
-            state: RunState::Active(ActiveRunState::IdleEdit),
-        }
+    pub fn new(id: RunId, profile: &SyncProfile) -> Result<Self, ProcessSpecError> {
+        Self::new_with_authorizations(id, profile, AuthorizationSnapshot::default())
     }
 
     pub fn new_with_authorizations(
         id: RunId,
         profile: &SyncProfile,
         authorizations: AuthorizationSnapshot,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ProcessSpecError> {
+        Ok(Self {
             id,
             snapshot: ProfileSnapshot::new_with_authorizations(
                 ProfileSnapshotId::new(id.value()),
                 profile,
                 authorizations,
-            ),
+            )?,
             state: RunState::Active(ActiveRunState::IdleEdit),
-        }
+        })
     }
 
     pub const fn id(&self) -> RunId {

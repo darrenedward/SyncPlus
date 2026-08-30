@@ -94,8 +94,9 @@ fn active_sync_run_owns_validated_options_and_authorizations_from_start() {
         RunId::new(5),
         &profile,
         AuthorizationSnapshot::new(true, false),
-    );
-    assert_eq!(run.snapshot().validated_options().unwrap().safe_delete(), true);
+    )
+    .expect("valid profile");
+    assert_eq!(run.snapshot().validated_options().safe_delete(), true);
     assert_eq!(
         run.snapshot().authorizations().allow_unattended_destructive(),
         true
@@ -295,7 +296,19 @@ fn recovery_review_can_only_be_cleared_after_explicit_reinspection_resolution() 
             RunId::new(7),
             JournalEvent::RecoveryResolved {
                 action_id: 1,
-                resolution: RecoveryResolution::Completed,
+                resolution: RecoveryResolution::Completed {
+                    evidence: RecoveryEvidence::new(
+                        100,
+                        Some(PathBuf::from("/recovery/file-1.txt")),
+                        true,
+                        true,
+                        false,
+                        Some(42),
+                        Some(42),
+                        None,
+                        None,
+                    ),
+                },
             },
         )
         .expect("persist reviewed resolution");
@@ -311,6 +324,69 @@ fn recovery_review_can_only_be_cleared_after_explicit_reinspection_resolution() 
     assert_eq!(cleared.status(), RunReportStatus::ReviewCleared);
     assert_eq!(cleared.lifecycle(), RunLifecycle::ReviewCleared);
     assert!(!cleared.can_mark_review_cleared());
+}
+
+#[test]
+fn action_settlement_requires_start_and_preserves_plan_order() {
+    let path = TestDatabase::new();
+    let run = snapshot(9);
+    let mut store = RunEvidenceStore::open(path.path()).expect("open evidence store");
+    store.begin_run(&run).expect("persist snapshot");
+    store
+        .append_event(RunId::new(9), JournalEvent::Planned { action: action(1) })
+        .expect("persist first plan");
+    let error = store
+        .append_event(RunId::new(9), JournalEvent::Completed { action_id: 1 })
+        .expect_err("an action cannot settle before it starts");
+    assert!(matches!(error, crate::StorageError::InvalidEvent(_)));
+
+    store
+        .append_event(RunId::new(9), JournalEvent::Started { action_id: 1 })
+        .expect("persist first start");
+    store
+        .append_event(RunId::new(9), JournalEvent::Planned { action: action(2) })
+        .expect("persist second plan");
+    let error = store
+        .append_event(RunId::new(9), JournalEvent::Completed { action_id: 2 })
+        .expect_err("a later action cannot settle before the first action");
+    assert!(matches!(error, crate::StorageError::InvalidEvent(_)));
+}
+
+#[test]
+fn recovery_completion_requires_newer_reinspection_evidence() {
+    let path = TestDatabase::new();
+    let run = snapshot(10);
+    let mut store = RunEvidenceStore::open(path.path()).expect("open evidence store");
+    store.begin_run(&run).expect("persist snapshot");
+    store
+        .append_event(RunId::new(10), JournalEvent::Planned { action: action(1) })
+        .expect("persist plan");
+    store
+        .append_event(RunId::new(10), JournalEvent::Started { action_id: 1 })
+        .expect("persist start");
+    store
+        .append_event(
+            RunId::new(10),
+            JournalEvent::RecoveryReview {
+                action_id: 1,
+                reason: ActionReason::InterruptedBoundary,
+                evidence: recovery_evidence(),
+            },
+        )
+        .expect("persist review");
+
+    let stale = store
+        .append_event(
+            RunId::new(10),
+            JournalEvent::RecoveryResolved {
+                action_id: 1,
+                resolution: RecoveryResolution::Completed {
+                    evidence: recovery_evidence(),
+                },
+            },
+        )
+        .expect_err("stale evidence cannot clear uncertainty");
+    assert!(matches!(stale, crate::StorageError::InvalidEvent(_)));
 }
 
 #[test]

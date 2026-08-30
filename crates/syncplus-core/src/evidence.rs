@@ -214,6 +214,10 @@ impl RecoveryEvidence {
     pub fn destination_sha256(&self) -> Option<&[u8; 32]> {
         self.destination_sha256.as_ref()
     }
+
+    fn is_newer_than(&self, earlier: &Self) -> bool {
+        self.observed_at_unix_nanos > earlier.observed_at_unix_nanos
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,9 +287,9 @@ pub enum ActionReason {
     DestinationUnavailable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecoveryResolution {
-    Completed,
+    Completed { evidence: RecoveryEvidence },
     Unresolved(ActionReason),
 }
 
@@ -337,6 +341,7 @@ pub struct ActionJournalEntry {
     progress_bytes: Vec<u64>,
     outcome: ActionOutcome,
     recovery_evidence: Option<RecoveryEvidence>,
+    recovery_resolution_evidence: Option<RecoveryEvidence>,
 }
 
 impl ActionJournalEntry {
@@ -358,6 +363,10 @@ impl ActionJournalEntry {
 
     pub fn recovery_evidence(&self) -> Option<&RecoveryEvidence> {
         self.recovery_evidence.as_ref()
+    }
+
+    pub fn recovery_resolution_evidence(&self) -> Option<&RecoveryEvidence> {
+        self.recovery_resolution_evidence.as_ref()
     }
 }
 
@@ -542,7 +551,7 @@ impl RunEvidenceStore {
     /// Open an explicitly supplied database path. Production callers should
     /// use `open_canonical`; this path form exists for controlled test and
     /// migration locations and never derives a path from a selected peer.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+    pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::from_connection(Connection::open(path)?)
     }
 
@@ -550,7 +559,7 @@ impl RunEvidenceStore {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, StorageError> {
+    fn from_connection(mut connection: Connection) -> Result<Self, StorageError> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -560,9 +569,10 @@ impl RunEvidenceStore {
             )));
         }
         if version == 0 {
-            connection.execute_batch(
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
             "
-            CREATE TABLE IF NOT EXISTS run_snapshots (
+            CREATE TABLE run_snapshots (
                 run_id INTEGER PRIMARY KEY,
                 snapshot_id INTEGER NOT NULL,
                 profile_name TEXT NOT NULL,
@@ -578,14 +588,14 @@ impl RunEvidenceStore {
                 allow_unattended_destructive INTEGER NOT NULL,
                 allow_unattended_permanent_removal INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS snapshot_exclusions (
+            CREATE TABLE snapshot_exclusions (
                 run_id INTEGER NOT NULL,
                 ordinal INTEGER NOT NULL,
                 pattern TEXT NOT NULL,
                 PRIMARY KEY (run_id, ordinal),
                 FOREIGN KEY (run_id) REFERENCES run_snapshots(run_id) ON DELETE CASCADE
             );
-            CREATE TABLE IF NOT EXISTS action_events (
+            CREATE TABLE action_events (
                 run_id INTEGER NOT NULL,
                 action_id INTEGER NOT NULL,
                 sequence INTEGER NOT NULL,
@@ -605,15 +615,17 @@ impl RunEvidenceStore {
                 PRIMARY KEY (run_id, action_id, sequence),
                 FOREIGN KEY (run_id) REFERENCES run_snapshots(run_id) ON DELETE CASCADE
             );
-            CREATE INDEX IF NOT EXISTS action_events_by_run
+            CREATE INDEX action_events_by_run
                 ON action_events (run_id, action_id, sequence);
             ",
             )?;
-            connection.pragma_update(None, "user_version", 1)?;
+            transaction.pragma_update(None, "user_version", 1)?;
+            transaction.commit()?;
             version = 1;
         }
         if version == 1 {
-            connection.execute_batch(
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
                 "
                 ALTER TABLE run_snapshots
                     ADD COLUMN review_cleared INTEGER NOT NULL DEFAULT 0;
@@ -629,8 +641,10 @@ impl RunEvidenceStore {
                 ALTER TABLE action_events ADD COLUMN resolution TEXT;
                 ",
             )?;
-            connection.pragma_update(None, "user_version", 2)?;
+            transaction.pragma_update(None, "user_version", 2)?;
+            transaction.commit()?;
         }
+        verify_integrity(&connection)?;
         Ok(Self { connection })
     }
 
@@ -799,6 +813,8 @@ impl RunEvidenceStore {
             )
             .optional()?;
         validate_event(&event, has_plan, current_phase.as_deref())?;
+        validate_action_order(&transaction, run_id, action_id, &event)?;
+        validate_recovery_resolution(&transaction, run_id, action_id, &event)?;
         let sequence = transaction
             .query_row(
                 "SELECT COALESCE(MAX(sequence), -1) + 1 FROM action_events
@@ -955,6 +971,16 @@ impl RunEvidenceStore {
     }
 }
 
+fn verify_integrity(connection: &Connection) -> Result<(), StorageError> {
+    let result: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if result != "ok" {
+        return Err(StorageError::CorruptEvidence(format!(
+            "SQLite integrity check failed: {result}"
+        )));
+    }
+    Ok(())
+}
+
 struct EventFields {
     phase: &'static str,
     relative_path: Option<Vec<u8>>,
@@ -1070,31 +1096,35 @@ impl EventFields {
                     unreachable!()
                 };
                 let mut fields = terminal_fields("recovery_review", *reason);
-                fields.recovery_observed_at_unix_nanos = Some(evidence.observed_at_unix_nanos);
-                fields.recovery_target = evidence
-                    .recovery_target
-                    .as_ref()
-                    .map(|path| path_to_blob(path));
-                fields.recovery_source_present = Some(bool_to_int(evidence.source_present));
-                fields.recovery_destination_present =
-                    Some(bool_to_int(evidence.destination_present));
-                fields.recovery_present = Some(bool_to_int(evidence.recovery_present));
-                fields.recovery_source_size = evidence.source_size.map(|size| size as i64);
-                fields.recovery_destination_size =
-                    evidence.destination_size.map(|size| size as i64);
-                fields.recovery_source_sha256 = evidence.source_sha256.map(|hash| hash.to_vec());
-                fields.recovery_destination_sha256 =
-                    evidence.destination_sha256.map(|hash| hash.to_vec());
+                set_recovery_fields(&mut fields, evidence);
                 fields
             }
             JournalEvent::RecoveryResolved { resolution, .. } => {
                 let mut fields = empty();
                 fields.phase = "recovery_resolved";
-                fields.resolution = Some(encode_resolution(*resolution));
+                fields.resolution = Some(encode_resolution(resolution));
+                if let RecoveryResolution::Completed { evidence } = resolution {
+                    set_recovery_fields(&mut fields, evidence);
+                }
                 fields
             }
         }
     }
+}
+
+fn set_recovery_fields(fields: &mut EventFields, evidence: &RecoveryEvidence) {
+    fields.recovery_observed_at_unix_nanos = Some(evidence.observed_at_unix_nanos);
+    fields.recovery_target = evidence
+        .recovery_target
+        .as_ref()
+        .map(|path| path_to_blob(path));
+    fields.recovery_source_present = Some(bool_to_int(evidence.source_present));
+    fields.recovery_destination_present = Some(bool_to_int(evidence.destination_present));
+    fields.recovery_present = Some(bool_to_int(evidence.recovery_present));
+    fields.recovery_source_size = evidence.source_size.map(|size| size as i64);
+    fields.recovery_destination_size = evidence.destination_size.map(|size| size as i64);
+    fields.recovery_source_sha256 = evidence.source_sha256.map(|hash| hash.to_vec());
+    fields.recovery_destination_sha256 = evidence.destination_sha256.map(|hash| hash.to_vec());
 }
 
 fn terminal_fields(phase: &'static str, reason: ActionReason) -> EventFields {
@@ -1220,6 +1250,7 @@ fn apply_stored_event(
                 progress_bytes: Vec::new(),
                 outcome: ActionOutcome::InProgress,
                 recovery_evidence: None,
+                recovery_resolution_evidence: None,
             },
         );
         return Ok(());
@@ -1260,10 +1291,24 @@ fn apply_stored_event(
                 })?,
             )?);
         }
-        "recovery_resolved" => match decode_resolution(row.resolution.as_deref().ok_or_else(|| {
-            StorageError::CorruptEvidence("recovery resolution has no outcome".to_owned())
-        })?)? {
-            RecoveryResolution::Completed => entry.outcome = ActionOutcome::Completed,
+        "recovery_resolved" => match decode_resolution(
+            row.resolution.as_deref().ok_or_else(|| {
+                StorageError::CorruptEvidence("recovery resolution has no outcome".to_owned())
+            })?,
+            &row,
+        )? {
+            RecoveryResolution::Completed { evidence } => {
+                if let Some(review) = entry.recovery_evidence.as_ref() {
+                    if !evidence.is_newer_than(review) {
+                        return Err(StorageError::CorruptEvidence(
+                            "recovery resolution evidence is not newer than its review"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                entry.recovery_resolution_evidence = Some(evidence);
+                entry.outcome = ActionOutcome::Completed;
+            }
             RecoveryResolution::Unresolved(reason) => {
                 entry.outcome = ActionOutcome::Unresolved(reason)
             }
@@ -1357,10 +1402,7 @@ fn validate_event(
             "an action must be planned before its next boundary".to_owned(),
         ));
     }
-    if matches!(
-        current_phase,
-        Some("completed" | "failed" | "cancelled" | "deferred" | "unresolved")
-    ) {
+    if matches!(current_phase, Some("completed" | "failed" | "cancelled" | "deferred" | "unresolved")) {
         return Err(StorageError::InvalidEvent(
             "a settled action cannot receive another boundary".to_owned(),
         ));
@@ -1370,11 +1412,104 @@ fn validate_event(
         "progress" if matches!(current_phase, Some("started" | "progress")) => Ok(()),
         "recovery_resolved" if current_phase == Some("recovery_review") => Ok(()),
         "completed" | "failed" | "cancelled" | "deferred" | "unresolved" | "recovery_review"
-            if matches!(current_phase, Some("planned" | "started" | "progress")) => Ok(()),
+            if matches!(current_phase, Some("started" | "progress")) => Ok(()),
         _ => Err(StorageError::InvalidEvent(format!(
             "{phase} cannot follow {current_phase:?}"
         ))),
     }
+}
+
+fn validate_action_order(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: RunId,
+    action_id: ActionId,
+    event: &JournalEvent,
+) -> Result<(), StorageError> {
+    if !event_settles_action(event) {
+        return Ok(());
+    }
+
+    let mut statement = transaction.prepare(
+        "SELECT action_id,
+                (SELECT phase FROM action_events earlier
+                 WHERE earlier.run_id = events.run_id
+                   AND earlier.action_id = events.action_id
+                 ORDER BY earlier.sequence DESC LIMIT 1)
+         FROM action_events events
+         WHERE events.run_id = ?1 AND events.action_id < ?2
+         GROUP BY events.action_id",
+    )?;
+    let prior_actions = statement
+        .query_map(params![run_id.value(), action_id], |row| {
+            Ok((row.get::<_, ActionId>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some((prior_action_id, phase)) = prior_actions
+        .into_iter()
+        .find(|(_, phase)| !is_settled_phase(phase))
+    {
+        return Err(StorageError::InvalidEvent(format!(
+            "action {action_id} cannot settle before prior action {prior_action_id} ({phase})"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recovery_resolution(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: RunId,
+    action_id: ActionId,
+    event: &JournalEvent,
+) -> Result<(), StorageError> {
+    let JournalEvent::RecoveryResolved {
+        resolution: RecoveryResolution::Completed { evidence },
+        ..
+    } = event
+    else {
+        return Ok(());
+    };
+
+    let review_observed_at: Option<i64> = transaction
+        .query_row(
+            "SELECT recovery_observed_at_unix_nanos
+             FROM action_events
+             WHERE run_id = ?1 AND action_id = ?2 AND phase = 'recovery_review'
+             ORDER BY sequence DESC LIMIT 1",
+            params![run_id.value(), action_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(review_observed_at) = review_observed_at else {
+        return Err(StorageError::InvalidEvent(
+            "completed recovery resolution requires a persisted Recovery Review".to_owned(),
+        ));
+    };
+    if evidence.observed_at_unix_nanos <= review_observed_at {
+        return Err(StorageError::InvalidEvent(
+            "completed recovery resolution requires newer filesystem inspection evidence"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn event_settles_action(event: &JournalEvent) -> bool {
+    matches!(
+        event,
+        JournalEvent::Completed { .. }
+            | JournalEvent::Failed { .. }
+            | JournalEvent::Cancelled { .. }
+            | JournalEvent::Deferred { .. }
+            | JournalEvent::Unresolved { .. }
+            | JournalEvent::RecoveryResolved { .. }
+    )
+}
+
+fn is_settled_phase(phase: &str) -> bool {
+    matches!(
+        phase,
+        "completed" | "failed" | "cancelled" | "deferred" | "unresolved" | "recovery_resolved"
+    )
 }
 
 fn report_status(items: &[RunReportItem], review_cleared: bool) -> RunReportStatus {
@@ -1565,9 +1700,9 @@ fn encode_reason(reason: ActionReason) -> &'static str {
     }
 }
 
-fn encode_resolution(resolution: RecoveryResolution) -> &'static str {
+fn encode_resolution(resolution: &RecoveryResolution) -> &'static str {
     match resolution {
-        RecoveryResolution::Completed => "completed",
+        RecoveryResolution::Completed { .. } => "completed",
         RecoveryResolution::Unresolved(ActionReason::TransferFailed) => "unresolved:transfer_failed",
         RecoveryResolution::Unresolved(ActionReason::VerificationMismatch) => {
             "unresolved:verification_mismatch"
@@ -1594,9 +1729,14 @@ fn encode_resolution(resolution: RecoveryResolution) -> &'static str {
     }
 }
 
-fn decode_resolution(resolution: &str) -> Result<RecoveryResolution, StorageError> {
+fn decode_resolution(
+    resolution: &str,
+    row: &StoredEvent,
+) -> Result<RecoveryResolution, StorageError> {
     if resolution == "completed" {
-        return Ok(RecoveryResolution::Completed);
+        return Ok(RecoveryResolution::Completed {
+            evidence: decode_recovery_evidence(row)?,
+        });
     }
     let reason = resolution.strip_prefix("unresolved:").ok_or_else(|| {
         StorageError::CorruptEvidence(format!("unknown recovery resolution {resolution}"))
