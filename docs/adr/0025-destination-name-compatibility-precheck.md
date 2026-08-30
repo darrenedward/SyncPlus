@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Detect destination naming incompatibilities before changes

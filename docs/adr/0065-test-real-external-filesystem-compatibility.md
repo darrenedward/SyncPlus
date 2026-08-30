@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Test real external-filesystem compatibility before release

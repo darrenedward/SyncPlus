@@ -88,6 +88,19 @@ pub trait PrecheckProbe {
 
     fn available_space(&self, path: &Path) -> Result<u64, PrecheckError>;
 
+    /// Whether a peer root is available for this run. A destination may be
+    /// absent when its parent is available and writable, because the transfer
+    /// workflow can create it without changing the source.
+    fn peer_available(&self, _path: &Path, _destination: bool) -> Result<bool, PrecheckError> {
+        Ok(true)
+    }
+
+    /// Detect both lexical scope overlap and aliases known to the local
+    /// filesystem. Implementations must not mutate either peer.
+    fn scopes_overlap(&self, source: &Path, destination: &Path) -> Result<bool, PrecheckError> {
+        Ok(PeerScope::new(source).overlaps(&PeerScope::new(destination)))
+    }
+
     fn required_space(
         &self,
         source: &Path,
@@ -125,6 +138,7 @@ pub trait PrecheckProbe {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrecheckBlockerKind {
+    PeerUnavailable,
     SourceUnreadable,
     DestinationNotWritable,
     RequiredPermission,
@@ -140,6 +154,7 @@ pub struct PrecheckBlocker {
     kind: PrecheckBlockerKind,
     path: PathBuf,
     requirement: String,
+    reason: String,
     remediation: String,
 }
 
@@ -150,10 +165,28 @@ impl PrecheckBlocker {
         requirement: impl Into<String>,
         remediation: impl Into<String>,
     ) -> Self {
+        let requirement = requirement.into();
+        Self {
+            kind,
+            path: path.into(),
+            reason: requirement.clone(),
+            requirement,
+            remediation: remediation.into(),
+        }
+    }
+
+    fn with_reason(
+        kind: PrecheckBlockerKind,
+        path: impl Into<PathBuf>,
+        requirement: impl Into<String>,
+        reason: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
         Self {
             kind,
             path: path.into(),
             requirement: requirement.into(),
+            reason: reason.into(),
             remediation: remediation.into(),
         }
     }
@@ -168,6 +201,10 @@ impl PrecheckBlocker {
 
     pub fn requirement(&self) -> &str {
         &self.requirement
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
     }
 
     pub fn remediation(&self) -> &str {
@@ -186,6 +223,7 @@ pub struct PrecheckBlocked {
 pub struct PermissionIssue {
     path: PathBuf,
     requirement: String,
+    reason: String,
     remediation: String,
 }
 
@@ -195,9 +233,25 @@ impl PermissionIssue {
         requirement: impl Into<String>,
         remediation: impl Into<String>,
     ) -> Self {
+        let requirement = requirement.into();
+        Self {
+            path: path.into(),
+            reason: requirement.clone(),
+            requirement,
+            remediation: remediation.into(),
+        }
+    }
+
+    pub fn with_reason(
+        path: impl Into<PathBuf>,
+        requirement: impl Into<String>,
+        reason: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
         Self {
             path: path.into(),
             requirement: requirement.into(),
+            reason: reason.into(),
             remediation: remediation.into(),
         }
     }
@@ -208,6 +262,10 @@ impl PermissionIssue {
 
     pub fn requirement(&self) -> &str {
         &self.requirement
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
     }
 
     pub fn remediation(&self) -> &str {
@@ -273,6 +331,10 @@ impl PathRiskWarning {
     pub fn explanation(&self) -> &str {
         &self.explanation
     }
+
+    pub const fn requires_stronger_confirmation(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +344,8 @@ pub enum NamingRule {
     ReservedName,
     InvalidCharacter,
     ComponentTooLong,
+    PathTooLong,
+    TrailingDotOrSpace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +434,17 @@ impl PrecheckResult {
         &self.warnings
     }
 
+    pub fn requires_stronger_confirmation(&self) -> bool {
+        self.warnings
+            .iter()
+            .any(PathRiskWarning::requires_stronger_confirmation)
+    }
+
+    pub fn is_confirmation_sufficient(&self, stronger_confirmation: bool) -> bool {
+        self.can_execute()
+            && (!self.requires_stronger_confirmation() || stronger_confirmation)
+    }
+
     pub fn can_execute(&self) -> bool {
         self.blockers.is_empty()
     }
@@ -431,10 +506,11 @@ impl std::fmt::Display for PrecheckFailure {
                     }
                     write!(
                         formatter,
-                        "{:?} at {:?}: {} ({})",
+                        "{:?} at {:?}: {} — {} ({})",
                         blocker.kind,
                         blocker.path,
                         blocker.requirement,
+                        blocker.reason,
                         blocker.remediation
                     )?;
                 }
@@ -593,9 +669,41 @@ impl RunPrecheck {
             return Ok(result);
         }
 
+        let source_available = probe
+            .peer_available(source, false)
+            .map_err(PrecheckErrorKind::Probe)?;
+        if !source_available {
+            result.blockers.push(PrecheckBlocker::with_reason(
+                PrecheckBlockerKind::PeerUnavailable,
+                source,
+                "the source peer must be available and be a directory",
+                "the selected source path is missing, unavailable, or not a directory",
+                "connect or mount the source peer and select an available directory, then run the precheck again",
+            ));
+        }
+
+        let destination_available = probe
+            .peer_available(destination, true)
+            .map_err(PrecheckErrorKind::Probe)?;
+        if !destination_available {
+            result.blockers.push(PrecheckBlocker::with_reason(
+                PrecheckBlockerKind::PeerUnavailable,
+                destination,
+                "the destination peer must be available or have an available parent directory",
+                "the destination path and its parent are unavailable",
+                "connect or mount the destination peer and choose an available directory, then run the precheck again",
+            ));
+        }
+        if !source_available || !destination_available {
+            return Ok(result);
+        }
+
         let source_scope = PeerScope::new(source);
         let destination_scope = PeerScope::new(destination);
-        if source_scope.overlaps(&destination_scope) {
+        if probe
+            .scopes_overlap(source, destination)
+            .map_err(PrecheckErrorKind::Probe)?
+        {
             result.blockers.push(PrecheckBlocker::new(
                 PrecheckBlockerKind::PeerScopeOverlap,
                 source,
@@ -613,10 +721,11 @@ impl RunPrecheck {
             .source_access(source)
             .map_err(PrecheckErrorKind::Probe)?;
         if !source_access.readable() {
-            result.blockers.push(PrecheckBlocker::new(
+            result.blockers.push(PrecheckBlocker::with_reason(
                 PrecheckBlockerKind::SourceUnreadable,
                 source,
                 "the selected source must be readable",
+                "the source root could not be read with the current user's effective access",
                 "grant the current user read and directory-traverse access, then run the precheck again",
             ));
         }
@@ -625,28 +734,31 @@ impl RunPrecheck {
             .destination_access(destination)
             .map_err(PrecheckErrorKind::Probe)?;
         if !destination_access.writable() {
-            result.blockers.push(PrecheckBlocker::new(
+            result.blockers.push(PrecheckBlocker::with_reason(
                 PrecheckBlockerKind::DestinationNotWritable,
                 destination,
                 "the selected destination must be writable",
+                "the destination root or its creation parent is not writable with the current user's effective access",
                 "grant the current user write and directory-traverse access, then run the precheck again",
             ));
         }
 
         let options = specification.options();
         if options.safe_delete() && !source_access.removable() {
-            result.blockers.push(PrecheckBlocker::new(
+            result.blockers.push(PrecheckBlocker::with_reason(
                 PrecheckBlockerKind::RequiredPermission,
                 source,
                 "Safe Delete requires permission to remove verified source items",
+                "the current user cannot remove an item from the source scope",
                 "grant removal access on the source's containing directory or choose a different approved source",
             ));
         }
         if options.destination_cleanup() && !destination_access.removable() {
-            result.blockers.push(PrecheckBlocker::new(
+            result.blockers.push(PrecheckBlocker::with_reason(
                 PrecheckBlockerKind::RequiredPermission,
                 destination,
                 "Destination Cleanup requires permission to remove destination items",
+                "the current user cannot remove an item from the destination scope",
                 "grant removal access on the destination's containing directory or disable Destination Cleanup",
             ));
         }
@@ -658,10 +770,11 @@ impl RunPrecheck {
             .available_space(destination)
             .map_err(PrecheckErrorKind::Probe)?;
         if available < required {
-            result.blockers.push(PrecheckBlocker::new(
+            result.blockers.push(PrecheckBlocker::with_reason(
                 PrecheckBlockerKind::InsufficientSpace,
                 destination,
                 format!("the destination needs at least {required} bytes of available space"),
+                format!("the destination has only {available} bytes available"),
                 format!("free space on the destination and retry; the precheck found only {available} bytes available"),
             ));
         }
@@ -669,34 +782,44 @@ impl RunPrecheck {
         let permission_issues = probe
             .item_permission_issues(source, destination, profile.exclusions(), options)
             .map_err(PrecheckErrorKind::Probe)?;
-        for issue in permission_issues {
-            result.blockers.push(PrecheckBlocker::new(
+        for issue in &permission_issues {
+            result.blockers.push(PrecheckBlocker::with_reason(
                 PrecheckBlockerKind::RequiredPermission,
                 issue.path(),
                 issue.requirement(),
+                issue.reason(),
                 issue.remediation(),
             ));
         }
 
-        let naming_conflicts = probe
-            .naming_conflicts(source, destination, profile.exclusions())
-            .map_err(PrecheckErrorKind::Probe)?;
-        for conflict in naming_conflicts {
-            let related = conflict
-                .related_path()
-                .map(|path| format!("; it conflicts with {path:?}"))
-                .unwrap_or_default();
-            result.blockers.push(PrecheckBlocker::new(
-                PrecheckBlockerKind::DestinationNamingConflict,
-                conflict.source_path(),
-                format!(
-                    "destination naming rule {:?} cannot represent {:?} safely{}",
-                    conflict.rule(),
-                    conflict.destination_path(),
-                    related
-                ),
-                "rename or exclude the conflicting item, or choose a destination with compatible naming rules",
-            ));
+        if source_access.readable()
+            && destination_access.readable()
+            && permission_issues.is_empty()
+        {
+            let naming_conflicts = probe
+                .naming_conflicts(source, destination, profile.exclusions())
+                .map_err(PrecheckErrorKind::Probe)?;
+            for conflict in naming_conflicts {
+                let related = conflict
+                    .related_path()
+                    .map(|path| format!("; it conflicts with {path:?}"))
+                    .unwrap_or_default();
+                result.blockers.push(PrecheckBlocker::with_reason(
+                    PrecheckBlockerKind::DestinationNamingConflict,
+                    conflict.source_path(),
+                    format!(
+                        "destination naming rule {:?} cannot represent {:?} safely{}",
+                        conflict.rule(),
+                        conflict.destination_path(),
+                        related
+                    ),
+                    format!(
+                        "the destination filesystem rejected or would collide with the source item's name under {:?}",
+                        conflict.rule()
+                    ),
+                    "rename or exclude the conflicting item, or choose a destination with compatible naming rules",
+                ));
+            }
         }
 
         if options.safe_delete() {
@@ -943,6 +1066,20 @@ impl PrecheckProbe for LocalPrecheckProbe {
         available_space(path)
     }
 
+    fn peer_available(&self, path: &Path, destination: bool) -> Result<bool, PrecheckError> {
+        Ok(if path.exists() {
+            path.is_dir()
+        } else {
+            destination && path.parent().is_some_and(Path::is_dir)
+        })
+    }
+
+    fn scopes_overlap(&self, source: &Path, destination: &Path) -> Result<bool, PrecheckError> {
+        let source_scope = canonical_scope(source)?;
+        let destination_scope = canonical_scope(destination)?;
+        Ok(PeerScope::new(source_scope).overlaps(&PeerScope::new(destination_scope)))
+    }
+
     fn required_space(
         &self,
         source: &Path,
@@ -950,7 +1087,7 @@ impl PrecheckProbe for LocalPrecheckProbe {
         options: ValidatedSyncOptions,
         exclusions: &[String],
     ) -> Result<u64, PrecheckError> {
-        let transfer_bytes = directory_size(source, exclusions)?;
+        let transfer_bytes = directory_size(source, exclusions).unwrap_or_default();
         if options.deletion_method() == Some(DeletionMethod::Trash)
             && !same_filesystem(source, destination)
         {
@@ -984,39 +1121,71 @@ impl PrecheckProbe for LocalPrecheckProbe {
         options: ValidatedSyncOptions,
     ) -> Result<Vec<PermissionIssue>, PrecheckError> {
         let mut issues = Vec::new();
-        for relative in collect_entries(source, exclusions)? {
+        let source_entries = if local_access(source, false).readable() {
+            match collect_entries(source, exclusions) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    issues.push(PermissionIssue::with_reason(
+                        error.path(),
+                        "each included source item must be readable",
+                        error.detail(),
+                        "grant the current user read access to this item and retry the precheck",
+                    ));
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        for relative in source_entries {
             let path = source.join(&relative);
             let access = local_access(&path, false);
             if !access.readable() {
-                issues.push(PermissionIssue::new(
+                issues.push(PermissionIssue::with_reason(
                     &path,
                     "each included source item must be readable",
+                    "the source item cannot be opened with the current user's effective access",
                     "grant the current user read access to this item and retry the precheck",
                 ));
             }
             if options.safe_delete() && !access.removable() {
-                issues.push(PermissionIssue::new(
+                issues.push(PermissionIssue::with_reason(
                     &path,
                     "Safe Delete requires removal access for each included source item",
+                    "the source item's containing directory does not allow removal with the current user's effective access",
                     "grant removal access on the item's containing directory or exclude the item",
                 ));
             }
         }
         if destination.exists() {
-            for relative in collect_entries(destination, &[])? {
+            let destination_entries = match collect_entries(destination, &[]) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    issues.push(PermissionIssue::with_reason(
+                        error.path(),
+                        "destination items that may be inspected or replaced must be readable",
+                        error.detail(),
+                        "grant the current user read access to this destination item or resolve the conflict explicitly",
+                    ));
+                    Vec::new()
+                }
+            };
+            for relative in destination_entries {
                 let path = destination.join(&relative);
                 let access = local_access(&path, true);
                 if !access.writable() {
-                    issues.push(PermissionIssue::new(
+                    issues.push(PermissionIssue::with_reason(
                         &path,
                         "destination items that may be replaced must be writable",
+                        "the existing destination item cannot be changed with the current user's effective access",
                         "grant the current user write access to this destination item or remove the conflict explicitly",
                     ));
                 }
                 if options.destination_cleanup() && !access.removable() {
-                    issues.push(PermissionIssue::new(
+                    issues.push(PermissionIssue::with_reason(
                         &path,
                         "Destination Cleanup requires removal access for each destination item",
+                        "the destination item cannot be removed with the current user's effective access",
                         "grant removal access on the item's containing directory or disable Destination Cleanup",
                     ));
                 }
@@ -1042,8 +1211,11 @@ pub struct DestinationNamingPolicy {
     case_insensitive: bool,
     unicode_normalization: bool,
     max_component_bytes: Option<usize>,
+    max_path_bytes: Option<usize>,
     reserved_names: Vec<String>,
     invalid_characters: Vec<char>,
+    reject_control_characters: bool,
+    reject_trailing_dot_or_space: bool,
 }
 
 impl Default for DestinationNamingPolicy {
@@ -1053,8 +1225,11 @@ impl Default for DestinationNamingPolicy {
             case_insensitive: false,
             unicode_normalization: false,
             max_component_bytes: None,
+            max_path_bytes: None,
             reserved_names: Vec::new(),
             invalid_characters: Vec::new(),
+            reject_control_characters: false,
+            reject_trailing_dot_or_space: false,
         }
     }
 }
@@ -1068,6 +1243,22 @@ impl DestinationNamingPolicy {
         }
     }
 
+    pub fn windows_compatible() -> Self {
+        Self {
+            auto_detect: false,
+            case_insensitive: true,
+            unicode_normalization: true,
+            max_component_bytes: Some(255),
+            max_path_bytes: Some(260),
+            reserved_names: windows_reserved_names().into_iter().map(String::from).collect(),
+            invalid_characters: ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
+                .into_iter()
+                .collect(),
+            reject_control_characters: true,
+            reject_trailing_dot_or_space: true,
+        }
+    }
+
     pub fn with_unicode_normalization(mut self, enabled: bool) -> Self {
         self.auto_detect = false;
         self.unicode_normalization = enabled;
@@ -1077,6 +1268,12 @@ impl DestinationNamingPolicy {
     pub fn with_max_component_bytes(mut self, maximum: usize) -> Self {
         self.auto_detect = false;
         self.max_component_bytes = Some(maximum);
+        self
+    }
+
+    pub fn with_max_path_bytes(mut self, maximum: usize) -> Self {
+        self.auto_detect = false;
+        self.max_path_bytes = Some(maximum);
         self
     }
 
@@ -1158,35 +1355,34 @@ impl DestinationNamingPolicy {
         let mut policy = self.clone();
         policy.auto_detect = false;
         policy.max_component_bytes.get_or_insert(255);
+        policy.max_path_bytes.get_or_insert(if cfg!(windows) { 260 } else { 4096 });
         policy.unicode_normalization = cfg!(target_os = "macos");
 
         #[cfg(unix)]
-        if let Some(filesystem_type) = filesystem_type(destination) {
-            const EXFAT_MAGIC: i64 = 0x2011_bab0;
-            const NTFS_MAGIC: i64 = 0x5346_544e;
-            const MSDOS_MAGIC: i64 = 0x4d44;
-            if matches!(filesystem_type, EXFAT_MAGIC | NTFS_MAGIC | MSDOS_MAGIC) {
-                policy.case_insensitive = true;
-                policy
-                    .reserved_names
-                    .extend(windows_reserved_names().into_iter().map(String::from));
-                policy.invalid_characters.extend(['<', '>', ':', '"', '/', '\\', '|', '?', '*']);
-            }
+        if restricted_filesystem(destination) {
+            policy = Self::windows_compatible();
         }
 
         #[cfg(windows)]
         {
-            policy.case_insensitive = true;
-            policy
-                .reserved_names
-                .extend(windows_reserved_names().into_iter().map(String::from));
-            policy.invalid_characters.extend(['<', '>', ':', '"', '/', '\\', '|', '?', '*']);
+            policy = Self::windows_compatible();
         }
 
         policy
     }
 
     fn validate_relative(&self, relative: &Path, destination: PathBuf) -> Option<NamingConflict> {
+        if self
+            .max_path_bytes
+            .is_some_and(|maximum| path_byte_length(&destination) > maximum)
+        {
+            return Some(NamingConflict::new(
+                relative,
+                destination,
+                None,
+                NamingRule::PathTooLong,
+            ));
+        }
         for component in relative.components() {
             let name = component.as_os_str().to_string_lossy();
             if self
@@ -1208,10 +1404,26 @@ impl DestinationNamingPolicy {
                     NamingRule::InvalidCharacter,
                 ));
             }
+            if self.reject_control_characters && name.chars().any(char::is_control) {
+                return Some(NamingConflict::new(
+                    relative,
+                    destination,
+                    None,
+                    NamingRule::InvalidCharacter,
+                ));
+            }
+            if self.reject_trailing_dot_or_space && name.ends_with(['.', ' ']) {
+                return Some(NamingConflict::new(
+                    relative,
+                    destination,
+                    None,
+                    NamingRule::TrailingDotOrSpace,
+                ));
+            }
             if self
                 .reserved_names
                 .iter()
-                .any(|reserved| self.key_component(reserved) == self.key_component(&name))
+                .any(|reserved| self.reserved_name_key(reserved) == self.reserved_name_key(&name))
             {
                 return Some(NamingConflict::new(
                     relative,
@@ -1234,6 +1446,11 @@ impl DestinationNamingPolicy {
     fn key_component(&self, value: &str) -> String {
         normalize_text(value, self.case_insensitive, self.unicode_normalization)
     }
+
+    fn reserved_name_key(&self, value: &str) -> String {
+        let base = value.trim_end_matches(['.', ' ']).split('.').next().unwrap_or_default();
+        self.key_component(base)
+    }
 }
 
 fn normalize_text(value: &str, case_insensitive: bool, unicode_normalization: bool) -> String {
@@ -1246,6 +1463,18 @@ fn normalize_text(value: &str, case_insensitive: bool, unicode_normalization: bo
         normalized.to_lowercase()
     } else {
         normalized
+    }
+}
+
+fn path_byte_length(path: &Path) -> usize {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().len()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().len()
     }
 }
 
@@ -1417,6 +1646,61 @@ fn filesystem_type(path: &Path) -> Option<i64> {
     Some(unsafe { statistics.assume_init() }.f_type as i64)
 }
 
+#[cfg(unix)]
+fn restricted_filesystem(path: &Path) -> bool {
+    const EXFAT_MAGIC: i64 = 0x2011_bab0;
+    const NTFS_MAGIC: i64 = 0x5346_544e;
+    const MSDOS_MAGIC: i64 = 0x4d44;
+
+    if matches!(filesystem_type(path), Some(EXFAT_MAGIC | NTFS_MAGIC | MSDOS_MAGIC)) {
+        return true;
+    }
+
+    let target = probe_target(path);
+    let Ok(mounts) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    mounts.lines().any(|line| {
+        let Some((mount_fields, filesystem_fields)) = line.split_once(" - ") else {
+            return false;
+        };
+        let Some(mount_point) = mount_fields.split_whitespace().nth(4) else {
+            return false;
+        };
+        let Some(filesystem) = filesystem_fields.split_whitespace().next() else {
+            return false;
+        };
+        if !matches!(filesystem, "fuseblk" | "vfat" | "msdos" | "exfat" | "ntfs" | "ntfs3") {
+            return false;
+        }
+        let mount_point = decode_mountinfo_path(mount_point);
+        target == mount_point || target.starts_with(&mount_point)
+    })
+}
+
+#[cfg(unix)]
+fn decode_mountinfo_path(value: &str) -> PathBuf {
+    let mut decoded = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            let escape: String = characters.by_ref().take(3).collect();
+            match escape.as_str() {
+                "040" => decoded.push(' '),
+                "011" => decoded.push('\t'),
+                "134" => decoded.push('\\'),
+                _ => {
+                    decoded.push('\\');
+                    decoded.push_str(&escape);
+                }
+            }
+        } else {
+            decoded.push(character);
+        }
+    }
+    PathBuf::from(decoded)
+}
+
 fn device_id(path: &Path) -> Option<u64> {
     let target = probe_target(path);
     #[cfg(unix)]
@@ -1480,6 +1764,40 @@ fn probe_target(path: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         path.parent().unwrap_or(path).to_path_buf()
+    }
+}
+
+fn canonical_scope(path: &Path) -> Result<PathBuf, PrecheckError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| PrecheckError::new(path, "resolve peer scope", error.to_string()))?
+            .join(path)
+    };
+    let mut unresolved = Vec::new();
+    let mut current = absolute.clone();
+    loop {
+        if current.exists() {
+            let mut resolved = fs::canonicalize(&current).map_err(|error| {
+                PrecheckError::new(&current, "resolve peer scope", error.to_string())
+            })?;
+            for component in unresolved.iter().rev() {
+                resolved.push(component);
+            }
+            return Ok(resolved);
+        }
+        let Some(name) = current.file_name() else {
+            return Err(PrecheckError::new(
+                path,
+                "resolve peer scope",
+                "no existing ancestor is available",
+            ));
+        };
+        unresolved.push(name.to_owned());
+        current = current.parent().ok_or_else(|| {
+            PrecheckError::new(path, "resolve peer scope", "no existing ancestor is available")
+        })?.to_path_buf();
     }
 }
 
