@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Block runs when required permissions are insufficient

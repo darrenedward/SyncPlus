@@ -159,7 +159,12 @@ fn path_warning_is_advisory_and_only_safe_delete_receives_it() {
     let result = RunPrecheck::check(&safe_delete, &probe).expect("safe delete should precheck");
     assert_eq!(result.warnings().len(), 1);
     assert_eq!(result.warnings()[0].level(), crate::PathRiskLevel::High);
+    assert!(result.warnings()[0].requires_stronger_confirmation());
+    assert!(result.requires_stronger_confirmation());
     assert!(result.can_execute(), "warnings must remain advisory");
+    assert!(!result.is_confirmation_sufficient(false));
+    assert!(result.is_confirmation_sufficient(true));
+    assert!(ordinary.is_confirmation_sufficient(false));
 }
 
 #[test]
@@ -238,6 +243,209 @@ fn local_probe_detects_case_collisions_against_an_existing_destination_name() {
         conflict.rule() == crate::NamingRule::CaseInsensitiveCollision
             && conflict.related_path().is_some()
     }));
+}
+
+#[test]
+fn missing_local_peer_is_reported_as_a_typed_blocker_before_deep_probing() {
+    let destination = TestTree::new();
+    let profile = profile(
+        PathBuf::from("/path/that/is/not-mounted"),
+        destination.path().to_path_buf(),
+    );
+
+    let result = RunPrecheck::check(&profile, &crate::LocalPrecheckProbe::default())
+        .expect("peer availability belongs in the precheck result");
+
+    let blocker = result
+        .blockers()
+        .iter()
+        .find(|blocker| blocker.kind() == PrecheckBlockerKind::PeerUnavailable)
+        .expect("missing source should be a peer-availability blocker");
+    assert_eq!(blocker.path(), PathBuf::from("/path/that/is/not-mounted"));
+    assert!(!blocker.requirement().is_empty());
+    assert!(!blocker.reason().is_empty());
+    assert!(!blocker.remediation().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn local_precheck_rejects_real_path_aliases_before_access_or_naming_probes() {
+    let root = TestTree::new();
+    let source = root.path().join("source");
+    fs::create_dir_all(&source).expect("create source");
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(root.path(), &alias).expect("create parent alias");
+    let destination = alias.join("source").join("nested");
+    fs::create_dir_all(destination.parent().expect("destination parent"))
+        .expect("create destination parent");
+
+    let result = RunPrecheck::check(
+        &profile(source, destination),
+        &crate::LocalPrecheckProbe::default(),
+    )
+    .expect("real path alias should be represented as a precheck result");
+
+    assert!(result
+        .blockers()
+        .iter()
+        .any(|blocker| blocker.kind() == PrecheckBlockerKind::PeerScopeOverlap));
+}
+
+#[test]
+fn local_naming_precheck_covers_unicode_reserved_invalid_and_total_path_rules() {
+    let source = TestTree::new();
+    let destination = TestTree::new();
+    fs::write(source.path().join("café.txt"), b"composed").expect("write composed name");
+    fs::write(source.path().join("cafe\u{301}.txt"), b"decomposed")
+        .expect("write decomposed name");
+    fs::write(source.path().join("CON.txt"), b"reserved").expect("write reserved name");
+    fs::write(source.path().join("bad:name"), b"invalid").expect("write invalid name");
+    fs::write(source.path().join("trailing. "), b"trailing").expect("write trailing name");
+    fs::write(source.path().join("long-name-that-exceeds"), b"too long for configured path")
+        .expect("write long name");
+
+    let policy = DestinationNamingPolicy::windows_compatible()
+        .with_unicode_normalization(true)
+        .with_max_path_bytes(destination.path().to_string_lossy().len() + 11);
+    let conflicts = crate::LocalPrecheckProbe::new(policy)
+        .naming_conflicts(source.path(), destination.path(), &[])
+        .expect("naming precheck should complete");
+
+    assert!(conflicts
+        .iter()
+        .any(|conflict| conflict.rule() == crate::NamingRule::UnicodeNormalizationCollision));
+    assert!(conflicts.iter().any(|conflict| {
+        conflict.rule() == crate::NamingRule::ReservedName
+            && conflict.source_path() == PathBuf::from("CON.txt")
+    }));
+    assert!(conflicts
+        .iter()
+        .any(|conflict| conflict.rule() == crate::NamingRule::InvalidCharacter));
+    assert!(conflicts
+        .iter()
+        .any(|conflict| conflict.rule() == crate::NamingRule::TrailingDotOrSpace));
+    assert!(conflicts
+        .iter()
+        .any(|conflict| conflict.rule() == crate::NamingRule::PathTooLong));
+}
+
+#[cfg(unix)]
+#[test]
+fn actual_restricted_filesystem_is_checked_before_mutation_when_available() {
+    let Some(filesystem_root) = [PathBuf::from("/mnt/elements"), PathBuf::from("/media")]
+        .into_iter()
+        .find(|path| path.is_dir())
+    else {
+        return;
+    };
+    let fixture_root = filesystem_root.join(format!(
+        ".syncplus-precheck-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    if fs::create_dir_all(&fixture_root).is_err() {
+        return;
+    }
+    struct ExternalFixture(PathBuf);
+    impl Drop for ExternalFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _fixture = ExternalFixture(fixture_root.clone());
+    let source = TestTree::new();
+    let destination = fixture_root.join("destination");
+    fs::create_dir(&destination).expect("create restricted destination");
+    fs::write(source.path().join("Report.txt"), b"source").expect("write source collision");
+    fs::write(source.path().join("bad:name"), b"source invalid name")
+        .expect("write source invalid name");
+    fs::write(destination.join("report.txt"), b"existing").expect("write destination collision");
+
+    let conflicts = crate::LocalPrecheckProbe::default()
+        .naming_conflicts(source.path(), &destination, &[])
+        .expect("restricted destination naming precheck should complete");
+    assert!(conflicts
+        .iter()
+        .any(|conflict| conflict.rule() == crate::NamingRule::CaseInsensitiveCollision));
+    assert!(conflicts
+        .iter()
+        .any(|conflict| conflict.rule() == crate::NamingRule::InvalidCharacter));
+    assert_eq!(fs::read(destination.join("report.txt")).expect("destination remains"), b"existing");
+}
+
+#[cfg(unix)]
+#[test]
+fn real_permission_precheck_reports_effective_access_without_changing_modes() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let source = TestTree::new();
+    let destination = TestTree::new();
+    fs::write(source.path().join("item.txt"), b"item").expect("write source");
+    let original_mode = fs::metadata(destination.path())
+        .expect("destination metadata")
+        .permissions()
+        .mode();
+    fs::set_permissions(destination.path(), fs::Permissions::from_mode(0o555))
+        .expect("make destination read-only");
+
+    let result = RunPrecheck::check(
+        &profile(source.path().to_path_buf(), destination.path().to_path_buf()),
+        &crate::LocalPrecheckProbe::default(),
+    )
+    .expect("permission failure should be a typed precheck blocker");
+
+    let blocker = result
+        .blockers()
+        .iter()
+        .find(|blocker| blocker.kind() == PrecheckBlockerKind::DestinationNotWritable)
+        .expect("destination writability should be reported");
+    assert_eq!(blocker.path(), destination.path());
+    assert!(!blocker.reason().is_empty());
+    assert!(!blocker.remediation().is_empty());
+    assert_eq!(
+        fs::metadata(destination.path())
+            .expect("destination metadata remains available")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o555
+    );
+    fs::set_permissions(destination.path(), fs::Permissions::from_mode(original_mode))
+        .expect("restore destination mode");
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_local_source_is_reported_without_turning_precheck_into_a_probe_error() {
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+
+    let source = TestTree::new();
+    let destination = TestTree::new();
+    fs::write(source.path().join("item.txt"), b"item").expect("write source");
+    fs::set_permissions(source.path(), fs::Permissions::from_mode(0o000))
+        .expect("make source unreadable");
+
+    let result = RunPrecheck::check(
+        &profile(source.path().to_path_buf(), destination.path().to_path_buf()),
+        &crate::LocalPrecheckProbe::default(),
+    )
+    .expect("unreadable source should be represented in the result");
+
+    assert!(result
+        .blockers()
+        .iter()
+        .any(|blocker| blocker.kind() == PrecheckBlockerKind::SourceUnreadable));
+    fs::set_permissions(source.path(), fs::Permissions::from_mode(0o755))
+        .expect("restore source mode");
 }
 
 #[test]

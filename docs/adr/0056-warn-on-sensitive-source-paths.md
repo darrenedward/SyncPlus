@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Warn on sensitive paths only for source-draining actions

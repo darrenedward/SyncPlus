@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Run a non-mutating precheck before confirmation
