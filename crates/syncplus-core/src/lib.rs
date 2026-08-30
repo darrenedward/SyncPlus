@@ -16,6 +16,7 @@ mod volume;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
+    SpecialistMetadataRequirements,
     OneWaySource, PartialTransferPolicy, Peer, ProfileSnapshot, ProfileSnapshotId, RetryPolicy,
     RunEvent, RunId, RunState, SafetyViolation, SyncMode, SyncOptions, SyncProfile, SyncRun,
     TerminalOutcome,
@@ -58,6 +59,7 @@ pub use precheck::{
     NamingConflict, NamingRule, PathRiskLevel, PathRiskWarning, PrecheckBlocker,
     PrecheckBlockerKind, PrecheckBlocked, PrecheckError, PrecheckErrorKind, PrecheckFailure,
     PrecheckLease, PrecheckProbe, PrecheckResult, PermissionIssue, RunPrecheck,
+    SpecialistMetadataCapabilities,
 };
 pub use scope_lock::{
     PeerScope, PeerScopeLock, PeerScopeLockRegistry, ScopeLockConflict, ScopeLockError,

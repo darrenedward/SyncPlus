@@ -13,6 +13,27 @@ use crate::{
     VolumeIdentity, VolumeIdentityError,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpecialistMetadataCapabilities {
+    ownership: bool,
+    access_control_lists: bool,
+    extended_attributes: bool,
+}
+
+impl SpecialistMetadataCapabilities {
+    pub const fn new(ownership: bool, access_control_lists: bool, extended_attributes: bool) -> Self {
+        Self { ownership, access_control_lists, extended_attributes }
+    }
+    pub const fn supports(self, requested: crate::SpecialistMetadataRequirements) -> bool {
+        (!requested.ownership() || self.ownership)
+            && (!requested.access_control_lists() || self.access_control_lists)
+            && (!requested.extended_attributes() || self.extended_attributes)
+    }
+    pub const fn ownership(self) -> bool { self.ownership }
+    pub const fn access_control_lists(self) -> bool { self.access_control_lists }
+    pub const fn extended_attributes(self) -> bool { self.extended_attributes }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AccessSnapshot {
     readable: bool,
@@ -109,6 +130,15 @@ pub trait PrecheckProbe {
         exclusions: &[String],
     ) -> Result<u64, PrecheckError>;
 
+    /// Read-only capability discovery for explicitly requested specialist
+    /// metadata. The conservative default is unsupported.
+    fn specialist_metadata_capabilities(
+        &self,
+        _destination: &Path,
+    ) -> Result<SpecialistMetadataCapabilities, PrecheckError> {
+        Ok(SpecialistMetadataCapabilities::default())
+    }
+
     /// Return the stable local volume identity for a peer when the operating
     /// system provides one. Implementations must not follow a symlink at the
     /// selected peer root or mutate the filesystem.
@@ -147,6 +177,7 @@ pub enum PrecheckBlockerKind {
     DestinationNamingConflict,
     VolumeIdentityMismatch,
     VolumeIdentityUnavailable,
+    SpecialistMetadataUnsupported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -744,6 +775,25 @@ impl RunPrecheck {
         }
 
         let options = specification.options();
+        let requested_specialist = options.specialist_metadata();
+        if requested_specialist.any() {
+            let capabilities = probe
+                .specialist_metadata_capabilities(destination)
+                .map_err(PrecheckErrorKind::Probe)?;
+            if !capabilities.supports(requested_specialist) {
+                result.blockers.push(PrecheckBlocker::with_reason(
+                    PrecheckBlockerKind::SpecialistMetadataUnsupported,
+                    destination,
+                    "the destination must support every selected specialist metadata capability",
+                    format!(
+                        "requested ownership={}, ACLs={}, extended attributes={}, but the destination reports ownership={}, ACLs={}, extended attributes={}",
+                        requested_specialist.ownership(), requested_specialist.access_control_lists(), requested_specialist.extended_attributes(),
+                        capabilities.ownership(), capabilities.access_control_lists(), capabilities.extended_attributes()
+                    ),
+                    "choose a destination with the required capabilities or disable the named Advanced metadata options",
+                ));
+            }
+        }
         if options.safe_delete() && !source_access.removable() {
             result.blockers.push(PrecheckBlocker::with_reason(
                 PrecheckBlockerKind::RequiredPermission,

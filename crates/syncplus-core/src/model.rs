@@ -123,6 +123,30 @@ pub struct MetadataRequirements {
     executable_permissions: bool,
     symlink_targets: bool,
     timestamps: bool,
+    specialist: SpecialistMetadataRequirements,
+}
+
+/// Optional metadata whose preservation is deliberately Advanced-only. These
+/// are named capabilities rather than an escape hatch for arbitrary rsync
+/// arguments. All are disabled by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpecialistMetadataRequirements {
+    ownership: bool,
+    access_control_lists: bool,
+    extended_attributes: bool,
+}
+
+impl SpecialistMetadataRequirements {
+    pub const fn new(ownership: bool, access_control_lists: bool, extended_attributes: bool) -> Self {
+        Self { ownership, access_control_lists, extended_attributes }
+    }
+
+    pub const fn ownership(self) -> bool { self.ownership }
+    pub const fn access_control_lists(self) -> bool { self.access_control_lists }
+    pub const fn extended_attributes(self) -> bool { self.extended_attributes }
+    pub const fn any(self) -> bool {
+        self.ownership || self.access_control_lists || self.extended_attributes
+    }
 }
 
 impl MetadataRequirements {
@@ -137,6 +161,7 @@ impl MetadataRequirements {
             executable_permissions,
             symlink_targets,
             timestamps,
+            specialist: SpecialistMetadataRequirements::new(false, false, false),
         }
     }
 
@@ -155,6 +180,13 @@ impl MetadataRequirements {
     pub const fn timestamps(self) -> bool {
         self.timestamps
     }
+
+    pub const fn with_specialist_metadata(mut self, specialist: SpecialistMetadataRequirements) -> Self {
+        self.specialist = specialist;
+        self
+    }
+
+    pub const fn specialist_metadata(self) -> SpecialistMetadataRequirements { self.specialist }
 }
 
 impl Default for MetadataRequirements {
