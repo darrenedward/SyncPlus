@@ -55,9 +55,22 @@ pub enum SyncMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OneWaySource {
+    PeerA,
+    PeerB,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionMethod {
+    Trash,
+    PermanentRemoval,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncOptions {
     pub safe_delete: bool,
     pub destination_cleanup: bool,
+    pub deletion_method: Option<DeletionMethod>,
 }
 
 impl Default for SyncOptions {
@@ -65,6 +78,7 @@ impl Default for SyncOptions {
         Self {
             safe_delete: false,
             destination_cleanup: false,
+            deletion_method: None,
         }
     }
 }
@@ -75,7 +89,9 @@ pub struct SyncProfile {
     peer_a: Peer,
     peer_b: Peer,
     mode: SyncMode,
+    source: OneWaySource,
     options: SyncOptions,
+    exclusions: Vec<String>,
 }
 
 impl SyncProfile {
@@ -85,7 +101,9 @@ impl SyncProfile {
             peer_a,
             peer_b,
             mode: SyncMode::OneWay,
+            source: OneWaySource::PeerA,
             options: SyncOptions::default(),
+            exclusions: Vec::new(),
         }
     }
 
@@ -105,8 +123,41 @@ impl SyncProfile {
         self.mode
     }
 
+    pub const fn source(&self) -> OneWaySource {
+        self.source
+    }
+
     pub const fn options(&self) -> SyncOptions {
         self.options
+    }
+
+    pub const fn with_source(mut self, source: OneWaySource) -> Self {
+        self.source = source;
+        self
+    }
+
+    pub const fn with_options(mut self, options: SyncOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    pub fn exclusions(&self) -> &[String] {
+        &self.exclusions
+    }
+
+    pub fn with_exclusion(mut self, exclusion: impl Into<String>) -> Self {
+        self.exclusions.push(exclusion.into());
+        self
+    }
+
+    pub fn with_exclusions<I, S>(mut self, exclusions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.exclusions
+            .extend(exclusions.into_iter().map(Into::into));
+        self
     }
 }
 
