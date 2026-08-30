@@ -4,7 +4,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{DeletionMethod, OneWaySource, SyncMode, SyncOptions, SyncProfile};
+use crate::{
+    DeletionMethod, OneWaySource, PeerSide, PlanAction, PlanActionKind, SyncMode, SyncOptions,
+    SyncProfile,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RsyncFlag {
@@ -85,6 +88,18 @@ impl ProcessInvocation {
     pub fn secret_bindings(&self) -> &[EnvironmentBinding] {
         &self.secret_bindings
     }
+
+    pub fn preview(&self) -> String {
+        let mut parts = Vec::with_capacity(1 + self.arguments.len() + self.secret_bindings.len());
+        parts.extend(
+            self.secret_bindings
+                .iter()
+                .map(|binding| format!("{}=<redacted>", binding.name)),
+        );
+        parts.push(shell_quote(&self.program));
+        parts.extend(self.arguments.iter().map(|argument| shell_quote(argument)));
+        parts.join(" ")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +112,9 @@ pub enum ProcessSpecError {
     InvalidExclusionPattern { reason: &'static str },
     InvalidSecretBinding { value: String },
     UnsupportedSyncMode,
+    ActionNotAllowed { kind: PlanActionKind },
+    ActionSourceMismatch,
+    InvalidTransferPath { path: PathBuf },
 }
 
 impl fmt::Display for ProcessSpecError {
@@ -120,6 +138,15 @@ impl fmt::Display for ProcessSpecError {
                 write!(formatter, "invalid secret binding name: {value}")
             }
             Self::UnsupportedSyncMode => write!(formatter, "unsupported synchronization mode"),
+            Self::ActionNotAllowed { kind } => {
+                write!(formatter, "plan action is not a file transfer: {kind:?}")
+            }
+            Self::ActionSourceMismatch => {
+                formatter.write_str("plan action belongs to a different source peer")
+            }
+            Self::InvalidTransferPath { path } => {
+                write!(formatter, "transfer path is not a normalized relative item path: {path:?}")
+            }
         }
     }
 }
@@ -174,6 +201,8 @@ pub struct ProcessSpecification {
     arguments: Vec<ProcessArgument>,
     options: ValidatedSyncOptions,
     source: OneWaySource,
+    source_root: PathBuf,
+    destination_root: PathBuf,
     secret_bindings: Vec<EnvironmentBinding>,
 }
 
@@ -216,6 +245,8 @@ impl ProcessSpecification {
             arguments,
             options,
             source: profile.source(),
+            source_root: source.root().to_path_buf(),
+            destination_root: destination.root().to_path_buf(),
             secret_bindings: Vec::new(),
         })
     }
@@ -267,21 +298,53 @@ impl ProcessSpecification {
         }
     }
 
-    pub fn preview(&self) -> String {
-        let invocation = self.invocation();
-        let mut parts = Vec::with_capacity(
-            1 + invocation.arguments.len() + invocation.secret_bindings.len(),
-        );
+    /// Builds the controlled per-item invocation used by the execution seam.
+    /// Destination cleanup is intentionally excluded: a temporary item
+    /// transfer must never turn into a tree-wide deletion command.
+    pub(crate) fn item_invocation(
+        &self,
+        source: &Path,
+        temporary_destination: &Path,
+    ) -> Result<ProcessInvocation, ProcessSpecError> {
+        validate_peer_path("item source", source)?;
+        validate_peer_path("temporary destination", temporary_destination)?;
+        Ok(ProcessInvocation {
+            program: OsString::from("rsync"),
+            arguments: vec![
+                ProcessArgument::Flag(RsyncFlag::Archive).to_os_string(),
+                ProcessArgument::Flag(RsyncFlag::ItemizeChanges).to_os_string(),
+                ProcessArgument::Flag(RsyncFlag::EndOfOptions).to_os_string(),
+                ProcessArgument::PeerPath(source.to_path_buf()).to_os_string(),
+                ProcessArgument::PeerPath(temporary_destination.to_path_buf()).to_os_string(),
+            ],
+            secret_bindings: Vec::new(),
+        })
+    }
 
-        parts.extend(
-            invocation
-                .secret_bindings
-                .iter()
-                .map(|binding| format!("{}=<redacted>", binding.name)),
-        );
-        parts.push(shell_quote(&invocation.program));
-        parts.extend(invocation.arguments.iter().map(|argument| shell_quote(argument)));
-        parts.join(" ")
+    pub(crate) fn transfer_paths(
+        &self,
+        action: &PlanAction,
+    ) -> Result<(PathBuf, PathBuf), ProcessSpecError> {
+        if !matches!(
+            action.kind(),
+            PlanActionKind::CopyToDestination | PlanActionKind::OverwriteDestination
+        ) {
+            return Err(ProcessSpecError::ActionNotAllowed {
+                kind: action.kind(),
+            });
+        }
+        if action.source_side() != PeerSide::from(self.source) {
+            return Err(ProcessSpecError::ActionSourceMismatch);
+        }
+        validate_relative_transfer_path(action.relative_path())?;
+        Ok((
+            self.source_root.join(action.relative_path()),
+            self.destination_root.join(action.relative_path()),
+        ))
+    }
+
+    pub fn preview(&self) -> String {
+        self.invocation().preview()
     }
 }
 
@@ -331,6 +394,22 @@ fn validate_exclusion_pattern(pattern: &str) -> Result<(), ProcessSpecError> {
     Ok(())
 }
 
+fn validate_relative_transfer_path(path: &Path) -> Result<(), ProcessSpecError> {
+    use std::path::Component;
+
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ProcessSpecError::InvalidTransferPath {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn path_contains_nul(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -372,4 +451,13 @@ fn shell_quote(value: &OsStr) -> String {
 
     quoted.push('\'');
     quoted
+}
+
+#[cfg(test)]
+pub(crate) fn test_process_invocation(program: &str, arguments: &[&str]) -> ProcessInvocation {
+    ProcessInvocation {
+        program: OsString::from(program),
+        arguments: arguments.iter().map(OsString::from).collect(),
+        secret_bindings: Vec::new(),
+    }
 }

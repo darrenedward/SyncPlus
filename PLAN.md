@@ -1,6 +1,6 @@
 # SyncPlus — a safety-first desktop synchronization app
 
-> Status: implementation in progress · 2026-08-30 · core run, validated process-specification, fresh-analysis/plan, local precheck/scope-lock, and durable run-evidence slices are implemented; remaining milestones are pending
+> Status: implementation complete pending review · 2026-08-30 · controlled transfer, bounded parser evidence, process-group supervision, independent content proof, metadata checks, and verified replacement are implemented for issue #13; Safe Delete and end-to-end workflow milestones remain pending
 
 ## Product goal
 
