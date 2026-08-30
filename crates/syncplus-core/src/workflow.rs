@@ -164,18 +164,28 @@ impl RunWorkflow {
         F: Fn() -> bool,
     {
         let report = store.load_report(run_id)?;
-        if matches!(
-            report.status(),
-            RunReportStatus::Completed | RunReportStatus::ReviewCleared
-        ) {
+        if matches!(report.status(), RunReportStatus::Completed | RunReportStatus::ReviewCleared)
+        {
             return Err(WorkflowError::InvalidRun(
                 "only an incomplete, cancelled, interrupted, or review-needed run can be resumed"
+                    .to_owned(),
+            ));
+        }
+        if report.status() == RunReportStatus::RecoveryReview {
+            return Err(WorkflowError::InvalidRun(
+                "Recovery Review must be explicitly resolved before a new run can resume"
                     .to_owned(),
             ));
         }
 
         self.classify_open_actions(run_id, report.snapshot().profile(), &report, store)?;
         let reopened = store.load_report(run_id)?;
+        if reopened.status() == RunReportStatus::RecoveryReview {
+            return Err(WorkflowError::InvalidRun(
+                "Recovery Review must be explicitly resolved before a new run can resume"
+                    .to_owned(),
+            ));
+        }
         let profile = reopened.snapshot().profile().clone();
         let analysis = FreshAnalysis::analyze(&profile)?;
         let confirmed = analysis.confirm(&profile)?;
@@ -692,8 +702,8 @@ mod tests {
     use crate::{
         ActionOutcome, AuthorizationSnapshot, ContentProof, DeletionMethod, FreshAnalysis,
         ItemType, JournalEvent, OneWaySource, Peer, PeerSide, PlanActionKind, PlanRecord,
-        PreActionState, ProcessError, RecoveryMethod, RetryPolicy, RunEvidenceStore, RunId,
-        RunReportStatus, SyncOptions, SyncProfile,
+        PreActionState, ProcessError, RecoveryEvidence, RecoveryMethod, RetryPolicy,
+        RunEvidenceStore, RunId, RunReportStatus, SyncOptions, SyncProfile,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(1);
@@ -896,6 +906,53 @@ mod tests {
         ));
         assert!(!source.exists());
         assert_eq!(fs::read(destination).expect("destination remains"), b"already installed");
+    }
+
+    #[test]
+    fn resume_does_not_bypass_an_existing_recovery_review() {
+        let fixture = Fixture::new();
+        let source = fixture.source().join("uncertain.txt");
+        write_file(&source, b"source remains");
+        fs::create_dir_all(fixture.destination()).expect("destination should be creatable");
+        let profile = fixture.profile();
+        let run_id = RunId::new(1);
+        let snapshot = crate::RunSnapshot::from_profile(
+            run_id,
+            &profile,
+            AuthorizationSnapshot::default(),
+        )
+        .expect("snapshot");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+        store.begin_run(&snapshot).expect("persist snapshot");
+        store
+            .append_event(
+                run_id,
+                JournalEvent::Planned {
+                    action: plan_record_for_source(1, &source, "uncertain.txt"),
+                },
+            )
+            .expect("persist plan");
+        store
+            .append_event(run_id, JournalEvent::Started { action_id: 1 })
+            .expect("persist start");
+        store
+            .append_event(
+                run_id,
+                JournalEvent::RecoveryReview {
+                    action_id: 1,
+                    reason: crate::ActionReason::InterruptedBoundary,
+                    evidence: RecoveryEvidence::new(
+                        1, None, true, false, false, Some(13), None, None, None,
+                    ),
+                },
+            )
+            .expect("persist recovery review");
+
+        let error = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .resume(run_id, &mut store, || false)
+            .expect_err("an unresolved Recovery Review must not be bypassed");
+        assert!(matches!(error, super::WorkflowError::InvalidRun(_)));
+        assert!(!fixture.destination().join("uncertain.txt").exists());
     }
 
     #[test]
