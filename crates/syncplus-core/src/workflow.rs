@@ -15,7 +15,8 @@ use crate::{
     RecoveryMethod, ReplacementError, RetryPolicy, RunEvidenceStore, RunId, RunPrecheck,
     RunReport, RunReportStatus, RunSnapshot, SafeDeleteError, ScopeLockOwner,
     PeerScopeLockRegistry,
-    StorageError, TransferError, VerificationError, VerifiedReplacement,
+    SourceInventorySnapshot, StorageError, TransferError, VerificationError,
+    VerifiedReplacement, CompletionReconciliation,
 };
 
 #[derive(Debug)]
@@ -130,13 +131,22 @@ impl RunWorkflow {
         C: FnOnce(&ConfirmedPlan) -> bool,
         F: Fn() -> bool,
     {
-        let _lease = self.acquire_precheck(run_id, profile, probe)?;
+        let _lease = match self.acquire_precheck(run_id, profile, probe) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.persist_blocked(run_id, profile, store, &error)?;
+                return Err(error);
+            }
+        };
         let analysis = FreshAnalysis::analyze(profile)?;
         let confirmed = analysis.confirm(profile)?;
         if !confirm(&confirmed) {
             return Err(WorkflowError::ConfirmationRequired);
         }
-        self.recheck_precheck(profile, probe)?;
+        if let Err(error) = self.recheck_precheck(profile, probe) {
+            self.persist_blocked(run_id, profile, store, &error)?;
+            return Err(error);
+        }
         let report = self.execute_confirmed(run_id, &confirmed, store, should_cancel)?;
         self.cleanup_partials_after_success(&confirmed, &report)?;
         Ok(report)
@@ -164,6 +174,8 @@ impl RunWorkflow {
             crate::AuthorizationSnapshot::default(),
         )?;
         store.begin_run(&snapshot)?;
+        let inventory = SourceInventorySnapshot::from_inventory(plan.source_inventory());
+        store.record_source_inventory(run_id, &inventory)?;
         self.persist_plan(run_id, plan, store)?;
 
         let cancel = &should_cancel as &dyn Fn() -> bool;
@@ -183,7 +195,7 @@ impl RunWorkflow {
             }
         }
 
-        Ok(store.load_report(run_id)?)
+        self.reconcile_run(run_id, confirmed.profile(), &inventory, store)
     }
 
     /// Reopen an incomplete run safely. Open action boundaries are first
@@ -225,7 +237,13 @@ impl RunWorkflow {
 
         let profile = report.snapshot().profile().clone();
         let next_run_id = store.next_run_id()?;
-        let _lease = self.acquire_precheck(next_run_id, &profile, probe)?;
+        let _lease = match self.acquire_precheck(next_run_id, &profile, probe) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.persist_blocked(next_run_id, &profile, store, &error)?;
+                return Err(error);
+            }
+        };
         self.classify_open_actions(run_id, &profile, &report, store)?;
         let reopened = store.load_report(run_id)?;
         if reopened.status() == RunReportStatus::RecoveryReview {
@@ -240,7 +258,10 @@ impl RunWorkflow {
         if !confirm(&confirmed) {
             return Err(WorkflowError::ConfirmationRequired);
         }
-        self.recheck_precheck(&profile, probe)?;
+        if let Err(error) = self.recheck_precheck(&profile, probe) {
+            self.persist_blocked(next_run_id, &profile, store, &error)?;
+            return Err(error);
+        }
         let report = self.execute_confirmed(next_run_id, &confirmed, store, should_cancel)?;
         self.cleanup_partials_after_success(&confirmed, &report)?;
         Ok(report)
@@ -259,6 +280,43 @@ impl RunWorkflow {
             ScopeLockOwner::new(profile.name(), run_id),
         )
         .map_err(WorkflowError::Precheck)
+    }
+
+    fn persist_blocked(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        store: &mut RunEvidenceStore,
+        error: &WorkflowError,
+    ) -> Result<(), WorkflowError> {
+        let snapshot = RunSnapshot::from_profile(
+            run_id,
+            profile,
+            crate::AuthorizationSnapshot::default(),
+        )?;
+        store.begin_run(&snapshot)?;
+        store.mark_blocked(run_id, &error.to_string())?;
+        Ok(())
+    }
+
+    fn reconcile_run(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        inventory: &SourceInventorySnapshot,
+        store: &mut RunEvidenceStore,
+    ) -> Result<RunReport, WorkflowError> {
+        let journal = store.load_journal(run_id)?;
+        let reconciliation = match FreshAnalysis::analyze(profile) {
+            Ok(current) => {
+                CompletionReconciliation::reconcile(profile, inventory, &current, &journal)
+            }
+            Err(error) => {
+                CompletionReconciliation::unavailable(profile, inventory, &journal, &error)
+            }
+        };
+        store.record_reconciliation(run_id, &reconciliation)?;
+        Ok(store.load_report(run_id)?)
     }
 
     fn recheck_precheck<P: PrecheckProbe>(
@@ -919,6 +977,11 @@ mod tests {
             error,
             super::WorkflowError::Precheck(PrecheckFailure::ScopeLocked(_))
         ));
+        let blocked = store
+            .load_report(RunId::new(1))
+            .expect("blocked precheck should leave a durable report");
+        assert_eq!(blocked.status(), RunReportStatus::Blocked);
+        assert!(blocked.blocked_reason().is_some());
         assert!(!fixture.destination().join("pending.txt").exists());
         drop(held);
     }
@@ -1139,6 +1202,24 @@ mod tests {
             .expect("Safe Delete should reverify equal content before removal");
 
         assert_eq!(report.status(), RunReportStatus::Completed);
+        assert_eq!(
+            report
+                .reconciliation()
+                .expect("completed runs require reconciliation")
+                .source_drain_status(),
+            crate::SourceDrainStatus::Drained
+        );
+        assert!(report.can_mark_review_cleared());
+        store
+            .mark_review_cleared(RunId::new(1))
+            .expect("reconciled run should be clearable");
+        assert_eq!(
+            store
+                .load_report(RunId::new(1))
+                .expect("cleared report")
+                .status(),
+            RunReportStatus::ReviewCleared
+        );
         assert_eq!(report.items().len(), 1);
         assert_eq!(
             report.items()[0].operation(),
@@ -1150,6 +1231,85 @@ mod tests {
         ));
         assert!(!source.exists());
         assert_eq!(fs::read(destination).expect("destination remains"), b"already installed");
+    }
+
+    #[test]
+    fn critical_file_reconciliation_preserves_source_and_allows_safe_resume() {
+        let fixture = Fixture::new();
+        let source = fixture.source().join("critical.txt");
+        let destination = fixture.destination().join("critical.txt");
+        let recovery_path = fixture.root.join("recovery-file");
+        write_file(&source, b"critical source");
+        fs::create_dir_all(fixture.destination()).expect("destination should be creatable");
+        fs::write(&recovery_path, b"recovery path is unavailable")
+            .expect("recovery fixture should be writable");
+        let profile = fixture.profile().with_options(SyncOptions {
+            safe_delete: true,
+            deletion_method: Some(DeletionMethod::Trash),
+            ..SyncOptions::default()
+        });
+        let workflow = RunWorkflow::new(RecoveryMethod::trash(&recovery_path));
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let blocked = workflow
+            .execute(
+                RunId::new(1),
+                &profile,
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("an unresolved safety boundary should produce a report");
+
+        assert_eq!(blocked.status(), RunReportStatus::CompletedWithReviewRequired);
+        assert!(blocked
+            .reconciliation()
+            .expect("reconciliation should be persisted")
+            .findings()
+            .iter()
+            .any(|finding| {
+                finding.relative_path() == Path::new("critical.txt")
+                    && finding.kind() == crate::ReconciliationFindingKind::Unavailable
+            }));
+        assert!(!blocked.can_mark_review_cleared());
+        assert_eq!(fs::read(&source).expect("source must be preserved"), b"critical source");
+        assert_eq!(fs::read(&destination).expect("destination should be installed"), b"critical source");
+
+        drop(store);
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("reopened evidence store");
+        let persisted_inventory = store
+            .load_source_inventory(RunId::new(1))
+            .expect("Source Inventory should survive restart");
+        assert!(persisted_inventory.item("critical.txt").is_some());
+        let persisted = store
+            .load_report(RunId::new(1))
+            .expect("reconciliation should survive restart");
+        assert_eq!(persisted.status(), RunReportStatus::CompletedWithReviewRequired);
+        assert!(persisted.reconciliation().is_some());
+
+        fs::remove_file(&recovery_path).expect("unavailable recovery path should be removable");
+        fs::create_dir(&recovery_path).expect("recovery folder should be restorable");
+        let resumed = workflow
+            .resume(
+                RunId::new(1),
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("resume should require fresh proof and then complete");
+
+        assert_eq!(resumed.status(), RunReportStatus::Completed);
+        assert_eq!(
+            resumed
+                .reconciliation()
+                .expect("resumed reconciliation")
+                .source_drain_status(),
+            crate::SourceDrainStatus::Drained
+        );
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination).expect("destination should remain"), b"critical source");
     }
 
     #[test]

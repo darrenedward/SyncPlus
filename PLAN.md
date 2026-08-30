@@ -1,6 +1,6 @@
 # SyncPlus — a safety-first desktop synchronization app
 
-> Status: implementation complete pending review · 2026-08-30 · controlled transfer, cancellation, interruption classification, bounded retry, and Fresh Analysis resume are implemented for issues #13–#15, including frozen metadata requirements and journaled transfer/removal boundaries; end-to-end Completion Reconciliation remains pending
+> Status: implementation complete pending review · 2026-08-30 · controlled transfer, cancellation, interruption classification, bounded retry, Fresh Analysis resume, and integrated Completion Reconciliation are implemented for issues #13–#16, including frozen Source Inventories, durable reconciliation findings, and fail-closed completion gates
 
 ## Product goal
 
@@ -161,7 +161,7 @@ Cancel stops launching new actions and terminates the current transfer promptly.
 
 Crashes, process termination, transport loss, drive removal, and database-boundary ambiguity create an Interrupted Run or Recovery Review. Resume uses the durable journal, continues from the last verified boundary, performs Fresh Analysis, and requires new confirmation where needed. It never blindly replays deletion.
 
-The shared core `RunWorkflow` persists the complete action plan before mutation, uses the controlled process-group transfer boundary, applies the frozen Retry Policy only to typed transient failures, and creates a new Sync Run for resume. Completion Reconciliation remains the separate gate for Source Drained and Review-Cleared status.
+The shared core `RunWorkflow` persists the frozen Source Inventory and complete action plan before mutation, uses the controlled process-group transfer boundary, applies the frozen Retry Policy only to typed transient failures, and creates a new Sync Run for resume. It performs Completion Reconciliation after every settled workflow run and persists its findings before deriving Source Drained, Source Not Empty, Completed with Review Required, or Review-Cleared status.
 
 ## Mirror and conflict policy
 

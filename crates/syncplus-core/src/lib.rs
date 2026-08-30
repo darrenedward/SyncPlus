@@ -11,6 +11,7 @@ mod replacement;
 mod transfer;
 mod removal;
 mod workflow;
+mod reconciliation;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
@@ -46,6 +47,10 @@ pub use verification::{
 pub use transfer::{ControlledTransfer, TransferError};
 pub use removal::{RecoveryMethod, RemovalReceipt, SafeDeleteError, SafeDeleteExecutor};
 pub use workflow::{RunWorkflow, WorkflowError};
+pub use reconciliation::{
+    CompletionReconciliation, InventorySnapshotItem, ReconciliationFinding,
+    ReconciliationFindingKind, ReconciliationReason, SourceDrainStatus, SourceInventorySnapshot,
+};
 pub use precheck::{
     AccessSnapshot, DestinationNamingPolicy, ExecutionPermit, LocalPrecheckProbe,
     NamingConflict, NamingRule, PathRiskLevel, PathRiskWarning, PrecheckBlocker,

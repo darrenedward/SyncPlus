@@ -27,5 +27,8 @@ actions still required by that analysis.
 Retries are limited by the frozen, validated Retry Policy and apply only to
 typed transient transfer failures. Identity changes, verification failures,
 policy failures, and unresolved recovery conditions are not retried as if
-they were transport failures. Completion Reconciliation remains a separate
-follow-up concern and is not implied by this workflow.
+they were transport failures. Completion Reconciliation is the final step of
+this workflow. The workflow persists its independent findings before
+deriving Source Drained, Completed-with-Review-Required, or Review-Cleared
+status; an unavailable peer or unverifiable item remains visible and blocks
+completion.

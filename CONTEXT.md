@@ -334,6 +334,8 @@ The recorded set of source items eligible for a specific Sync Run after hidden-f
 The final independent comparison of the current source and destination against the approved Source Inventory and Action Journal. Safe Delete cannot become Review-Cleared while an eligible source item lacks a verified destination result or while the app cannot explain why a source item remains.
 _Avoid_: Declaring success from process exit code, transfer count, or partial per-file results alone
 
+The shared core performs this comparison after each workflow run, persists the Source Inventory and typed findings in SQLite, and exposes the affected paths and reasons through the Run Report. A missing current peer is recorded as Unavailable; a missing proof is Unverifiable; neither is converted into completion.
+
 The contract test suite must include a simulated missed or unverifiable critical source item. The expected behavior is source preservation, clear reporting, blocked **Complete** action, and safe resume after correction. This is a release-blocking safety test.
 
 Release verification also includes real external-filesystem coverage for at least one case-insensitive or restricted filesystem such as NTFS, FAT32, or exFAT, alongside portable unit tests. The test must prove that naming collisions and unsupported paths are detected before changes.
