@@ -191,6 +191,10 @@ impl ConflictResolutionPlan {
     pub const fn action_count(&self) -> usize {
         self.actions.len()
     }
+
+    pub fn actions(&self) -> &[ConflictResolutionAction] {
+        &self.actions
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

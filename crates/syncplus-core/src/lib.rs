@@ -3,6 +3,7 @@ mod process;
 mod analysis;
 mod conflict;
 mod resolution;
+mod resolution_run;
 mod preserved_copy;
 mod baseline;
 mod mirror_deletion;
@@ -42,6 +43,11 @@ pub use conflict::{
 pub use resolution::{
     ConflictDecision, ConflictResolution, ConflictResolutionAction, ConflictResolutionError,
     ConflictResolutionPlan, ConfirmedConflictResolutionPlan, ResolutionOperation,
+};
+pub use resolution_run::{
+    ConfirmedResolutionRun, FilesystemResolutionExecutor, ResolutionActionExecutor,
+    ResolutionExecutionReport, ResolutionRun, ResolutionRunError, ResolutionRunOutcome,
+    ResolutionRunResult,
 };
 pub use preserved_copy::{
     PreservedCopyError, PreservedCopyExecutionError, PreservedCopyExecutionItem,
@@ -109,6 +115,9 @@ mod conflict_tests;
 
 #[cfg(test)]
 mod resolution_tests;
+
+#[cfg(test)]
+mod resolution_run_tests;
 
 #[cfg(test)]
 mod preserved_copy_tests;

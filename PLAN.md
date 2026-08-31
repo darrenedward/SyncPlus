@@ -177,6 +177,7 @@ The shared core `RunWorkflow` persists the frozen Source Inventory and complete 
 - Same-hash files at different paths are possible duplicates/rename candidates only; hash equality never automatically moves or deletes them.
 - Mirror deletion candidates are derived only when a two-sided Sync Baseline proves one peer absent and the remaining peer unchanged. Each candidate exposes its baseline/current evidence and affected peer; a missing baseline, changed counterpart, exclusion, or other uncertainty produces no deletion candidate.
 - Mirror deletion requires an explicit per-path decision and final Execution Confirmation. A failed deletion preserves the remaining copy and leaves the Mirror Invariant unresolved.
+- A Resolution Run starts with Fresh Analysis, binds every reviewed decision to both peer revisions and the applicable Sync Baseline state, and refuses stale content, metadata, path identity, or baseline evidence. Data-changing resolutions require fresh Execution Confirmation; failed actions remain unresolved and preserved.
 - Preserved conflict copies use the effective destination naming policy to reserve deterministic generated paths before execution. The local preserved-copy boundary creates each copy with no-replace installation, verifies its content, and reports any failed copy as Review Later; a later Resolution Run owns explicit removal.
 - Only successfully reconciled and verified paths enter the Sync Baseline.
 
