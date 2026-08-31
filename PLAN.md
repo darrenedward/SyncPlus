@@ -168,6 +168,8 @@ The shared core `RunWorkflow` persists the frozen Source Inventory and complete 
 - One-way conflicts use source authority by default.
 - A per-path override may retain the destination version; under Safe Delete, the source is removed only after the retained destination is verified.
 - Mirror conflicts have no implicit winner. Choices include Keep Peer A, Keep Peer B, Preserve Both, Rename/Preserve for Review, or Defer.
+- The core `ConflictReview` is read-only: same-path differences retain both peer evidences, text previews are bounded in memory, and binary, large, or unreadable files expose only safe metadata and available hashes.
+- Same-hash files at different paths are emitted as possible duplicate/rename candidates only. Structured destination compatibility conflicts use the same review entries and remain blocked from mutation.
 - Preserved copies receive deterministic human-readable collision-safe names and remain listed with both original and new paths under the report's conflict section.
 - A skipped/deferred item keeps the run open. Removing an item from scope is an explicit recorded decision and does not count as a successful transfer.
 - Same-hash files at different paths are possible duplicates/rename candidates only; hash equality never automatically moves or deletes them.

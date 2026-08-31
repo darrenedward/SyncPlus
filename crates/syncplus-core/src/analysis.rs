@@ -609,6 +609,12 @@ impl FreshAnalysis {
         &self.plan
     }
 
+    /// Build the read-only Conflict Review for this frozen analysis. The
+    /// review contains evidence only; it never adds an execution action.
+    pub fn conflict_review(&self) -> crate::ConflictReview {
+        crate::ConflictReview::from_analysis(self)
+    }
+
     pub fn revision(&self) -> AnalysisRevision {
         self.revision.clone()
     }
@@ -796,14 +802,9 @@ fn walk_directory(
         let content_fingerprint = if outcome == AnalysisOutcome::Included
             && item_type == ItemType::RegularFile
         {
-            Some(
-                *ContentProof::from_path(&absolute_path)
-                    .map_err(|_| AnalysisError::ReadFileContents {
-                        peer: peer.name().to_owned(),
-                        path: relative_path.clone(),
-                    })?
-                    .sha256(),
-            )
+            ContentProof::from_path(&absolute_path)
+                .ok()
+                .map(|proof| *proof.sha256())
         } else {
             None
         };

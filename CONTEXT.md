@@ -269,6 +269,12 @@ _Avoid_: Automatic merge, text editor
 
 Same-hash files at different paths open this same review with both paths visible. The matching hash is presented as evidence of byte equality, not as an automatic rename, merge, or deletion decision.
 
+The core `ConflictReview` boundary is read-only and structured. It retains
+both same-path evidences, limits text previews to a bounded in-memory size,
+and represents binary, large, or unreadable items with safe type, size, and
+hash evidence. Destination compatibility findings use the same review entry
+boundary.
+
 **Saved Secret**:
 Sensitive authentication material that SyncPlus may use for a saved connection, such as a password. Saved Secrets are optional, are not written into profiles or history, and are stored through the desktop OS keyring where available.
 _Avoid_: Credential in config, password in profile

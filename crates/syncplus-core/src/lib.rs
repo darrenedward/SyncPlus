@@ -1,6 +1,7 @@
 mod model;
 mod process;
 mod analysis;
+mod conflict;
 mod evidence;
 mod precheck;
 mod scope_lock;
@@ -30,6 +31,9 @@ pub use analysis::{
     AnalysisError, AnalysisOutcome, AnalysisRevision, ApprovedSyncScope, ConfirmedPlan,
     FreshAnalysis, InventoryItem, ItemMetadata, ItemType, OneWayPlan, PeerInventory, PeerSide,
     PlanAction, PlanActionKind, PlanError, PlanSummary, ScopeDecision, SourceInventory,
+};
+pub use conflict::{
+    ConflictEntry, ConflictEvidence, ConflictKind, ConflictReview, FileReviewClassification,
 };
 pub use evidence::{
     ActionId, ActionJournalEntry, ActionOutcome, ActionReason, FileIdentity,
@@ -76,6 +80,9 @@ mod process_tests;
 
 #[cfg(test)]
 mod analysis_tests;
+
+#[cfg(test)]
+mod conflict_tests;
 
 #[cfg(test)]
 mod evidence_tests;
