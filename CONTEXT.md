@@ -301,6 +301,7 @@ _Avoid_: Password recovery, silent unlock
 
 **SSH Server Identity**:
 The remembered host-key fingerprint used to recognize an approved SSH server. A new server requires explicit approval; a changed fingerprint is rejected and reported for review.
+Core host-trust evaluation exposes a pre-mutation permit only for an unchanged approved fingerprint; first-use and changed identities remain review decisions, and unattended runs cannot persist approval.
 _Avoid_: Hostname alone, automatic trust
 
 **SSH Authentication Preference**:

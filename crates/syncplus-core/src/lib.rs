@@ -20,6 +20,7 @@ mod restore;
 mod workflow;
 mod reconciliation;
 mod volume;
+mod ssh_host;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
@@ -27,6 +28,11 @@ pub use model::{
     OneWaySource, PartialTransferPolicy, Peer, PeerEndpoint, ProfileSnapshot, ProfileSnapshotId,
     RetryPolicy, RunEvent, RunId, RunState, SafetyViolation, SshAuthentication, SshPeer,
     SshPeerError, SyncMode, SyncOptions, SyncProfile, SyncRun, TerminalOutcome,
+};
+pub use ssh_host::{
+    HostTrustDecision, HostTrustError, HostTrustMode, HostTrustStoreError, SshHost,
+    SshHostFingerprint, SshHostFingerprintError, SshHostIdentityError, SshHostIdentityProbe,
+    SshHostTrustController, SshHostTrustPermit,
 };
 pub use process::{
     EnvironmentBinding, ProcessArgument, ProcessInvocation, ProcessSpecError,
