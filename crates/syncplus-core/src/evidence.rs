@@ -14,7 +14,7 @@ use crate::{
     ProfileSnapshotId, ReconciliationFindingKind, ReconciliationReason, RetryPolicy, RunId,
     SourceDrainStatus, SourceInventorySnapshot, SyncMode, SyncOptions, SyncProfile,
     ValidatedSyncOptions, CompletionReconciliation, AnalysisOutcome, InventorySnapshotItem,
-    VolumeIdentity,
+    VolumeIdentity, SyncBaseline, SyncBaselineItem, SyncBaselineItemState,
 };
 
 pub type ActionId = u64;
@@ -745,7 +745,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 8 {
+        if version > 9 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -959,6 +959,54 @@ impl RunEvidenceStore {
                 ",
             )?;
             transaction.pragma_update(None, "user_version", 8)?;
+            transaction.commit()?;
+            version = 8;
+        }
+        if version == 8 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                CREATE TABLE sync_baselines (
+                    profile_name TEXT PRIMARY KEY,
+                    peer_a_name TEXT NOT NULL,
+                    peer_a_root BLOB NOT NULL,
+                    peer_b_name TEXT NOT NULL,
+                    peer_b_root BLOB NOT NULL,
+                    metadata_file_type INTEGER NOT NULL,
+                    metadata_executable_permissions INTEGER NOT NULL,
+                    metadata_symlink_targets INTEGER NOT NULL,
+                    metadata_timestamps INTEGER NOT NULL,
+                    metadata_ownership INTEGER NOT NULL,
+                    metadata_access_control_lists INTEGER NOT NULL,
+                    metadata_extended_attributes INTEGER NOT NULL
+                );
+                CREATE TABLE sync_baseline_items (
+                    profile_name TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    relative_path BLOB NOT NULL,
+                    peer_a_present INTEGER NOT NULL,
+                    peer_a_item_type TEXT,
+                    peer_a_size INTEGER,
+                    peer_a_modified_at_unix_nanos INTEGER,
+                    peer_a_readonly INTEGER,
+                    peer_a_permissions INTEGER,
+                    peer_a_symlink_target BLOB,
+                    peer_a_content_fingerprint BLOB,
+                    peer_b_present INTEGER NOT NULL,
+                    peer_b_item_type TEXT,
+                    peer_b_size INTEGER,
+                    peer_b_modified_at_unix_nanos INTEGER,
+                    peer_b_readonly INTEGER,
+                    peer_b_permissions INTEGER,
+                    peer_b_symlink_target BLOB,
+                    peer_b_content_fingerprint BLOB,
+                    PRIMARY KEY (profile_name, ordinal),
+                    UNIQUE (profile_name, relative_path),
+                    FOREIGN KEY (profile_name) REFERENCES sync_baselines(profile_name) ON DELETE CASCADE
+                );
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 9)?;
             transaction.commit()?;
         }
         verify_integrity(&connection)?;
@@ -1220,6 +1268,260 @@ impl RunEvidenceStore {
             )
             .collect::<Result<Vec<_>, StorageError>>()?;
         Ok(SourceInventorySnapshot::from_parts(peer_name, root, items))
+    }
+
+    /// Atomically merge settled Mirror paths into the durable Sync Baseline.
+    /// Existing paths remain settled when a later run leaves another path
+    /// unresolved; only the paths in `baseline` are replaced.
+    pub fn update_mirror_baseline(&mut self, baseline: &SyncBaseline) -> Result<(), StorageError> {
+        let baseline = match self.load_mirror_baseline(baseline.profile_name())? {
+            Some(existing) => existing.merge_settled(baseline),
+            None => baseline.clone(),
+        };
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO sync_baselines (
+                profile_name, peer_a_name, peer_a_root, peer_b_name, peer_b_root,
+                metadata_file_type, metadata_executable_permissions,
+                metadata_symlink_targets, metadata_timestamps, metadata_ownership,
+                metadata_access_control_lists, metadata_extended_attributes
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                baseline.profile_name(),
+                baseline.peer_a_name(),
+                path_to_blob(baseline.peer_a_root()),
+                baseline.peer_b_name(),
+                path_to_blob(baseline.peer_b_root()),
+                bool_to_int(baseline.metadata_requirements().file_type()),
+                bool_to_int(baseline.metadata_requirements().executable_permissions()),
+                bool_to_int(baseline.metadata_requirements().symlink_targets()),
+                bool_to_int(baseline.metadata_requirements().timestamps()),
+                bool_to_int(baseline.metadata_requirements().specialist_metadata().ownership()),
+                bool_to_int(
+                    baseline
+                        .metadata_requirements()
+                        .specialist_metadata()
+                        .access_control_lists(),
+                ),
+                bool_to_int(
+                    baseline
+                        .metadata_requirements()
+                        .specialist_metadata()
+                        .extended_attributes(),
+                ),
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM sync_baseline_items WHERE profile_name = ?1",
+            params![baseline.profile_name()],
+        )?;
+        for (ordinal, item) in baseline.items().iter().enumerate() {
+            let peer_a = item.peer_a();
+            let peer_b = item.peer_b();
+            transaction.execute(
+                "INSERT INTO sync_baseline_items (
+                    profile_name, ordinal, relative_path,
+                    peer_a_present, peer_a_item_type, peer_a_size,
+                    peer_a_modified_at_unix_nanos, peer_a_readonly,
+                    peer_a_permissions, peer_a_symlink_target,
+                    peer_a_content_fingerprint, peer_b_present, peer_b_item_type,
+                    peer_b_size, peer_b_modified_at_unix_nanos, peer_b_readonly,
+                    peer_b_permissions, peer_b_symlink_target,
+                    peer_b_content_fingerprint
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                    ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                )",
+                params![
+                    baseline.profile_name(),
+                    ordinal as i64,
+                    path_to_blob(item.relative_path()),
+                    bool_to_int(peer_a.is_some()),
+                    peer_a.map(|state| encode_item_type(state.item_type())),
+                    peer_a.map(|state| state.size() as i64),
+                    peer_a.and_then(SyncBaselineItemState::modified_at_unix_nanos),
+                    peer_a.map(|state| bool_to_int(state.is_readonly())),
+                    peer_a
+                        .and_then(SyncBaselineItemState::executable_permissions)
+                        .map(i64::from),
+                    peer_a
+                        .and_then(SyncBaselineItemState::symlink_target)
+                        .map(path_to_blob),
+                    peer_a
+                        .and_then(SyncBaselineItemState::content_fingerprint)
+                        .map(|hash| hash.to_vec()),
+                    bool_to_int(peer_b.is_some()),
+                    peer_b.map(|state| encode_item_type(state.item_type())),
+                    peer_b.map(|state| state.size() as i64),
+                    peer_b.and_then(SyncBaselineItemState::modified_at_unix_nanos),
+                    peer_b.map(|state| bool_to_int(state.is_readonly())),
+                    peer_b
+                        .and_then(SyncBaselineItemState::executable_permissions)
+                        .map(i64::from),
+                    peer_b
+                        .and_then(SyncBaselineItemState::symlink_target)
+                        .map(path_to_blob),
+                    peer_b
+                        .and_then(SyncBaselineItemState::content_fingerprint)
+                        .map(|hash| hash.to_vec()),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn load_mirror_baseline(
+        &self,
+        profile_name: &str,
+    ) -> Result<Option<SyncBaseline>, StorageError> {
+        let metadata = self
+            .connection
+            .query_row(
+                "SELECT peer_a_name, peer_a_root, peer_b_name, peer_b_root,
+                        metadata_file_type, metadata_executable_permissions,
+                        metadata_symlink_targets, metadata_timestamps,
+                        metadata_ownership, metadata_access_control_lists,
+                        metadata_extended_attributes
+                 FROM sync_baselines WHERE profile_name = ?1",
+                params![profile_name],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            peer_a_name,
+            peer_a_root,
+            peer_b_name,
+            peer_b_root,
+            file_type,
+            executable_permissions,
+            symlink_targets,
+            timestamps,
+            ownership,
+            access_control_lists,
+            extended_attributes,
+        )) = metadata
+        else {
+            return Ok(None);
+        };
+        let specialist = crate::SpecialistMetadataRequirements::new(
+            decode_bool(ownership, "baseline ownership requirement")?,
+            decode_bool(access_control_lists, "baseline ACL requirement")?,
+            decode_bool(extended_attributes, "baseline extended-attribute requirement")?,
+        );
+        let metadata_requirements = MetadataRequirements::new(
+            decode_bool(file_type, "baseline file-type requirement")?,
+            decode_bool(executable_permissions, "baseline executable-permission requirement")?,
+            decode_bool(symlink_targets, "baseline symlink-target requirement")?,
+            decode_bool(timestamps, "baseline timestamp requirement")?,
+        )
+        .with_specialist_metadata(specialist);
+
+        let mut statement = self.connection.prepare(
+            "SELECT relative_path, peer_a_present, peer_a_item_type, peer_a_size,
+                    peer_a_modified_at_unix_nanos, peer_a_readonly, peer_a_permissions,
+                    peer_a_symlink_target, peer_a_content_fingerprint, peer_b_present,
+                    peer_b_item_type, peer_b_size, peer_b_modified_at_unix_nanos,
+                    peer_b_readonly, peer_b_permissions, peer_b_symlink_target,
+                    peer_b_content_fingerprint
+             FROM sync_baseline_items WHERE profile_name = ?1 ORDER BY ordinal",
+        )?;
+        let rows = statement
+            .query_map(params![profile_name], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                    row.get::<_, Option<Vec<u8>>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, Option<Vec<u8>>>(15)?,
+                    row.get::<_, Option<Vec<u8>>>(16)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let items = rows
+            .into_iter()
+            .map(
+                |(
+                    relative_path,
+                    peer_a_present,
+                    peer_a_item_type,
+                    peer_a_size,
+                    peer_a_modified,
+                    peer_a_readonly,
+                    peer_a_permissions,
+                    peer_a_symlink,
+                    peer_a_hash,
+                    peer_b_present,
+                    peer_b_item_type,
+                    peer_b_size,
+                    peer_b_modified,
+                    peer_b_readonly,
+                    peer_b_permissions,
+                    peer_b_symlink,
+                    peer_b_hash,
+                )| {
+                    let peer_a = decode_baseline_state(
+                        peer_a_present,
+                        peer_a_item_type,
+                        peer_a_size,
+                        peer_a_modified,
+                        peer_a_readonly,
+                        peer_a_permissions,
+                        peer_a_symlink,
+                        peer_a_hash,
+                    )?;
+                    let peer_b = decode_baseline_state(
+                        peer_b_present,
+                        peer_b_item_type,
+                        peer_b_size,
+                        peer_b_modified,
+                        peer_b_readonly,
+                        peer_b_permissions,
+                        peer_b_symlink,
+                        peer_b_hash,
+                    )?;
+                    Ok(SyncBaselineItem::from_parts(
+                        blob_to_path(&relative_path)?,
+                        peer_a,
+                        peer_b,
+                    ))
+                },
+            )
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        Ok(Some(SyncBaseline::from_parts(
+            profile_name.to_owned(),
+            peer_a_name,
+            blob_to_path(&peer_a_root)?,
+            peer_b_name,
+            blob_to_path(&peer_b_root)?,
+            metadata_requirements,
+            items,
+        )))
     }
 
     /// Persist the independent Completion Reconciliation result as durable
@@ -3372,6 +3674,75 @@ fn path_to_blob(path: &Path) -> Vec<u8> {
 
 fn volume_identity_to_blob(identity: VolumeIdentity) -> Vec<u8> {
     identity.device().to_le_bytes().to_vec()
+}
+
+fn decode_bool(value: i64, field: &str) -> Result<bool, StorageError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(StorageError::CorruptEvidence(format!(
+            "{field} is not a boolean"
+        ))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_baseline_state(
+    present: i64,
+    item_type: Option<String>,
+    size: Option<i64>,
+    modified_at_unix_nanos: Option<i64>,
+    readonly: Option<i64>,
+    permissions: Option<i64>,
+    symlink_target: Option<Vec<u8>>,
+    content_fingerprint: Option<Vec<u8>>,
+) -> Result<Option<SyncBaselineItemState>, StorageError> {
+    let present = decode_bool(present, "baseline item presence")?;
+    if !present {
+        if item_type.is_some()
+            || size.is_some()
+            || modified_at_unix_nanos.is_some()
+            || readonly.is_some()
+            || permissions.is_some()
+            || symlink_target.is_some()
+            || content_fingerprint.is_some()
+        {
+            return Err(StorageError::CorruptEvidence(
+                "absent baseline item contains state".to_owned(),
+            ));
+        }
+        return Ok(None);
+    }
+
+    let item_type = decode_item_type(item_type.as_deref().ok_or_else(|| {
+        StorageError::CorruptEvidence("present baseline item has no item type".to_owned())
+    })?)?;
+    let size = u64::try_from(size.ok_or_else(|| {
+        StorageError::CorruptEvidence("present baseline item has no size".to_owned())
+    })?)
+    .map_err(|_| StorageError::CorruptEvidence("baseline item has a negative size".to_owned()))?;
+    let readonly = decode_bool(
+        readonly.ok_or_else(|| {
+            StorageError::CorruptEvidence("present baseline item has no readonly flag".to_owned())
+        })?,
+        "baseline readonly flag",
+    )?;
+    let permissions = permissions
+        .map(|permissions| {
+            u32::try_from(permissions).map_err(|_| {
+                StorageError::CorruptEvidence("baseline item has invalid permissions".to_owned())
+            })
+        })
+        .transpose()?;
+    Ok(Some(SyncBaselineItemState::from_parts(
+        item_type,
+        size,
+        modified_at_unix_nanos,
+        readonly,
+        permissions,
+        symlink_target.as_deref().map(blob_to_path).transpose()?,
+        decode_hash(content_fingerprint.as_deref())?,
+    )))
 }
 
 fn decode_volume_identity(bytes: Option<&[u8]>) -> Result<Option<VolumeIdentity>, StorageError> {
