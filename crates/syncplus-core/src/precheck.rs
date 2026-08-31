@@ -654,6 +654,11 @@ impl RunPrecheck {
     ) -> Result<PrecheckResult, PrecheckErrorKind> {
         let specification =
             ProcessSpecification::from_profile(profile).map_err(PrecheckErrorKind::InvalidSpecification)?;
+        if profile.peer_a().is_ssh() || profile.peer_b().is_ssh() {
+            return Err(PrecheckErrorKind::InvalidSpecification(
+                ProcessSpecError::UnsupportedSshFilesystemOperation,
+            ));
+        }
         let (source_peer, destination_peer) = selected_peers(profile);
         let source = source_peer.root();
         let destination = destination_peer.root();

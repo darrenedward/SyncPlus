@@ -1,8 +1,9 @@
 use std::{fs, path::PathBuf};
 
 use crate::{
-    DeletionMethod, FreshAnalysis, MetadataRequirements, OneWaySource, ProcessArgument, ProcessSpecError,
-    ProcessSpecification, Peer, RsyncFlag, SshAuthentication, SshPeer, SshPeerError, SyncMode,
+    AnalysisError, AuthorizationSnapshot, DeletionMethod, FreshAnalysis, MetadataRequirements,
+    OneWaySource, ProcessArgument, ProcessSpecError, ProcessSpecification, Peer, RsyncFlag,
+    RunId, RunSnapshot, SshAuthentication, SshPeer, SshPeerError, StorageError, SyncMode,
     SyncOptions, SyncProfile,
     SpecialistMetadataRequirements,
 };
@@ -203,6 +204,24 @@ fn two_ssh_peers_are_rejected_before_process_construction() {
     .expect_err("SSH-to-SSH is outside the supported topology");
 
     assert!(matches!(error, ProcessSpecError::UnsupportedSshTopology));
+}
+
+#[test]
+fn remote_peers_are_blocked_from_local_filesystem_workflows() {
+    let profile = SyncProfile::new(
+        "SSH workflow boundary",
+        Peer::new("Local", PathBuf::from("/home/user/source")),
+        ssh_peer("/srv/sync"),
+    );
+
+    assert!(matches!(
+        FreshAnalysis::analyze(&profile),
+        Err(AnalysisError::UnsupportedRemotePeer { peer }) if peer == "SSH peer"
+    ));
+    assert!(matches!(
+        RunSnapshot::from_profile(RunId::new(1), &profile, AuthorizationSnapshot::default()),
+        Err(StorageError::UnsupportedRemotePeer)
+    ));
 }
 
 #[test]

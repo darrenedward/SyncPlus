@@ -784,6 +784,7 @@ fn analysis_error_path(profile: &SyncProfile, error: &AnalysisError) -> Option<P
             })
         }
         AnalysisError::ProcessSpecification(_)
+        | AnalysisError::UnsupportedRemotePeer { .. }
         | AnalysisError::Plan(_)
         | AnalysisError::ProfileChanged
         | AnalysisError::StaleAnalysis { .. } => Some(selected_destination_root(profile).to_path_buf()),

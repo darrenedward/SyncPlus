@@ -171,7 +171,7 @@ pub enum ProcessSpecError {
     InvalidSecretBinding { value: String },
     UnsupportedSyncMode,
     UnsupportedSshTopology,
-    UnsupportedSshItemTransfer,
+    UnsupportedSshFilesystemOperation,
     MirrorRequiresReviewedPlan,
     ActionNotAllowed { kind: PlanActionKind },
     ActionSourceMismatch,
@@ -203,8 +203,8 @@ impl fmt::Display for ProcessSpecError {
             Self::UnsupportedSshTopology => {
                 write!(formatter, "SSH-to-SSH synchronization is not supported")
             }
-            Self::UnsupportedSshItemTransfer => {
-                write!(formatter, "per-item SSH transfer is not available yet")
+            Self::UnsupportedSshFilesystemOperation => {
+                write!(formatter, "local filesystem operations cannot use an SSH peer yet")
             }
             Self::MirrorRequiresReviewedPlan => write!(
                 formatter,
@@ -456,7 +456,7 @@ impl ProcessSpecification {
         temporary_destination: &Path,
     ) -> Result<ProcessInvocation, ProcessSpecError> {
         if self.ssh_transport.is_some() {
-            return Err(ProcessSpecError::UnsupportedSshItemTransfer);
+            return Err(ProcessSpecError::UnsupportedSshFilesystemOperation);
         }
         validate_peer_path("item source", source)?;
         validate_peer_path("temporary destination", temporary_destination)?;
@@ -499,6 +499,7 @@ impl ProcessSpecification {
         if self.mode == SyncMode::OneWay && action.source_side() != PeerSide::from(self.source) {
             return Err(ProcessSpecError::ActionSourceMismatch);
         }
+        self.ensure_local_filesystem_operations()?;
         validate_relative_transfer_path(action.relative_path())?;
         Ok((
             self.source_path(action)?,
@@ -510,6 +511,7 @@ impl ProcessSpecification {
         if self.mode == SyncMode::OneWay && action.source_side() != PeerSide::from(self.source) {
             return Err(ProcessSpecError::ActionSourceMismatch);
         }
+        self.ensure_local_filesystem_operations()?;
         validate_relative_transfer_path(action.relative_path())?;
         let root = match action.source_side() {
             PeerSide::PeerA => &self.peer_a_root,
@@ -525,6 +527,7 @@ impl ProcessSpecification {
         if self.mode == SyncMode::OneWay && action.source_side() != PeerSide::from(self.source) {
             return Err(ProcessSpecError::ActionSourceMismatch);
         }
+        self.ensure_local_filesystem_operations()?;
         validate_relative_transfer_path(action.relative_path())?;
         let root = match action.source_side() {
             PeerSide::PeerA => &self.peer_b_root,
@@ -546,6 +549,14 @@ impl ProcessSpecification {
         self.invocation()
             .expect("a validated One-Way specification has a whole-tree invocation")
             .preview()
+    }
+
+    fn ensure_local_filesystem_operations(&self) -> Result<(), ProcessSpecError> {
+        if self.ssh_transport.is_some() {
+            Err(ProcessSpecError::UnsupportedSshFilesystemOperation)
+        } else {
+            Ok(())
+        }
     }
 }
 
