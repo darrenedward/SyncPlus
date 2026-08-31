@@ -20,6 +20,7 @@ mod restore;
 mod workflow;
 mod reconciliation;
 mod volume;
+mod ssh_host;
 mod ssh;
 
 pub use model::{
@@ -34,6 +35,11 @@ pub use ssh::{
     AskpassError, AskpassProvider, CredentialAvailability, CredentialResolutionError,
     CredentialResolver, DesktopKeyring, PasswordSource, ResolvedSshCredential, SecretStore,
     SecretStoreError, SecretValue, SshRunMode, SystemCredentialAvailability, SSH_KEYRING_SERVICE,
+};
+pub use ssh_host::{
+    HostTrustDecision, HostTrustError, HostTrustMode, HostTrustStoreError, SshHost,
+    SshHostFingerprint, SshHostFingerprintError, SshHostIdentityError, SshHostIdentityProbe,
+    SshHostTrustController, SshHostTrustPermit,
 };
 pub use process::{
     EnvironmentBinding, ProcessArgument, ProcessInvocation, ProcessSpecError,

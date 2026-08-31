@@ -869,7 +869,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 10 {
+        if version > 11 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -1158,6 +1158,23 @@ impl RunEvidenceStore {
                 ",
             )?;
             transaction.pragma_update(None, "user_version", 10)?;
+            transaction.commit()?;
+            version = 10;
+        }
+        if version == 10 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                CREATE TABLE ssh_host_fingerprints (
+                    server TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    algorithm TEXT NOT NULL,
+                    digest BLOB NOT NULL,
+                    PRIMARY KEY (server, port)
+                );
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 11)?;
             transaction.commit()?;
         }
         verify_integrity(&connection)?;
@@ -2360,6 +2377,65 @@ impl RunEvidenceStore {
             params![run_id.value()],
         )?;
         Ok(())
+    }
+}
+
+impl RunEvidenceStore {
+    pub(crate) fn load_ssh_host_fingerprint(
+        &self,
+        host: &crate::SshHost,
+    ) -> Result<Option<crate::SshHostFingerprint>, crate::HostTrustStoreError> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT algorithm, digest FROM ssh_host_fingerprints
+                 WHERE server = ?1 AND port = ?2",
+                rusqlite::params![host.server(), host.port() as i64],
+                |row| {
+                    let algorithm = row.get::<_, String>(0)?;
+                    let digest = row.get::<_, Vec<u8>>(1)?;
+                    Ok((algorithm, digest))
+                },
+            )
+            .optional()
+            .map_err(|error| crate::HostTrustStoreError::Storage(error.to_string()))?;
+
+        stored
+            .map(|(algorithm, digest)| {
+                crate::SshHostFingerprint::from_storage(&algorithm, &digest).map_err(|error| {
+                    crate::HostTrustStoreError::Storage(error.to_string())
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn approve_ssh_host_fingerprint(
+        &mut self,
+        host: &crate::SshHost,
+        fingerprint: &crate::SshHostFingerprint,
+    ) -> Result<(), crate::HostTrustStoreError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| crate::HostTrustStoreError::Storage(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO ssh_host_fingerprints (server, port, algorithm, digest)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(server, port) DO UPDATE SET
+                    algorithm = excluded.algorithm,
+                    digest = excluded.digest",
+                rusqlite::params![
+                    host.server(),
+                    host.port() as i64,
+                    fingerprint.algorithm(),
+                    fingerprint.digest().as_slice(),
+                ],
+            )
+            .map_err(|error| crate::HostTrustStoreError::Storage(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| crate::HostTrustStoreError::Storage(error.to_string()))
     }
 }
 
@@ -4155,5 +4231,44 @@ fn blob_to_path(bytes: &[u8]) -> Result<PathBuf, StorageError> {
         String::from_utf8(bytes.to_vec())
             .map(PathBuf::from)
             .map_err(|_| StorageError::CorruptEvidence("stored path is not valid text".to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_version_ten_database_migrates_host_trust_state_to_version_eleven() {
+        let store = RunEvidenceStore::open_in_memory().expect("SQLite store should open");
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE ssh_host_fingerprints;
+                 PRAGMA user_version = 10;",
+            )
+            .expect("fixture should represent a version ten database");
+
+        let migrated = RunEvidenceStore::from_connection(store.connection)
+            .expect("version ten database should migrate");
+        let version: i64 = migrated
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("schema version should be readable");
+
+        assert_eq!(version, 11);
+        assert!(
+            migrated
+                .connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'ssh_host_fingerprints'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .expect("host trust table lookup should succeed")
+                .is_some()
+        );
     }
 }
