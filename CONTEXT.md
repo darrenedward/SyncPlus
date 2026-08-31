@@ -379,6 +379,7 @@ A Scheduled Run that starts automatically remains Unattended. A user selecting *
 
 **Remote Rsync Capability Preflight**:
 Before any SSH-backed Sync Run can change files, SyncPlus verifies that the remote peer has a compatible `rsync` capability and that the required invocation is supported. A connection that authenticates successfully is not sufficient. If the capability is missing or incompatible, the affected operation stops before file changes, preserves the source, and reports clear remediation.
+The core remote precheck accepts only a selected credential and approved host-identity permit, checks the remote account's requested access, hashing, rsync, and verified Trash capabilities, and yields no execution permit while any requirement is missing.
 _Avoid_: Starting a transfer after connectivity-only checks, silently installing tools, or falling back to an unverified destructive method
 
 **Run Precheck**:

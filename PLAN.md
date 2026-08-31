@@ -211,6 +211,7 @@ V1 supports one local peer and one SSH peer in either direction. SSH-to-SSH is n
 - A new host fingerprint requires explicit approval. A changed fingerprint is rejected and reported for review.
 - Host-trust state is persisted as a nonsecret server/port fingerprint record; only an explicit interactive approval can create or replace that record.
 - A non-mutating remote preflight verifies compatible `rsync` and controlled SHA-256 capability before changes.
+- Remote preflight also verifies the authenticated account's requested access and remote Trash location/access when recovery is required; missing capabilities block without an execution permit or fallback.
 - After transfer, SyncPlus verifies the actual remote destination digest. If it cannot obtain or match the digest, the source remains preserved.
 - Remote Trash requires a verified recovery location and access for the remote account. Otherwise deletion stops or requires the separately authorized Permanent Removal option.
 - Server, username, port, identity, and remote path are structured fields. User values are safely encoded into controlled process arguments; no arbitrary remote command is accepted.

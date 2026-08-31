@@ -3,7 +3,12 @@ use std::{fs, path::PathBuf};
 use crate::{
     AccessSnapshot, DestinationNamingPolicy, DeletionMethod, Peer,
     PeerScopeLockRegistry, PrecheckBlockerKind, PrecheckFailure, PrecheckProbe, RunId,
-    RunPrecheck, ScopeLockOwner, SyncMode, SyncOptions, SyncProfile,
+    RemoteAccessRequirements, RemotePrecheckBlockerKind, RemotePrecheckObservation,
+    RemotePrecheckRequest, RemoteRsyncCapability, RemoteSha256Capability,
+    RemoteTrashCapability, ResolvedSshCredential, RunEvidenceStore, RunPrecheck,
+    ScopeLockOwner, SshHostFingerprint, SshHostIdentityError, SshHostIdentityProbe,
+    SshHostTrustController, SshPeer, SshRemotePrecheck, SshRemotePrecheckProbe,
+    SyncMode, SyncOptions, SyncProfile,
 };
 
 #[derive(Clone)]
@@ -86,6 +91,232 @@ fn passing_probe() -> FakeProbe {
         naming_conflicts: Vec::new(),
         probe_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     }
+}
+
+struct FixedHostProbe(SshHostFingerprint);
+
+impl SshHostIdentityProbe for FixedHostProbe {
+    fn probe(&self, _peer: &SshPeer) -> Result<SshHostFingerprint, SshHostIdentityError> {
+        Ok(self.0)
+    }
+}
+
+struct FixedRemoteProbe {
+    observation: RemotePrecheckObservation,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SshRemotePrecheckProbe for FixedRemoteProbe {
+    fn probe(
+        &self,
+        _peer: &SshPeer,
+        _credential: &ResolvedSshCredential,
+        _host_permit: &crate::SshHostTrustPermit,
+        _request: &RemotePrecheckRequest,
+    ) -> Result<RemotePrecheckObservation, crate::PrecheckError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.observation.clone())
+    }
+}
+
+fn remote_peer() -> SshPeer {
+    SshPeer::new(
+        "backup.example.test",
+        "sync-user",
+        2222,
+        None,
+        crate::SshAuthentication::Agent,
+        "/srv/sync",
+    )
+    .expect("SSH fixture should be valid")
+}
+
+fn approved_host_permit(peer: &SshPeer) -> crate::SshHostTrustPermit {
+    let mut controller = SshHostTrustController::new(
+        RunEvidenceStore::open_in_memory().expect("SQLite store should open"),
+    );
+    let probe = FixedHostProbe(SshHostFingerprint::sha256([7; 32]));
+    let decision = controller
+        .inspect(peer, &probe)
+        .expect("host fingerprint probe should succeed");
+    controller
+        .approve(peer, &decision, crate::HostTrustMode::Interactive)
+        .expect("interactive approval should persist");
+    controller
+        .pre_mutation_permit(peer, &probe)
+        .expect("approved host should provide a permit")
+}
+
+#[test]
+fn remote_precheck_requires_trusted_authentication_and_all_requested_capabilities() {
+    let peer = remote_peer();
+    let host_permit = approved_host_permit(&peer);
+    let request = RemotePrecheckRequest::new(
+        RemoteAccessRequirements::new(false, true, true),
+        true,
+    );
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe = FixedRemoteProbe {
+        observation: RemotePrecheckObservation::new(
+            true,
+            AccessSnapshot::new(true, true, true),
+            RemoteRsyncCapability::Compatible,
+            RemoteSha256Capability::Available,
+            RemoteTrashCapability::verified("/srv/.syncplus-trash")
+                .expect("Trash fixture should have a location"),
+        ),
+        calls: calls.clone(),
+    };
+
+    let result = SshRemotePrecheck::check(
+        &peer,
+        &ResolvedSshCredential::Agent,
+        &host_permit,
+        &request,
+        &probe,
+    )
+    .expect("remote capability probe should complete");
+
+    assert!(result.can_execute());
+    assert_eq!(result.account(), "sync-user");
+    assert_eq!(result.path(), std::path::Path::new("/srv/sync"));
+    assert_eq!(result.trash_location(), Some(std::path::Path::new("/srv/.syncplus-trash")));
+    let permit = result
+        .require_passed()
+        .expect("all remote capabilities should yield a precheck permit");
+    assert_eq!(permit.host(), host_permit.host());
+    assert_eq!(permit.trash_location(), Some(std::path::Path::new("/srv/.syncplus-trash")));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
+fn remote_precheck_blocks_without_falling_back_when_capabilities_are_missing() {
+    let peer = remote_peer();
+    let host_permit = approved_host_permit(&peer);
+    let request = RemotePrecheckRequest::new(
+        RemoteAccessRequirements::new(true, true, true),
+        true,
+    );
+    let probe = FixedRemoteProbe {
+        observation: RemotePrecheckObservation::new(
+            false,
+            AccessSnapshot::new(false, false, false),
+            RemoteRsyncCapability::Missing,
+            RemoteSha256Capability::Unavailable,
+            RemoteTrashCapability::unavailable(),
+        ),
+        calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+
+    let result = SshRemotePrecheck::check(
+        &peer,
+        &ResolvedSshCredential::Agent,
+        &host_permit,
+        &request,
+        &probe,
+    )
+    .expect("missing capabilities should be represented as blockers");
+
+    assert!(!result.can_execute());
+    assert_eq!(result.trash_location(), None);
+    let blockers = result.blockers().to_vec();
+    assert!(result
+        .require_passed()
+        .expect_err("blocked remote precheck must not provide a mutation permit")
+        .blockers()
+        .iter()
+        .all(|blocker| {
+            !blocker.account().is_empty()
+                && !blocker.path().as_os_str().is_empty()
+                && !blocker.requirement().is_empty()
+                && !blocker.reason().is_empty()
+                && !blocker.remediation().is_empty()
+        }));
+    let kinds: Vec<_> = blockers.iter().map(|blocker| blocker.kind()).collect();
+    assert!(kinds.contains(&RemotePrecheckBlockerKind::AuthenticationUnavailable));
+    assert!(kinds.contains(&RemotePrecheckBlockerKind::AccountPermission));
+    assert!(kinds.contains(&RemotePrecheckBlockerKind::RemoteRsyncUnavailable));
+    assert!(kinds.contains(&RemotePrecheckBlockerKind::RemoteSha256Unavailable));
+    assert!(kinds.contains(&RemotePrecheckBlockerKind::RemoteTrashUnavailable));
+}
+
+#[test]
+fn remote_precheck_request_derives_directional_access_and_recovery_requirements() {
+    let local = Peer::new("local", PathBuf::from("/local"));
+    let remote = Peer::from_ssh("remote", remote_peer());
+    let push = SyncProfile::new("push", local.clone(), remote.clone());
+    let (_, push_request) = RemotePrecheckRequest::from_profile(&push)
+        .expect("local-to-SSH profile should derive a request");
+    assert_eq!(push_request.access(), RemoteAccessRequirements::new(false, true, false));
+    assert!(!push_request.require_recovery());
+
+    let pull = SyncProfile::new("pull", local, remote)
+        .with_source(crate::OneWaySource::PeerB)
+        .with_options(SyncOptions {
+            safe_delete: true,
+            deletion_method: Some(DeletionMethod::Trash),
+            ..SyncOptions::default()
+        });
+    let (_, pull_request) = RemotePrecheckRequest::from_profile(&pull)
+        .expect("SSH-to-local profile should derive a request");
+    assert_eq!(pull_request.access(), RemoteAccessRequirements::new(true, false, true));
+    assert!(pull_request.require_recovery());
+}
+
+#[test]
+fn remote_precheck_rejects_a_mismatched_host_permit_or_credential_before_probing() {
+    let peer = remote_peer();
+    let host_permit = approved_host_permit(&peer);
+    let request = RemotePrecheckRequest::new(
+        RemoteAccessRequirements::new(false, true, false),
+        false,
+    );
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe = FixedRemoteProbe {
+        observation: RemotePrecheckObservation::new(
+            true,
+            AccessSnapshot::new(true, true, true),
+            RemoteRsyncCapability::Compatible,
+            RemoteSha256Capability::Available,
+            RemoteTrashCapability::unavailable(),
+        ),
+        calls: calls.clone(),
+    };
+
+    let other_peer = SshPeer::new(
+        "other.example.test",
+        "sync-user",
+        2222,
+        None,
+        crate::SshAuthentication::Agent,
+        "/srv/sync",
+    )
+    .expect("SSH fixture should be valid");
+    assert_eq!(
+        SshRemotePrecheck::check(
+            &other_peer,
+            &ResolvedSshCredential::Agent,
+            &host_permit,
+            &request,
+            &probe,
+        ),
+        Err(crate::RemotePrecheckError::HostTrustPermitMismatch)
+    );
+    assert_eq!(
+        SshRemotePrecheck::check(
+            &peer,
+            &ResolvedSshCredential::Password {
+                source: crate::PasswordSource::InteractiveAskpass,
+                secret: crate::SecretValue::new("not-for-logs"),
+            },
+            &host_permit,
+            &request,
+            &probe,
+        ),
+        Err(crate::RemotePrecheckError::CredentialDoesNotMatchPeer)
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
 
 #[test]
