@@ -24,13 +24,13 @@ mod volume;
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
     SpecialistMetadataRequirements,
-    OneWaySource, PartialTransferPolicy, Peer, ProfileSnapshot, ProfileSnapshotId, RetryPolicy,
-    RunEvent, RunId, RunState, SafetyViolation, SyncMode, SyncOptions, SyncProfile, SyncRun,
-    TerminalOutcome,
+    OneWaySource, PartialTransferPolicy, Peer, PeerEndpoint, ProfileSnapshot, ProfileSnapshotId,
+    RetryPolicy, RunEvent, RunId, RunState, SafetyViolation, SshAuthentication, SshPeer,
+    SshPeerError, SyncMode, SyncOptions, SyncProfile, SyncRun, TerminalOutcome,
 };
 pub use process::{
     EnvironmentBinding, ProcessArgument, ProcessInvocation, ProcessSpecError,
-    ProcessSpecification, RsyncFlag, ValidatedSyncOptions,
+    ProcessSpecification, RsyncFlag, SshTarget, SshTransport, ValidatedSyncOptions,
 };
 pub use analysis::{
     AnalysisError, AnalysisOutcome, AnalysisRevision, ApprovedSyncScope, ConfirmedPlan,
