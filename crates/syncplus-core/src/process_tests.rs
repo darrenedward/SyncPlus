@@ -1,8 +1,9 @@
 use std::{fs, path::PathBuf};
 
 use crate::{
-    DeletionMethod, FreshAnalysis, OneWaySource, ProcessArgument, ProcessSpecError,
+    DeletionMethod, FreshAnalysis, MetadataRequirements, OneWaySource, ProcessArgument, ProcessSpecError,
     ProcessSpecification, Peer, RsyncFlag, SyncOptions, SyncProfile,
+    SpecialistMetadataRequirements,
 };
 
 fn profile(source: PathBuf, destination: PathBuf) -> SyncProfile {
@@ -24,6 +25,23 @@ fn unknown_and_destructive_raw_options_are_rejected() {
         RsyncFlag::try_from("--delete"),
         Err(ProcessSpecError::ArbitraryArgument { .. })
     ));
+}
+
+#[test]
+fn specialist_metadata_is_named_and_disabled_by_default() {
+    let defaults = MetadataRequirements::default().specialist_metadata();
+    assert!(!defaults.any());
+
+    let specialist = MetadataRequirements::default().with_specialist_metadata(
+        SpecialistMetadataRequirements::new(false, true, true),
+    );
+    let specification = ProcessSpecification::from_profile(
+        &profile(PathBuf::from("/source"), PathBuf::from("/destination"))
+            .with_options(SyncOptions { metadata: specialist, ..SyncOptions::default() }),
+    )
+    .expect("named specialist options should validate");
+    assert!(specification.arguments().contains(&ProcessArgument::Flag(RsyncFlag::Acls)));
+    assert!(specification.arguments().contains(&ProcessArgument::Flag(RsyncFlag::Xattrs)));
 }
 
 #[test]

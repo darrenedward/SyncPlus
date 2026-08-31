@@ -16,6 +16,8 @@ pub enum RsyncFlag {
     Compress,
     DestinationCleanup,
     EndOfOptions,
+    Acls,
+    Xattrs,
 }
 
 impl RsyncFlag {
@@ -26,6 +28,8 @@ impl RsyncFlag {
             Self::Compress => "--compress",
             Self::DestinationCleanup => "--delete",
             Self::EndOfOptions => "--",
+            Self::Acls => "--acls",
+            Self::Xattrs => "--xattrs",
         }
     }
 }
@@ -184,6 +188,8 @@ impl ValidatedSyncOptions {
         self.metadata
     }
 
+    pub const fn specialist_metadata(self) -> crate::SpecialistMetadataRequirements { self.metadata.specialist_metadata() }
+
     pub const fn partial_transfer_policy(self) -> PartialTransferPolicy {
         self.partial_transfer_policy
     }
@@ -253,6 +259,13 @@ impl ProcessSpecification {
             ProcessArgument::Flag(RsyncFlag::Archive),
             ProcessArgument::Flag(RsyncFlag::ItemizeChanges),
         ];
+
+        if options.specialist_metadata().access_control_lists() {
+            arguments.push(ProcessArgument::Flag(RsyncFlag::Acls));
+        }
+        if options.specialist_metadata().extended_attributes() {
+            arguments.push(ProcessArgument::Flag(RsyncFlag::Xattrs));
+        }
 
         if options.destination_cleanup() {
             arguments.push(ProcessArgument::Flag(RsyncFlag::DestinationCleanup));
@@ -338,13 +351,24 @@ impl ProcessSpecification {
         validate_peer_path("temporary destination", temporary_destination)?;
         Ok(ProcessInvocation {
             program: OsString::from("rsync"),
-            arguments: vec![
-                ProcessArgument::Flag(RsyncFlag::Archive).to_os_string(),
-                ProcessArgument::Flag(RsyncFlag::ItemizeChanges).to_os_string(),
-                ProcessArgument::Flag(RsyncFlag::EndOfOptions).to_os_string(),
-                ProcessArgument::PeerPath(source.to_path_buf()).to_os_string(),
-                ProcessArgument::PeerPath(temporary_destination.to_path_buf()).to_os_string(),
-            ],
+            arguments: {
+                let mut arguments = vec![
+                    ProcessArgument::Flag(RsyncFlag::Archive).to_os_string(),
+                    ProcessArgument::Flag(RsyncFlag::ItemizeChanges).to_os_string(),
+                ];
+                if self.options.specialist_metadata().access_control_lists() {
+                    arguments.push(ProcessArgument::Flag(RsyncFlag::Acls).to_os_string());
+                }
+                if self.options.specialist_metadata().extended_attributes() {
+                    arguments.push(ProcessArgument::Flag(RsyncFlag::Xattrs).to_os_string());
+                }
+                arguments.extend([
+                    ProcessArgument::Flag(RsyncFlag::EndOfOptions).to_os_string(),
+                    ProcessArgument::PeerPath(source.to_path_buf()).to_os_string(),
+                    ProcessArgument::PeerPath(temporary_destination.to_path_buf()).to_os_string(),
+                ]);
+                arguments
+            },
             secret_bindings: Vec::new(),
         })
     }
