@@ -173,6 +173,66 @@ fn failed_resolution_preserves_the_item_as_unresolved() {
 }
 
 #[test]
+fn cancellation_stops_resolution_actions_and_settles_remaining_actions() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("peer-a/other.txt"), b"peer a other").unwrap();
+    fs::write(fixture.root.join("peer-b/other.txt"), b"peer b other").unwrap();
+    let profile = fixture.profile();
+    let run = ResolutionRun::start(
+        &profile,
+        [
+            decision(ConflictResolution::KeepPeerA),
+            ConflictDecision::new("other.txt", ConflictResolution::KeepPeerB),
+        ],
+        None,
+    )
+    .unwrap();
+    let confirmed = run.prepare(&profile, None, true).unwrap();
+
+    struct CancellingExecutor {
+        executed: Vec<PathBuf>,
+        cancelled: Vec<PathBuf>,
+    }
+
+    impl ResolutionActionExecutor for CancellingExecutor {
+        fn execute(
+            &mut self,
+            action: &crate::ConflictResolutionAction,
+            _analysis: &FreshAnalysis,
+        ) -> Result<(), ActionReason> {
+            self.executed.push(action.relative_path().to_path_buf());
+            Err(ActionReason::CancellationRequested)
+        }
+
+        fn cancel(
+            &mut self,
+            action: &crate::ConflictResolutionAction,
+            _analysis: &FreshAnalysis,
+        ) -> Result<(), ActionReason> {
+            self.cancelled.push(action.relative_path().to_path_buf());
+            Ok(())
+        }
+    }
+
+    let mut executor = CancellingExecutor {
+        executed: Vec::new(),
+        cancelled: Vec::new(),
+    };
+    let report = confirmed.execute(&mut executor);
+
+    assert_eq!(executor.executed.len(), 1);
+    assert_eq!(executor.cancelled.len(), 1);
+    assert_eq!(report.results().len(), 2);
+    assert!(report
+        .results()
+        .iter()
+        .all(|result| result.requires_review()));
+    assert!(report.results().iter().any(|result| {
+        result.outcome() == ResolutionRunOutcome::Unresolved(ActionReason::CancellationRequested)
+    }));
+}
+
+#[test]
 fn confirmed_keep_resolution_uses_verified_filesystem_transfer() {
     let fixture = Fixture::new();
     let profile = fixture.profile();

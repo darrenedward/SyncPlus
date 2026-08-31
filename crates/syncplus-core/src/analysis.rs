@@ -910,7 +910,9 @@ fn walk_directory(
 
 fn is_syncplus_internal_artifact(name: &std::ffi::OsStr) -> bool {
     let name = name.to_string_lossy();
-    name.starts_with(".syncplus-partial-") || name.starts_with(".syncplus-temporary-")
+    name.starts_with(".syncplus-partial-")
+        || name.starts_with(".syncplus-temporary-")
+        || name.starts_with(".syncplus-previous-")
 }
 
 fn item_type(metadata: &Metadata) -> ItemType {

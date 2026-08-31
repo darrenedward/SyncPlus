@@ -12,9 +12,10 @@ use crate::{
     AuthorizationSnapshot, DeletionMethod, ItemType, MetadataRequirements, OneWaySource, Peer,
     PeerSide, PartialTransferPolicy, PlanActionKind, ProcessSpecError, ProcessSpecification,
     ProfileSnapshotId, ReconciliationFindingKind, ReconciliationReason, RetryPolicy, RunId,
-    SourceDrainStatus, SourceInventorySnapshot, SyncMode, SyncOptions, SyncProfile,
-    ValidatedSyncOptions, CompletionReconciliation, AnalysisOutcome, InventorySnapshotItem,
-    VolumeIdentity, SyncBaseline, SyncBaselineItem, SyncBaselineItemState,
+    AnalysisOutcome, CompletionReconciliation, ConflictResolution, InventorySnapshotItem,
+    ResolutionOperation, SourceDrainStatus, SourceInventorySnapshot, SyncBaseline,
+    SyncBaselineItem, SyncBaselineItemState, SyncMode, SyncOptions, SyncProfile,
+    ValidatedSyncOptions, VolumeIdentity,
 };
 
 pub type ActionId = u64;
@@ -551,6 +552,112 @@ impl RunReportItem {
     }
 }
 
+/// The durable report record for one reviewed Mirror resolution. Preserved
+/// copies use one record per generated path so the original and every retained
+/// copy remain independently visible for later review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorResolutionReportItem {
+    original_path: PathBuf,
+    generated_path: Option<PathBuf>,
+    resolution: ConflictResolution,
+    operation: ResolutionOperation,
+    source_peer: Option<PeerSide>,
+    target_peer: Option<PeerSide>,
+    outcome: MirrorResolutionOutcome,
+    review_state: MirrorResolutionReviewState,
+}
+
+impl MirrorResolutionReportItem {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        original_path: impl Into<PathBuf>,
+        generated_path: Option<impl Into<PathBuf>>,
+        resolution: ConflictResolution,
+        operation: ResolutionOperation,
+        source_peer: Option<PeerSide>,
+        target_peer: Option<PeerSide>,
+        outcome: MirrorResolutionOutcome,
+        review_state: MirrorResolutionReviewState,
+    ) -> Self {
+        let review_state = if matches!(
+            resolution,
+            ConflictResolution::PreserveBoth | ConflictResolution::RenamePreserveForReview
+        ) {
+            MirrorResolutionReviewState::ReviewLater
+        } else {
+            review_state
+        };
+        Self {
+            original_path: original_path.into(),
+            generated_path: generated_path.map(Into::into),
+            resolution,
+            operation,
+            source_peer,
+            target_peer,
+            outcome,
+            review_state,
+        }
+    }
+
+    pub fn original_path(&self) -> &Path {
+        &self.original_path
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        self.original_path()
+    }
+
+    pub fn generated_path(&self) -> Option<&Path> {
+        self.generated_path.as_deref()
+    }
+
+    pub const fn resolution(&self) -> ConflictResolution {
+        self.resolution
+    }
+
+    pub const fn operation(&self) -> ResolutionOperation {
+        self.operation
+    }
+
+    pub const fn source_peer(&self) -> Option<PeerSide> {
+        self.source_peer
+    }
+
+    pub const fn target_peer(&self) -> Option<PeerSide> {
+        self.target_peer
+    }
+
+    pub const fn outcome(&self) -> MirrorResolutionOutcome {
+        self.outcome
+    }
+
+    pub const fn review_state(&self) -> MirrorResolutionReviewState {
+        self.review_state
+    }
+
+    pub const fn requires_review(&self) -> bool {
+        matches!(
+            self.resolution,
+            ConflictResolution::PreserveBoth | ConflictResolution::RenamePreserveForReview
+        ) || !matches!(self.outcome, MirrorResolutionOutcome::Completed)
+            || matches!(self.review_state, MirrorResolutionReviewState::ReviewLater)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorResolutionOutcome {
+    Completed,
+    Deferred,
+    Failed(ActionReason),
+    Unresolved(ActionReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorResolutionReviewState {
+    Settled,
+    ReviewLater,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunReportStatus {
     InProgress,
@@ -596,6 +703,7 @@ pub struct RunReport {
     reconciliation_required: bool,
     peer_a_inventory: Option<SourceInventorySnapshot>,
     peer_b_inventory: Option<SourceInventorySnapshot>,
+    mirror_resolutions: Vec<MirrorResolutionReportItem>,
 }
 
 impl RunReport {
@@ -639,6 +747,10 @@ impl RunReport {
         self.peer_b_inventory.as_ref()
     }
 
+    pub fn mirror_resolutions(&self) -> &[MirrorResolutionReportItem] {
+        &self.mirror_resolutions
+    }
+
     pub fn can_mark_review_cleared(&self) -> bool {
         matches!(self.lifecycle, RunLifecycle::Open)
             && matches!(self.execution_result, RunExecutionResult::Succeeded)
@@ -647,6 +759,10 @@ impl RunReport {
                     .reconciliation
                     .as_ref()
                     .is_some_and(|reconciliation| !reconciliation.requires_review()))
+            && self
+                .mirror_resolutions
+                .iter()
+                .all(|resolution| !resolution.requires_review())
     }
 }
 
@@ -745,7 +861,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 9 {
+        if version > 10 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -1008,6 +1124,33 @@ impl RunEvidenceStore {
             )?;
             transaction.pragma_update(None, "user_version", 9)?;
             transaction.commit()?;
+            version = 9;
+        }
+        if version == 9 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                CREATE TABLE mirror_resolution_items (
+                    run_id INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    original_path BLOB NOT NULL,
+                    generated_path BLOB,
+                    resolution TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    source_peer TEXT,
+                    target_peer TEXT,
+                    outcome TEXT NOT NULL,
+                    action_reason TEXT,
+                    review_state TEXT NOT NULL,
+                    PRIMARY KEY (run_id, ordinal),
+                    FOREIGN KEY (run_id) REFERENCES run_snapshots(run_id) ON DELETE CASCADE
+                );
+                CREATE INDEX mirror_resolution_items_by_run
+                    ON mirror_resolution_items (run_id, ordinal);
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 10)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -1162,6 +1305,121 @@ impl RunEvidenceStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Persist the reviewed Mirror outcomes that do not fit the ordinary
+    /// transfer journal, including deferred conflicts and generated preserved
+    /// copies. Replacing this derived set is safe because the immutable run
+    /// snapshot and ordinary action journal remain intact.
+    pub fn record_mirror_resolutions(
+        &mut self,
+        run_id: RunId,
+        resolutions: &[MirrorResolutionReportItem],
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.transaction()?;
+        let mode: String = transaction.query_row(
+            "SELECT mode FROM run_snapshots WHERE run_id = ?1",
+            params![run_id.value()],
+            |row| row.get(0),
+        )?;
+        if mode != encode_mode(SyncMode::Mirror) {
+            return Err(StorageError::InvalidEvent(
+                "Mirror resolution evidence requires a Mirror run".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "DELETE FROM mirror_resolution_items WHERE run_id = ?1",
+            params![run_id.value()],
+        )?;
+        for (ordinal, resolution) in resolutions.iter().enumerate() {
+            let (outcome, action_reason) = encode_mirror_resolution_outcome(resolution.outcome());
+            transaction.execute(
+                "INSERT INTO mirror_resolution_items (
+                    run_id, ordinal, original_path, generated_path, resolution,
+                    operation, source_peer, target_peer, outcome, action_reason,
+                    review_state
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    run_id.value(),
+                    ordinal as i64,
+                    path_to_blob(resolution.original_path()),
+                    resolution.generated_path().map(path_to_blob),
+                    encode_conflict_resolution(resolution.resolution()),
+                    encode_resolution_operation(resolution.operation()),
+                    resolution.source_peer().map(encode_side),
+                    resolution.target_peer().map(encode_side),
+                    outcome,
+                    action_reason,
+                    encode_mirror_review_state(resolution.review_state()),
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn load_mirror_resolutions(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<MirrorResolutionReportItem>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT original_path, generated_path, resolution, operation,
+                    source_peer, target_peer, outcome, action_reason, review_state
+             FROM mirror_resolution_items WHERE run_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = statement
+            .query_map(params![run_id.value()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    original_path,
+                    generated_path,
+                    resolution,
+                    operation,
+                    source_peer,
+                    target_peer,
+                    outcome,
+                    action_reason,
+                    review_state,
+                )| {
+                    Ok(MirrorResolutionReportItem::new(
+                        blob_to_path(&original_path)?,
+                        generated_path
+                            .as_deref()
+                            .map(blob_to_path)
+                            .transpose()?,
+                        decode_conflict_resolution(&resolution)?,
+                        decode_resolution_operation(&operation)?,
+                        source_peer
+                            .as_deref()
+                            .map(decode_side)
+                            .transpose()?,
+                        target_peer
+                            .as_deref()
+                            .map(decode_side)
+                            .transpose()?,
+                        decode_mirror_resolution_outcome(
+                            &outcome,
+                            action_reason.as_deref(),
+                        )?,
+                        decode_mirror_review_state(&review_state)?,
+                    ))
+                },
+            )
+            .collect()
     }
 
     pub fn load_source_inventory(
@@ -1986,6 +2244,7 @@ impl RunEvidenceStore {
             |row| row.get(0),
         )?;
         let reconciliation = self.load_reconciliation(run_id)?;
+        let mirror_resolutions = self.load_mirror_resolutions(run_id)?;
         let inventory_recorded: bool = self.connection.query_row(
             "SELECT source_inventory_recorded FROM run_snapshots WHERE run_id = ?1",
             params![run_id.value()],
@@ -2021,6 +2280,7 @@ impl RunEvidenceStore {
             .collect();
         let status = report_status(
             &items,
+            &mirror_resolutions,
             review_cleared,
             blocked_reason.is_some(),
             reconciliation.as_ref(),
@@ -2028,11 +2288,22 @@ impl RunEvidenceStore {
         );
         let execution_result = execution_result(&items, blocked_reason.is_some(), reconciliation.is_some());
         let lifecycle = if review_cleared {
-            RunLifecycle::ReviewCleared
+            if mirror_resolutions.iter().any(MirrorResolutionReportItem::requires_review)
+                || reconciliation
+                    .as_ref()
+                    .is_some_and(CompletionReconciliation::requires_review)
+            {
+                RunLifecycle::ReviewRequired
+            } else {
+                RunLifecycle::ReviewCleared
+            }
         } else if blocked_reason.is_some()
             || reconciliation
                 .as_ref()
                 .is_some_and(CompletionReconciliation::requires_review)
+            || mirror_resolutions
+                .iter()
+                .any(MirrorResolutionReportItem::requires_review)
         {
             RunLifecycle::ReviewRequired
         } else if items.iter().any(|item| {
@@ -2062,6 +2333,7 @@ impl RunEvidenceStore {
             reconciliation_required: inventories_recorded,
             peer_a_inventory,
             peer_b_inventory,
+            mirror_resolutions,
         })
     }
 
@@ -3234,6 +3506,7 @@ fn is_settled_phase(phase: &str) -> bool {
 
 fn report_status(
     items: &[RunReportItem],
+    mirror_resolutions: &[MirrorResolutionReportItem],
     review_cleared: bool,
     blocked: bool,
     reconciliation: Option<&CompletionReconciliation>,
@@ -3256,6 +3529,12 @@ fn report_status(
     if items
         .iter()
         .any(|item| matches!(item.outcome(), ActionOutcome::Failed(_)))
+        || mirror_resolutions.iter().any(|item| {
+            matches!(
+                item.outcome(),
+                MirrorResolutionOutcome::Failed(_) | MirrorResolutionOutcome::Unresolved(_)
+            )
+        })
     {
         return RunReportStatus::Failed;
     }
@@ -3276,7 +3555,10 @@ fn report_status(
             item.outcome(),
             ActionOutcome::Deferred | ActionOutcome::Unresolved(_)
         )
-    }) || reconciliation.is_some_and(CompletionReconciliation::requires_review)
+    }) || mirror_resolutions
+        .iter()
+        .any(MirrorResolutionReportItem::requires_review)
+        || reconciliation.is_some_and(CompletionReconciliation::requires_review)
         || (inventory_recorded && reconciliation.is_none())
     {
         return RunReportStatus::CompletedWithReviewRequired;
@@ -3370,6 +3652,105 @@ fn event_action_id(event: &JournalEvent) -> ActionId {
         | JournalEvent::Unresolved { action_id, .. }
         | JournalEvent::RecoveryReview { action_id, .. }
         | JournalEvent::RecoveryResolved { action_id, .. } => *action_id,
+    }
+}
+
+fn encode_conflict_resolution(resolution: ConflictResolution) -> &'static str {
+    match resolution {
+        ConflictResolution::KeepPeerA => "keep_peer_a",
+        ConflictResolution::KeepPeerB => "keep_peer_b",
+        ConflictResolution::PreserveBoth => "preserve_both",
+        ConflictResolution::RenamePreserveForReview => "rename_preserve_for_review",
+        ConflictResolution::Defer => "defer",
+    }
+}
+
+fn decode_conflict_resolution(value: &str) -> Result<ConflictResolution, StorageError> {
+    match value {
+        "keep_peer_a" => Ok(ConflictResolution::KeepPeerA),
+        "keep_peer_b" => Ok(ConflictResolution::KeepPeerB),
+        "preserve_both" => Ok(ConflictResolution::PreserveBoth),
+        "rename_preserve_for_review" => Ok(ConflictResolution::RenamePreserveForReview),
+        "defer" => Ok(ConflictResolution::Defer),
+        _ => Err(StorageError::CorruptEvidence(format!(
+            "unknown Mirror conflict resolution {value}"
+        ))),
+    }
+}
+
+fn encode_resolution_operation(operation: ResolutionOperation) -> &'static str {
+    match operation {
+        ResolutionOperation::CopyWholeFile => "copy_whole_file",
+        ResolutionOperation::PreserveBoth => "preserve_both",
+        ResolutionOperation::RenamePreserveForReview => "rename_preserve_for_review",
+        ResolutionOperation::Defer => "defer",
+    }
+}
+
+fn decode_resolution_operation(value: &str) -> Result<ResolutionOperation, StorageError> {
+    match value {
+        "copy_whole_file" => Ok(ResolutionOperation::CopyWholeFile),
+        "preserve_both" => Ok(ResolutionOperation::PreserveBoth),
+        "rename_preserve_for_review" => Ok(ResolutionOperation::RenamePreserveForReview),
+        "defer" => Ok(ResolutionOperation::Defer),
+        _ => Err(StorageError::CorruptEvidence(format!(
+            "unknown Mirror resolution operation {value}"
+        ))),
+    }
+}
+
+fn encode_mirror_resolution_outcome(
+    outcome: MirrorResolutionOutcome,
+) -> (&'static str, Option<&'static str>) {
+    match outcome {
+        MirrorResolutionOutcome::Completed => ("completed", None),
+        MirrorResolutionOutcome::Deferred => ("deferred", None),
+        MirrorResolutionOutcome::Failed(reason) => ("failed", Some(encode_reason(reason))),
+        MirrorResolutionOutcome::Unresolved(reason) => ("unresolved", Some(encode_reason(reason))),
+    }
+}
+
+fn decode_mirror_resolution_outcome(
+    outcome: &str,
+    action_reason: Option<&str>,
+) -> Result<MirrorResolutionOutcome, StorageError> {
+    match outcome {
+        "completed" => Ok(MirrorResolutionOutcome::Completed),
+        "deferred" => Ok(MirrorResolutionOutcome::Deferred),
+        "failed" => Ok(MirrorResolutionOutcome::Failed(decode_reason(
+            action_reason.ok_or_else(|| {
+                StorageError::CorruptEvidence(
+                    "failed Mirror resolution has no action reason".to_owned(),
+                )
+            })?,
+        )?)),
+        "unresolved" => Ok(MirrorResolutionOutcome::Unresolved(decode_reason(
+            action_reason.ok_or_else(|| {
+                StorageError::CorruptEvidence(
+                    "unresolved Mirror resolution has no action reason".to_owned(),
+                )
+            })?,
+        )?)),
+        _ => Err(StorageError::CorruptEvidence(format!(
+            "unknown Mirror resolution outcome {outcome}"
+        ))),
+    }
+}
+
+fn encode_mirror_review_state(state: MirrorResolutionReviewState) -> &'static str {
+    match state {
+        MirrorResolutionReviewState::Settled => "settled",
+        MirrorResolutionReviewState::ReviewLater => "review_later",
+    }
+}
+
+fn decode_mirror_review_state(value: &str) -> Result<MirrorResolutionReviewState, StorageError> {
+    match value {
+        "settled" => Ok(MirrorResolutionReviewState::Settled),
+        "review_later" => Ok(MirrorResolutionReviewState::ReviewLater),
+        _ => Err(StorageError::CorruptEvidence(format!(
+            "unknown Mirror resolution review state {value}"
+        ))),
     }
 }
 

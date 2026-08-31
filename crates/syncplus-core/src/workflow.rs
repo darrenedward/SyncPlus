@@ -8,15 +8,21 @@ use std::{
 
 use crate::replacement::cleanup_partial_transfer_artifacts;
 use crate::{
-    ActionOutcome, ActionReason, AnalysisError, ConfirmedPlan, ControlledTransfer, ContentProof,
-    FileMetadataProof, FreshAnalysis, JournalEvent, OneWayPlan,
-    PlanAction, PlanActionKind, PlanRecord, PreActionState, ProcessError, ProcessSpecification,
-    PrecheckErrorKind, PrecheckFailure, PrecheckLease, PrecheckProbe, RecoveryEvidence,
-    RecoveryMethod, ReplacementError, RetryPolicy, RunEvidenceStore, RunId, RunPrecheck,
-    RunReport, RunReportStatus, RunSnapshot, SafeDeleteError, ScopeLockOwner,
-    PeerScopeLockRegistry,
-    SourceInventorySnapshot, StorageError, TransferError, VerificationError,
-    VerifiedReplacement, CompletionReconciliation, PrecheckBlocked, SyncBaseline,
+    ActionOutcome, ActionReason, AnalysisError, ConfirmedPlan, ConflictResolution,
+    ConflictResolutionAction, CompletionReconciliation, ContentProof, ControlledTransfer,
+    FileMetadataProof, FilesystemResolutionExecutor, FreshAnalysis, JournalEvent, OneWayPlan,
+    MirrorResolutionOutcome, MirrorResolutionReportItem, MirrorResolutionReviewState,
+    PlanAction, PlanActionKind, PlanRecord, PreActionState, PrecheckBlocked,
+    PrecheckErrorKind, PrecheckFailure, PrecheckLease, PrecheckProbe,
+    PreservedCopyExecutionError, PreservedCopyExecutionOutcome, ProcessError,
+    ProcessSpecification, RecoveryEvidence,
+    MirrorDeletionResult, RecoveryMethod, ReplacementError, ResolutionRun, ResolutionRunError,
+    ResolutionRunOutcome,
+    RetryPolicy,
+    RunEvidenceStore, RunId, RunPrecheck, RunReport, RunReportStatus, RunSnapshot,
+    SafeDeleteError, ScopeLockOwner,
+    SourceInventorySnapshot, StorageError, SyncBaseline, TransferError, VerificationError,
+    VerifiedReplacement, PeerScopeLockRegistry,
 };
 
 #[derive(Debug)]
@@ -28,6 +34,7 @@ pub enum WorkflowError {
     ConfirmationRequired,
     InvalidRun(String),
     Io(String),
+    Resolution(ResolutionRunError),
 }
 
 impl std::fmt::Display for WorkflowError {
@@ -42,6 +49,7 @@ impl std::fmt::Display for WorkflowError {
             }
             Self::InvalidRun(reason) => write!(formatter, "invalid Sync Run: {reason}"),
             Self::Io(reason) => write!(formatter, "Sync Run filesystem operation failed: {reason}"),
+            Self::Resolution(error) => write!(formatter, "Resolution Run failed: {error}"),
         }
     }
 }
@@ -57,6 +65,12 @@ impl From<AnalysisError> for WorkflowError {
 impl From<StorageError> for WorkflowError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<ResolutionRunError> for WorkflowError {
+    fn from(error: ResolutionRunError) -> Self {
+        Self::Resolution(error)
     }
 }
 
@@ -181,6 +195,159 @@ impl RunWorkflow {
             destination_volume_identity,
         )?;
         self.cleanup_partials_after_success(&confirmed, &report)?;
+        Ok(report)
+    }
+
+    /// Execute a reviewed Mirror Resolution Run through the same precheck,
+    /// scope-lock, fresh-analysis, confirmation, reconciliation, and durable
+    /// report boundaries as an ordinary Sync Run.
+    pub fn execute_resolution_run<P, C, F>(
+        &self,
+        run_id: RunId,
+        resolution: &ResolutionRun,
+        profile: &crate::SyncProfile,
+        baseline: Option<&SyncBaseline>,
+        probe: &P,
+        confirm: C,
+        store: &mut RunEvidenceStore,
+        should_cancel: F,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        P: PrecheckProbe,
+        C: FnOnce(&FreshAnalysis, &[ConflictResolutionAction]) -> bool,
+        F: Fn() -> bool,
+    {
+        let lease = match self.acquire_precheck(run_id, profile, probe) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let (source_volume_identity, destination_volume_identity) =
+                    blocked_volume_identities(&error);
+                self.persist_blocked(
+                    run_id,
+                    profile,
+                    store,
+                    &error,
+                    source_volume_identity,
+                    destination_volume_identity,
+                )?;
+                return Err(error);
+            }
+        };
+        let source_volume_identity = lease.result().source_volume_identity();
+        let destination_volume_identity = lease.result().destination_volume_identity();
+        let reviewed = resolution.fresh_analysis(profile, baseline)?;
+        if !confirm(&reviewed, resolution.plan().actions()) {
+            return Err(WorkflowError::ConfirmationRequired);
+        }
+        let confirmed = resolution.prepare(profile, baseline, true)?;
+        self.recheck_precheck(
+            profile,
+            probe,
+            source_volume_identity,
+            destination_volume_identity,
+            false,
+            false,
+        )?;
+
+        let (peer_a_volume_identity, peer_b_volume_identity) = orient_volume_identities(
+            profile,
+            source_volume_identity,
+            destination_volume_identity,
+        );
+        let snapshot = RunSnapshot::from_profile_with_volume_identities(
+            run_id,
+            profile,
+            crate::AuthorizationSnapshot::default(),
+            peer_a_volume_identity,
+            peer_b_volume_identity,
+        )?;
+        store.begin_run(&snapshot)?;
+        let inventory = SourceInventorySnapshot::from_inventory(
+            confirmed.fresh_analysis().source_inventory(),
+        );
+        let destination_inventory = SourceInventorySnapshot::from_inventory(
+            confirmed.fresh_analysis().destination_inventory(),
+        );
+        store.record_source_inventory(run_id, &inventory)?;
+        store.record_destination_inventory(run_id, &destination_inventory)?;
+
+        let action_ids = resolution_action_ids(confirmed.actions());
+        for action in confirmed.actions() {
+            let action_id = action_ids
+                .get(action.relative_path())
+                .copied()
+                .expect("every resolution action has a journal id");
+            store.append_event(
+                run_id,
+                JournalEvent::Planned {
+                    action: resolution_plan_record(
+                        confirmed.fresh_analysis(),
+                        action_id,
+                        action,
+                    )?,
+                },
+            )?;
+        }
+
+        let peer_a_naming_policy = probe.destination_naming_policy(profile.peer_a().root());
+        let peer_b_naming_policy = probe.destination_naming_policy(profile.peer_b().root());
+        let mut executor = match FilesystemResolutionExecutor::new_with_naming_policies(
+            &confirmed,
+            self.transfer,
+            should_cancel,
+            peer_a_naming_policy,
+            peer_b_naming_policy,
+        ) {
+            Ok(executor) => executor,
+            Err(_error) => {
+                record_resolution_setup_failure(
+                    run_id,
+                    confirmed.actions(),
+                    &action_ids,
+                    store,
+                    ActionReason::TransferFailed,
+                )?;
+                let report_items = resolution_setup_failure_items(
+                    confirmed.actions(),
+                    ActionReason::TransferFailed,
+                );
+                store.record_mirror_resolutions(run_id, &report_items)?;
+                return self.reconcile_run_with_resolutions(
+                    run_id,
+                    profile,
+                    &inventory,
+                    &destination_inventory,
+                    store,
+                    confirmed.actions(),
+                );
+            }
+        };
+        // Persist the selected resolution and every collision-safe generated
+        // path before the first filesystem mutation. These rows intentionally
+        // start unresolved: a crash before the action boundary must remain
+        // visible and cannot be mistaken for a completed resolution.
+        let planned_report_items = resolution_planned_report_items(&confirmed, &executor);
+        store.record_mirror_resolutions(run_id, &planned_report_items)?;
+        let execution = {
+            let mut durable_executor = JournaledResolutionExecutor {
+                inner: &mut executor,
+                store,
+                run_id,
+                action_ids: &action_ids,
+            };
+            confirmed.execute(&mut durable_executor)
+        };
+        let report_items = resolution_report_items(&confirmed, &execution, &executor);
+        store.record_mirror_resolutions(run_id, &report_items)?;
+        let report = self.reconcile_run_with_resolutions(
+            run_id,
+            profile,
+            &inventory,
+            &destination_inventory,
+            store,
+            confirmed.actions(),
+        )?;
+        self.cleanup_partials_after_resolution(profile, &report)?;
         Ok(report)
     }
 
@@ -507,16 +674,198 @@ impl RunWorkflow {
         destination_inventory: &SourceInventorySnapshot,
         store: &mut RunEvidenceStore,
     ) -> Result<RunReport, WorkflowError> {
+        self.reconcile_run_with_resolutions(
+            run_id,
+            profile,
+            inventory,
+            destination_inventory,
+            store,
+            &[],
+        )
+    }
+
+    fn reconcile_run_with_resolutions(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        inventory: &SourceInventorySnapshot,
+        destination_inventory: &SourceInventorySnapshot,
+        store: &mut RunEvidenceStore,
+        resolutions: &[ConflictResolutionAction],
+    ) -> Result<RunReport, WorkflowError> {
+        self.reconcile_run_with_resolutions_and_deletions(
+            run_id,
+            profile,
+            inventory,
+            destination_inventory,
+            store,
+            resolutions,
+            &[],
+        )
+    }
+
+    /// Reconcile a previously journaled Mirror deletion result against the
+    /// final two-peer state. This keeps an explicitly completed counterpart
+    /// deletion from being mistaken for an unexplained missing item.
+    pub fn reconcile_mirror_deletions(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        inventory: &SourceInventorySnapshot,
+        destination_inventory: &SourceInventorySnapshot,
+        deletions: &[MirrorDeletionResult],
+        store: &mut RunEvidenceStore,
+    ) -> Result<RunReport, WorkflowError> {
+        if profile.mode() != crate::SyncMode::Mirror {
+            return Err(WorkflowError::InvalidRun(
+                "Mirror deletion reconciliation requires Mirror Sync".to_owned(),
+            ));
+        }
+        self.reconcile_run_with_resolutions_and_deletions(
+            run_id,
+            profile,
+            inventory,
+            destination_inventory,
+            store,
+            &[],
+            deletions,
+        )
+    }
+
+    /// Persist the action boundaries for explicit, already-authorized Mirror
+    /// deletion outcomes and reconcile the final two-peer state. The actual
+    /// filesystem deletion is supplied by the typed deletion executor; this
+    /// method owns its journal and completion evidence.
+    pub fn record_mirror_deletion_results(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        inventory: &SourceInventorySnapshot,
+        destination_inventory: &SourceInventorySnapshot,
+        deletions: &[MirrorDeletionResult],
+        store: &mut RunEvidenceStore,
+    ) -> Result<RunReport, WorkflowError> {
+        if profile.mode() != crate::SyncMode::Mirror {
+            return Err(WorkflowError::InvalidRun(
+                "Mirror deletion results require Mirror Sync".to_owned(),
+            ));
+        }
+        // Take a fresh observation before marking any typed deletion as
+        // completed. The result object records what the authorized executor
+        // attempted; this observation is the independent absence boundary
+        // that keeps a stale or malformed completion from clearing review.
+        let current = FreshAnalysis::analyze(profile).ok();
+        let next_action_id = store
+            .load_journal(run_id)?
+            .into_iter()
+            .map(|entry| entry.plan().action_id())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        for (offset, deletion) in deletions.iter().enumerate() {
+            let action_id = next_action_id.saturating_add(offset as crate::ActionId);
+            let affected_inventory = match deletion.affected_peer() {
+                crate::PeerSide::PeerA => inventory,
+                crate::PeerSide::PeerB => destination_inventory,
+            };
+            let item = affected_inventory.item(deletion.relative_path()).ok_or_else(|| {
+                WorkflowError::InvalidRun(format!(
+                    "deletion result {:?} is outside the affected inventory",
+                    deletion.relative_path()
+                ))
+            })?;
+            store.append_event(
+                run_id,
+                JournalEvent::Planned {
+                    action: PlanRecord::new(
+                        action_id,
+                        deletion.relative_path().to_path_buf(),
+                        PlanActionKind::RemoveDestination,
+                        deletion.affected_peer(),
+                        (item.item_type() == crate::ItemType::RegularFile)
+                            .then_some(item.size()),
+                        PreActionState::new(
+                            item.item_type(),
+                            item.size(),
+                            item.modified_at_unix_nanos(),
+                            None,
+                            item.content_fingerprint().copied(),
+                        ),
+                    ),
+                },
+            )?;
+            store.append_event(run_id, JournalEvent::Started { action_id })?;
+            match deletion.outcome() {
+                crate::MirrorDeletionOutcome::Completed => {
+                    let independently_verified = current.as_ref().is_some_and(|current| {
+                        current.source_inventory().item(deletion.relative_path()).is_none()
+                            && current
+                                .destination_inventory()
+                                .item(deletion.relative_path())
+                                .is_none()
+                    });
+                    if independently_verified && !deletion.requires_review() {
+                        store.append_event(run_id, JournalEvent::Completed { action_id })?;
+                    } else {
+                        store.append_event(
+                            run_id,
+                            JournalEvent::Unresolved {
+                                action_id,
+                                reason: if current.is_some() {
+                                    ActionReason::VerificationMismatch
+                                } else {
+                                    ActionReason::FilesystemUncertain
+                                },
+                            },
+                        )?;
+                    }
+                }
+                crate::MirrorDeletionOutcome::FailedPreserved => {
+                    store.append_event(
+                        run_id,
+                        JournalEvent::Unresolved {
+                            action_id,
+                            reason: ActionReason::TransferFailed,
+                        },
+                    )?;
+                }
+                crate::MirrorDeletionOutcome::Deferred => {
+                    store.append_event(run_id, JournalEvent::Deferred { action_id })?;
+                }
+            }
+        }
+        self.reconcile_mirror_deletions(
+            run_id,
+            profile,
+            inventory,
+            destination_inventory,
+            deletions,
+            store,
+        )
+    }
+
+    fn reconcile_run_with_resolutions_and_deletions(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        inventory: &SourceInventorySnapshot,
+        destination_inventory: &SourceInventorySnapshot,
+        store: &mut RunEvidenceStore,
+        resolutions: &[ConflictResolutionAction],
+        deletions: &[MirrorDeletionResult],
+    ) -> Result<RunReport, WorkflowError> {
         let journal = store.load_journal(run_id)?;
         let (reconciliation, current_analysis) = match FreshAnalysis::analyze(profile) {
             Ok(current) => {
                 let reconciliation = if profile.mode() == crate::SyncMode::Mirror {
-                    CompletionReconciliation::reconcile_mirror(
+                    CompletionReconciliation::reconcile_mirror_with_resolutions_and_deletions(
                         profile,
                         inventory,
                         destination_inventory,
                         &current,
                         &journal,
+                        resolutions,
+                        deletions,
                     )
                 } else {
                     CompletionReconciliation::reconcile(profile, inventory, &current, &journal)
@@ -598,6 +947,22 @@ impl RunWorkflow {
             && report.status() == RunReportStatus::Completed
         {
             for root in partial_cleanup_roots(confirmed.profile()) {
+                cleanup_partial_transfer_artifacts(root)
+                    .map_err(|error| WorkflowError::Io(error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup_partials_after_resolution(
+        &self,
+        profile: &crate::SyncProfile,
+        report: &RunReport,
+    ) -> Result<(), WorkflowError> {
+        if profile.options().partial_transfer_policy == crate::PartialTransferPolicy::KeepPartialForResume
+            && report.status() == RunReportStatus::Completed
+        {
+            for root in partial_cleanup_roots(profile) {
                 cleanup_partial_transfer_artifacts(root)
                     .map_err(|error| WorkflowError::Io(error.to_string()))?;
             }
@@ -974,6 +1339,342 @@ impl RunWorkflow {
     }
 }
 
+fn resolution_report_items<F>(
+    confirmed: &crate::ConfirmedResolutionRun,
+    execution: &crate::ResolutionExecutionReport,
+    executor: &FilesystemResolutionExecutor<F>,
+) -> Vec<MirrorResolutionReportItem>
+where
+    F: Fn() -> bool,
+{
+    confirmed
+        .actions()
+        .iter()
+        .flat_map(|action| {
+            let result = execution
+                .result_for(action.relative_path())
+                .expect("every confirmed resolution action has an execution result");
+            if matches!(
+                action.resolution(),
+                ConflictResolution::PreserveBoth | ConflictResolution::RenamePreserveForReview
+            ) {
+                if let Some(report) = executor.preserved_copy_report(action.relative_path()) {
+                    return report
+                        .items()
+                        .iter()
+                        .map(|item| {
+                            let outcome = match item.outcome() {
+                                PreservedCopyExecutionOutcome::Copied => {
+                                    MirrorResolutionOutcome::Completed
+                                }
+                                PreservedCopyExecutionOutcome::Unresolved(error) => {
+                                    MirrorResolutionOutcome::Unresolved(
+                                        preserved_copy_failure_reason(error),
+                                    )
+                                }
+                            };
+                            MirrorResolutionReportItem::new(
+                                item.copy().original_path(),
+                                Some(item.copy().generated_path()),
+                                item.copy().resolution(),
+                                action.operation(),
+                                Some(item.copy().source_peer()),
+                                Some(item.copy().target_peer()),
+                                outcome,
+                                MirrorResolutionReviewState::ReviewLater,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                }
+            }
+            vec![MirrorResolutionReportItem::new(
+                action.relative_path(),
+                None::<PathBuf>,
+                action.resolution(),
+                action.operation(),
+                action.source_side(),
+                action.target_side(),
+                mirror_resolution_outcome(result.outcome()),
+                if matches!(
+                    action.resolution(),
+                    ConflictResolution::PreserveBoth
+                        | ConflictResolution::RenamePreserveForReview
+                ) {
+                    MirrorResolutionReviewState::ReviewLater
+                } else {
+                    MirrorResolutionReviewState::Settled
+                },
+            )]
+        })
+        .collect()
+}
+
+fn resolution_planned_report_items<F>(
+    confirmed: &crate::ConfirmedResolutionRun,
+    executor: &FilesystemResolutionExecutor<F>,
+) -> Vec<MirrorResolutionReportItem>
+where
+    F: Fn() -> bool,
+{
+    confirmed
+        .actions()
+        .iter()
+        .flat_map(|action| {
+            if let Some(plan) = executor.preserved_copy_plan(action.relative_path()) {
+                return plan
+                    .copies()
+                    .iter()
+                    .map(|copy| {
+                        MirrorResolutionReportItem::new(
+                            copy.original_path(),
+                            Some(copy.generated_path()),
+                            copy.resolution(),
+                            action.operation(),
+                            Some(copy.source_peer()),
+                            Some(copy.target_peer()),
+                            MirrorResolutionOutcome::Unresolved(ActionReason::InterruptedBoundary),
+                            MirrorResolutionReviewState::ReviewLater,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+            }
+
+            vec![MirrorResolutionReportItem::new(
+                action.relative_path(),
+                None::<PathBuf>,
+                action.resolution(),
+                action.operation(),
+                action.source_side(),
+                action.target_side(),
+                if action.resolution() == ConflictResolution::Defer {
+                    MirrorResolutionOutcome::Deferred
+                } else {
+                    MirrorResolutionOutcome::Unresolved(ActionReason::InterruptedBoundary)
+                },
+                if action.resolution() == ConflictResolution::Defer {
+                    MirrorResolutionReviewState::ReviewLater
+                } else {
+                    MirrorResolutionReviewState::Settled
+                },
+            )]
+        })
+        .collect()
+}
+
+struct JournaledResolutionExecutor<'a, F> {
+    inner: &'a mut FilesystemResolutionExecutor<F>,
+    store: &'a mut RunEvidenceStore,
+    run_id: RunId,
+    action_ids: &'a BTreeMap<PathBuf, crate::ActionId>,
+}
+
+impl<F> JournaledResolutionExecutor<'_, F>
+where
+    F: Fn() -> bool,
+{
+    fn action_id(&self, action: &ConflictResolutionAction) -> crate::ActionId {
+        self.action_ids
+            .get(action.relative_path())
+            .copied()
+            .expect("every resolution action has a journal id")
+    }
+
+    fn start(&mut self, action: &ConflictResolutionAction) -> Result<crate::ActionId, ActionReason> {
+        let action_id = self.action_id(action);
+        self.store
+            .append_event(
+                self.run_id,
+                JournalEvent::Started { action_id },
+            )
+            .map_err(|_| ActionReason::InterruptedBoundary)?;
+        Ok(action_id)
+    }
+
+    fn finish(
+        &mut self,
+        action_id: crate::ActionId,
+        outcome: &Result<(), ActionReason>,
+    ) -> Result<(), ActionReason> {
+        let event = match outcome {
+            Ok(()) => JournalEvent::Completed { action_id },
+            Err(reason) => JournalEvent::Unresolved {
+                action_id,
+                reason: *reason,
+            },
+        };
+        self.store
+            .append_event(self.run_id, event)
+            .map_err(|_| ActionReason::InterruptedBoundary)
+    }
+}
+
+impl<F> crate::ResolutionActionExecutor for JournaledResolutionExecutor<'_, F>
+where
+    F: Fn() -> bool,
+{
+    fn execute(
+        &mut self,
+        action: &ConflictResolutionAction,
+        analysis: &FreshAnalysis,
+    ) -> Result<(), ActionReason> {
+        let action_id = self.start(action)?;
+        let result = self.inner.execute(action, analysis);
+        if self.finish(action_id, &result).is_err() {
+            return Err(ActionReason::InterruptedBoundary);
+        }
+        result
+    }
+
+    fn defer(
+        &mut self,
+        action: &ConflictResolutionAction,
+        _analysis: &FreshAnalysis,
+    ) -> Result<(), ActionReason> {
+        let action_id = self.start(action)?;
+        self.store
+            .append_event(
+                self.run_id,
+                JournalEvent::Deferred { action_id },
+            )
+            .map_err(|_| ActionReason::InterruptedBoundary)
+    }
+
+    fn cancel(
+        &mut self,
+        action: &ConflictResolutionAction,
+        _analysis: &FreshAnalysis,
+    ) -> Result<(), ActionReason> {
+        let action_id = self.action_id(action);
+        self.store
+            .append_event(
+                self.run_id,
+                JournalEvent::Cancelled { action_id },
+            )
+            .map_err(|_| ActionReason::InterruptedBoundary)
+    }
+}
+
+fn resolution_action_ids(
+    actions: &[ConflictResolutionAction],
+) -> BTreeMap<PathBuf, crate::ActionId> {
+    actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            (
+                action.relative_path().to_path_buf(),
+                (index + 1) as crate::ActionId,
+            )
+        })
+        .collect()
+}
+
+fn resolution_plan_record(
+    analysis: &FreshAnalysis,
+    action_id: crate::ActionId,
+    action: &ConflictResolutionAction,
+) -> Result<PlanRecord, WorkflowError> {
+    let affected_side = action.source_side().unwrap_or(crate::PeerSide::PeerA);
+    let inventory = match affected_side {
+        crate::PeerSide::PeerA => analysis.source_inventory(),
+        crate::PeerSide::PeerB => analysis.destination_inventory(),
+    };
+    let item = inventory.item(action.relative_path()).ok_or_else(|| {
+        WorkflowError::InvalidRun(format!(
+            "resolution action {:?} is outside the fresh inventory",
+            action.relative_path()
+        ))
+    })?;
+    Ok(PlanRecord::new(
+        action_id,
+        action.relative_path().to_path_buf(),
+        PlanActionKind::CopyToDestination,
+        affected_side,
+        (item.item_type() == crate::ItemType::RegularFile).then_some(item.metadata().size()),
+        PreActionState::new(
+            item.item_type(),
+            item.metadata().size(),
+            unix_nanos(item.metadata().modified_at()),
+            None,
+            item.content_fingerprint().copied(),
+        ),
+    ))
+}
+
+fn record_resolution_setup_failure(
+    run_id: RunId,
+    actions: &[ConflictResolutionAction],
+    action_ids: &BTreeMap<PathBuf, crate::ActionId>,
+    store: &mut RunEvidenceStore,
+    reason: ActionReason,
+) -> Result<(), WorkflowError> {
+    for action in actions {
+        let action_id = action_ids
+            .get(action.relative_path())
+            .copied()
+            .expect("every resolution action has a journal id");
+        store.append_event(run_id, JournalEvent::Started { action_id })?;
+        if action.resolution() == ConflictResolution::Defer {
+            store.append_event(run_id, JournalEvent::Deferred { action_id })?;
+        } else {
+            store.append_event(
+                run_id,
+                JournalEvent::Unresolved { action_id, reason },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn resolution_setup_failure_items(
+    actions: &[ConflictResolutionAction],
+    reason: ActionReason,
+) -> Vec<MirrorResolutionReportItem> {
+    actions
+        .iter()
+        .map(|action| {
+            MirrorResolutionReportItem::new(
+                action.relative_path(),
+                None::<PathBuf>,
+                action.resolution(),
+                action.operation(),
+                action.source_side(),
+                action.target_side(),
+                if action.resolution() == ConflictResolution::Defer {
+                    MirrorResolutionOutcome::Deferred
+                } else {
+                    MirrorResolutionOutcome::Failed(reason)
+                },
+                if action.resolution() == ConflictResolution::Defer {
+                    MirrorResolutionReviewState::ReviewLater
+                } else {
+                    MirrorResolutionReviewState::Settled
+                },
+            )
+        })
+        .collect()
+}
+
+fn mirror_resolution_outcome(outcome: ResolutionRunOutcome) -> MirrorResolutionOutcome {
+    match outcome {
+        ResolutionRunOutcome::Completed => MirrorResolutionOutcome::Completed,
+        ResolutionRunOutcome::Deferred => MirrorResolutionOutcome::Deferred,
+        ResolutionRunOutcome::Unresolved(reason) => MirrorResolutionOutcome::Failed(reason),
+    }
+}
+
+fn preserved_copy_failure_reason(error: &PreservedCopyExecutionError) -> ActionReason {
+    match error {
+        PreservedCopyExecutionError::SourceChanged(_) => ActionReason::SourceChanged,
+        PreservedCopyExecutionError::Verification(_, _) => ActionReason::VerificationMismatch,
+        PreservedCopyExecutionError::UnsafePath(_)
+        | PreservedCopyExecutionError::SourceUnavailable(_, _)
+        | PreservedCopyExecutionError::UnsupportedItem(_)
+        | PreservedCopyExecutionError::DestinationOccupied(_)
+        | PreservedCopyExecutionError::Io(_, _) => ActionReason::TransferFailed,
+    }
+}
+
 fn sleep_interruptibly(duration: Duration, should_cancel: &dyn Fn() -> bool) -> bool {
     let deadline = std::time::Instant::now() + duration;
     while std::time::Instant::now() < deadline {
@@ -1164,12 +1865,14 @@ mod tests {
 
     use super::RunWorkflow;
     use crate::{
-        ActionOutcome, AuthorizationSnapshot, ContentProof, DeletionMethod, FreshAnalysis,
+        ActionOutcome, AuthorizationSnapshot, ContentProof, DeletionMethod,
+        DestinationNamingPolicy, FreshAnalysis,
         ItemType, JournalEvent, OneWaySource, Peer, PeerSide, PlanActionKind, PlanRecord,
         PreActionState, ProcessError, RecoveryEvidence, RecoveryMethod, RetryPolicy,
         LocalPrecheckProbe, PartialTransferPolicy, PeerScope, PeerScopeLockRegistry,
         PrecheckFailure, PrecheckProbe,
-        RunEvidenceStore, RunId, RunReportStatus, ScopeLockOwner, SyncMode, SyncOptions,
+        MirrorDeletionChoice, MirrorDeletionDecision, RunEvidenceStore, RunId, RunReportStatus,
+        RunSnapshot, ScopeLockOwner, SourceInventorySnapshot, SyncMode, SyncOptions,
         SyncProfile,
     };
 
@@ -1273,6 +1976,123 @@ mod tests {
         assert_eq!(from_a.source_path(), fixture.source().join("from-a.txt"));
         assert_eq!(from_a.destination_path(), fixture.destination().join("from-a.txt"));
         assert!(from_a.consequence().contains("Peer A"));
+    }
+
+    #[test]
+    fn partial_mirror_run_keeps_failed_and_successful_paths_review_required() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.source()).expect("Peer A should be creatable");
+        fs::create_dir_all(fixture.destination()).expect("Peer B should be creatable");
+        write_file(&fixture.source().join("a.txt"), b"original A");
+        write_file(&fixture.destination().join("b.txt"), b"original B");
+        let profile = fixture.profile().with_mode(SyncMode::Mirror);
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute(
+                RunId::new(1),
+                &profile,
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || fixture.destination().join("a.txt").exists(),
+            )
+            .expect("partial Mirror execution should return its report");
+
+        assert_eq!(report.status(), RunReportStatus::RecoveryReview, "report: {report:?}");
+        assert!(report.items().iter().any(|item| {
+            item.relative_path() == Path::new("a.txt")
+                && matches!(item.outcome(), ActionOutcome::RecoveryReview(_))
+        }));
+        assert!(report.items().iter().any(|item| {
+            item.relative_path() == Path::new("b.txt")
+                && matches!(item.outcome(), ActionOutcome::Cancelled)
+        }));
+        assert!(report
+            .reconciliation()
+            .expect("partial Mirror reconciliation")
+            .requires_review());
+        assert!(!report.can_mark_review_cleared());
+        assert!(fixture.source().join("a.txt").exists());
+        assert_eq!(
+            fs::read(fixture.destination().join("b.txt")).unwrap(),
+            b"original B"
+        );
+    }
+
+    #[test]
+    fn completed_mirror_deletion_reconciles_both_peers_as_absent() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.source()).expect("Peer A should be creatable");
+        fs::create_dir_all(fixture.destination()).expect("Peer B should be creatable");
+        write_file(&fixture.source().join("gone.txt"), b"same item");
+        write_file(&fixture.destination().join("gone.txt"), b"same item");
+        let profile = fixture.profile().with_mode(SyncMode::Mirror);
+        let workflow = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")));
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        workflow
+            .execute(
+                RunId::new(1),
+                &profile,
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("initial equal Mirror run should settle");
+        fs::remove_file(fixture.source().join("gone.txt")).expect("user deletion should succeed");
+
+        let analysis = FreshAnalysis::analyze(&profile).expect("current analysis");
+        let current_a = SourceInventorySnapshot::from_inventory(analysis.source_inventory());
+        let current_b = SourceInventorySnapshot::from_inventory(analysis.destination_inventory());
+        let baseline = store
+            .load_mirror_baseline(profile.name())
+            .expect("baseline should load")
+            .expect("initial run should create a baseline");
+        let confirmed = baseline
+            .deletion_review(&current_a, &current_b)
+            .resolve([MirrorDeletionDecision::new(
+                "gone.txt",
+                MirrorDeletionChoice::DeleteCounterpart,
+            )])
+            .expect("baseline-backed deletion should require an explicit decision")
+            .confirm(true)
+            .expect("deletion should require final confirmation");
+        fs::remove_file(fixture.destination().join("gone.txt"))
+            .expect("confirmed counterpart deletion should be applied");
+
+        let run_id = RunId::new(2);
+        let snapshot = RunSnapshot::from_profile(run_id, &profile, AuthorizationSnapshot::default())
+            .expect("deletion run snapshot");
+        store.begin_run(&snapshot).expect("deletion run should begin");
+        store
+            .record_source_inventory(run_id, &current_a)
+            .expect("Peer A inventory should persist");
+        store
+            .record_destination_inventory(run_id, &current_b)
+            .expect("Peer B inventory should persist");
+        let result = confirmed.deletion_actions()[0].completed();
+        let report = workflow
+            .record_mirror_deletion_results(
+                run_id,
+                &profile,
+                &current_a,
+                &current_b,
+                &[result],
+                &mut store,
+            )
+            .expect("deletion result should reconcile through the workflow");
+
+        assert_eq!(report.status(), RunReportStatus::Completed, "report: {report:?}");
+        assert!(report.reconciliation().unwrap().findings().is_empty());
+        assert!(report.can_mark_review_cleared());
+        assert!(store
+            .load_mirror_baseline(profile.name())
+            .unwrap()
+            .unwrap()
+            .item("gone.txt")
+            .is_some());
     }
 
     #[cfg(unix)]
@@ -1606,6 +2426,202 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".syncplus-temporary-")));
         assert!(calls.load(Ordering::Relaxed) >= 514);
+    }
+
+    #[test]
+    fn resolution_run_executes_through_workflow_reconciliation_and_report_storage() {
+        let fixture = Fixture::new();
+        write_file(&fixture.source().join("conflict.txt"), b"peer A");
+        write_file(&fixture.destination().join("conflict.txt"), b"peer B");
+        let profile = fixture.profile().with_mode(SyncMode::Mirror);
+        let resolution = crate::ResolutionRun::start(
+            &profile,
+            [crate::ConflictDecision::new(
+                "conflict.txt",
+                crate::ConflictResolution::KeepPeerA,
+            )],
+            None,
+        )
+        .expect("resolution review should start");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute_resolution_run(
+                RunId::new(1),
+                &resolution,
+                &profile,
+                None,
+                &LocalPrecheckProbe::default(),
+                |analysis, actions| {
+                    assert_eq!(analysis.conflict_review().entries().len(), 1);
+                    assert_eq!(actions.len(), 1);
+                    true
+                },
+                &mut store,
+                || false,
+            )
+            .expect("the confirmed Resolution Run should execute");
+
+        assert_eq!(report.status(), RunReportStatus::Completed, "report: {report:?}");
+        assert_eq!(fs::read(fixture.destination().join("conflict.txt")).unwrap(), b"peer A");
+        assert_eq!(report.mirror_resolutions().len(), 1);
+        assert_eq!(
+            report.mirror_resolutions()[0].outcome(),
+            crate::MirrorResolutionOutcome::Completed
+        );
+        assert_eq!(report.items().len(), 1);
+        assert!(matches!(
+            report.items()[0].outcome(),
+            ActionOutcome::Completed
+        ));
+        assert!(report.can_mark_review_cleared());
+
+        drop(store);
+        let reopened = RunEvidenceStore::open(&fixture.database()).expect("reopen evidence store");
+        let persisted = reopened.load_report(RunId::new(1)).expect("load report");
+        assert_eq!(persisted.mirror_resolutions(), report.mirror_resolutions());
+        assert_eq!(persisted.status(), RunReportStatus::Completed);
+    }
+
+    #[test]
+    fn preserve_both_resolution_creates_collision_safe_copies_and_stays_review_required() {
+        let fixture = Fixture::new();
+        write_file(&fixture.source().join("conflict.txt"), b"peer A");
+        write_file(&fixture.destination().join("conflict.txt"), b"peer B");
+        write_file(&fixture.destination().join("conflict (Peer A).txt"), b"occupied");
+        let profile = fixture.profile().with_mode(SyncMode::Mirror);
+        let resolution = crate::ResolutionRun::start(
+            &profile,
+            [crate::ConflictDecision::new(
+                "conflict.txt",
+                crate::ConflictResolution::PreserveBoth,
+            )],
+            None,
+        )
+        .expect("preservation review should start");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute_resolution_run(
+                RunId::new(1),
+                &resolution,
+                &profile,
+                None,
+                &LocalPrecheckProbe::default(),
+                |_, _| true,
+                &mut store,
+                || false,
+            )
+            .expect("preservation should complete without deleting either original");
+
+        assert_eq!(report.status(), RunReportStatus::CompletedWithReviewRequired);
+        assert_eq!(fs::read(fixture.source().join("conflict.txt")).unwrap(), b"peer A");
+        assert_eq!(fs::read(fixture.destination().join("conflict.txt")).unwrap(), b"peer B");
+        assert_eq!(report.mirror_resolutions().len(), 2);
+        assert!(report.mirror_resolutions().iter().all(|item| {
+            item.review_state() == crate::MirrorResolutionReviewState::ReviewLater
+                && item.generated_path().is_some()
+                && item.requires_review()
+        }));
+        for item in report.mirror_resolutions() {
+            let target_root = match item.target_peer().expect("preserved target peer") {
+                PeerSide::PeerA => fixture.source(),
+                PeerSide::PeerB => fixture.destination(),
+            };
+            assert!(target_root.join(item.generated_path().unwrap()).exists());
+        }
+        assert!(!report.can_mark_review_cleared());
+
+        let persisted = store.load_report(RunId::new(1)).expect("reload report");
+        assert_eq!(persisted.mirror_resolutions(), report.mirror_resolutions());
+    }
+
+    #[test]
+    fn preserved_copies_use_each_peer_effective_naming_policy() {
+        let fixture = Fixture::new();
+        write_file(&fixture.source().join("conflict.txt"), b"peer A");
+        write_file(&fixture.destination().join("conflict.txt"), b"peer B");
+        write_file(
+            &fixture.destination().join("CONFLICT (PEER A).TXT"),
+            b"occupied under a case-insensitive filesystem",
+        );
+        let profile = fixture.profile().with_mode(SyncMode::Mirror);
+        let resolution = crate::ResolutionRun::start(
+            &profile,
+            [crate::ConflictDecision::new(
+                "conflict.txt",
+                crate::ConflictResolution::PreserveBoth,
+            )],
+            None,
+        )
+        .expect("preservation review should start");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute_resolution_run(
+                RunId::new(1),
+                &resolution,
+                &profile,
+                None,
+                &LocalPrecheckProbe::new(DestinationNamingPolicy::case_insensitive()),
+                |_, _| true,
+                &mut store,
+                || false,
+            )
+            .expect("preservation should honor the effective naming policy");
+
+        let peer_a_copy = report
+            .mirror_resolutions()
+            .iter()
+            .find(|item| item.target_peer() == Some(PeerSide::PeerB))
+            .expect("Peer A copy should target Peer B");
+        assert_eq!(
+            peer_a_copy.generated_path(),
+            Some(Path::new("conflict (Peer A) (2).txt"))
+        );
+        assert_eq!(
+            fs::read(fixture.destination().join(peer_a_copy.generated_path().unwrap())).unwrap(),
+            b"peer A"
+        );
+    }
+
+    #[test]
+    fn deferred_resolution_is_reported_and_keeps_review_cleared_unavailable() {
+        let fixture = Fixture::new();
+        write_file(&fixture.source().join("conflict.txt"), b"peer A");
+        write_file(&fixture.destination().join("conflict.txt"), b"peer B");
+        let profile = fixture.profile().with_mode(SyncMode::Mirror);
+        let resolution = crate::ResolutionRun::start(
+            &profile,
+            [crate::ConflictDecision::new(
+                "conflict.txt",
+                crate::ConflictResolution::Defer,
+            )],
+            None,
+        )
+        .expect("deferred review should start");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute_resolution_run(
+                RunId::new(1),
+                &resolution,
+                &profile,
+                None,
+                &LocalPrecheckProbe::default(),
+                |_, _| true,
+                &mut store,
+                || false,
+            )
+            .expect("deferring does not require a file mutation");
+
+        assert_eq!(report.status(), RunReportStatus::CompletedWithReviewRequired);
+        assert_eq!(report.mirror_resolutions().len(), 1);
+        assert_eq!(
+            report.mirror_resolutions()[0].outcome(),
+            crate::MirrorResolutionOutcome::Deferred
+        );
+        assert!(!report.can_mark_review_cleared());
     }
 
     #[test]

@@ -8,6 +8,8 @@ use crate::{
     JournalEvent, OneWaySource, Peer, PeerSide, PlanActionKind, PlanRecord, PreActionState, RecoveryEvidence,
     PartialTransferPolicy, RecoveryResolution, RetryPolicy, RunEvidenceStore, RunExecutionResult,
     RunId, RunLifecycle, RunReportStatus, RunSnapshot, SyncOptions, SyncProfile, SyncRun,
+    ConflictResolution, MirrorResolutionOutcome, MirrorResolutionReportItem,
+    MirrorResolutionReviewState, ResolutionOperation, SyncMode,
 };
 
 fn profile() -> SyncProfile {
@@ -351,6 +353,92 @@ fn report_distinguishes_every_required_item_outcome_and_keeps_review_work_visibl
         item.outcome(),
         ActionOutcome::RecoveryReview(ActionReason::InterruptedBoundary)
     )));
+}
+
+#[test]
+fn mirror_resolution_evidence_is_durable_and_blocks_review_clear() {
+    let path = TestDatabase::new();
+    let mirror_profile = profile().with_mode(SyncMode::Mirror);
+    let run = RunSnapshot::from_profile(
+        RunId::new(31),
+        &mirror_profile,
+        AuthorizationSnapshot::default(),
+    )
+    .expect("Mirror snapshot");
+    let mut store = RunEvidenceStore::open(path.path()).expect("open evidence store");
+    store.begin_run(&run).expect("persist snapshot");
+    store
+        .record_mirror_resolutions(
+            RunId::new(31),
+            &[
+                MirrorResolutionReportItem::new(
+                    "conflict.txt",
+                    Some("conflict (Peer A).txt"),
+                    ConflictResolution::PreserveBoth,
+                    ResolutionOperation::PreserveBoth,
+                    Some(PeerSide::PeerA),
+                    Some(PeerSide::PeerB),
+                    MirrorResolutionOutcome::Completed,
+                    MirrorResolutionReviewState::ReviewLater,
+                ),
+                MirrorResolutionReportItem::new(
+                    "deferred.txt",
+                    None::<&str>,
+                    ConflictResolution::Defer,
+                    ResolutionOperation::Defer,
+                    None,
+                    None,
+                    MirrorResolutionOutcome::Deferred,
+                    MirrorResolutionReviewState::ReviewLater,
+                ),
+                MirrorResolutionReportItem::new(
+                    "failed.txt",
+                    None::<&str>,
+                    ConflictResolution::KeepPeerA,
+                    ResolutionOperation::CopyWholeFile,
+                    Some(PeerSide::PeerA),
+                    Some(PeerSide::PeerB),
+                MirrorResolutionOutcome::Failed(ActionReason::VerificationMismatch),
+                    MirrorResolutionReviewState::Settled,
+                ),
+                MirrorResolutionReportItem::new(
+                    "malformed-preserve.txt",
+                    None::<&str>,
+                    ConflictResolution::PreserveBoth,
+                    ResolutionOperation::PreserveBoth,
+                    None,
+                    None,
+                    MirrorResolutionOutcome::Completed,
+                    MirrorResolutionReviewState::Settled,
+                ),
+            ],
+        )
+        .expect("persist Mirror resolution evidence");
+
+    let report = store.load_report(RunId::new(31)).expect("load report");
+    assert_eq!(report.mirror_resolutions().len(), 4);
+    assert_eq!(
+        report.mirror_resolutions()[0].generated_path(),
+        Some(std::path::Path::new("conflict (Peer A).txt"))
+    );
+    assert!(report.mirror_resolutions().iter().any(|item| {
+        matches!(
+            item.outcome(),
+            MirrorResolutionOutcome::Failed(ActionReason::VerificationMismatch)
+        )
+    }));
+    let malformed = report
+        .mirror_resolutions()
+        .iter()
+        .find(|item| item.original_path() == std::path::Path::new("malformed-preserve.txt"))
+        .expect("malformed preserve evidence should remain visible");
+    assert_eq!(
+        malformed.review_state(),
+        MirrorResolutionReviewState::ReviewLater
+    );
+    assert!(malformed.requires_review());
+    assert_eq!(report.status(), RunReportStatus::Failed);
+    assert!(!report.can_mark_review_cleared());
 }
 
 #[test]

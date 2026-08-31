@@ -60,7 +60,8 @@ impl std::error::Error for PreservedCopyError {}
 /// normalized filesystems are handled before any filesystem mutation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreservedPathInventory {
-    policy: DestinationNamingPolicy,
+    peer_a_policy: DestinationNamingPolicy,
+    peer_b_policy: DestinationNamingPolicy,
     peer_a: BTreeSet<String>,
     peer_b: BTreeSet<String>,
 }
@@ -71,29 +72,50 @@ impl PreservedPathInventory {
         A: IntoIterator<Item = PathBuf>,
         B: IntoIterator<Item = PathBuf>,
     {
+        Self::new_with_policies(policy.clone(), policy, peer_a, peer_b)
+    }
+
+    pub fn new_with_policies<A, B>(
+        peer_a_policy: DestinationNamingPolicy,
+        peer_b_policy: DestinationNamingPolicy,
+        peer_a: A,
+        peer_b: B,
+    ) -> Self
+    where
+        A: IntoIterator<Item = PathBuf>,
+        B: IntoIterator<Item = PathBuf>,
+    {
         let peer_a = peer_a
             .into_iter()
-            .map(|path| policy.collision_key(&path))
+            .map(|path| peer_a_policy.collision_key(&path))
             .collect();
         let peer_b = peer_b
             .into_iter()
-            .map(|path| policy.collision_key(&path))
+            .map(|path| peer_b_policy.collision_key(&path))
             .collect();
         Self {
-            policy,
+            peer_a_policy,
+            peer_b_policy,
             peer_a,
             peer_b,
         }
     }
 
     pub fn contains(&self, peer: PeerSide, path: &Path) -> bool {
-        let key = self.policy.collision_key(path);
+        let key = self.policy(peer).collision_key(path);
         self.keys(peer).contains(&key)
     }
 
     fn reserve(&mut self, peer: PeerSide, path: &Path) {
-        let key = self.policy.collision_key(path);
+        let key = self.policy(peer).collision_key(path);
         self.keys_mut(peer).insert(key);
+    }
+
+    fn policy(&self, peer: PeerSide) -> &DestinationNamingPolicy {
+        match peer {
+            PeerSide::PeerA => &self.peer_a_policy,
+            PeerSide::PeerB => &self.peer_b_policy,
+        }
     }
 
     fn keys(&self, peer: PeerSide) -> &BTreeSet<String> {
@@ -553,7 +575,10 @@ fn allocate_copy(
         };
         let generated_path = parent.join(generated_name);
 
-        if let Some(rule) = inventory.policy.validate_generated_path(&generated_path) {
+        if let Some(rule) = inventory
+            .policy(target_peer)
+            .validate_generated_path(&generated_path)
+        {
             return Err(PreservedCopyError::InvalidGeneratedPath {
                 path: generated_path,
                 rule,

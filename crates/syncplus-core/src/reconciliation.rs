@@ -7,7 +7,8 @@ use std::{
 
 use crate::{
     ActionJournalEntry, ActionOutcome, ActionReason, AnalysisError, AnalysisOutcome, FreshAnalysis,
-    InventoryItem, ItemType, PlanActionKind, SyncProfile,
+    InventoryItem, ItemType, MirrorDeletionOutcome, MirrorDeletionResult, MirrorEquality,
+    PlanActionKind, SyncProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,6 +411,70 @@ impl CompletionReconciliation {
         current: &FreshAnalysis,
         journal: &[ActionJournalEntry],
     ) -> Self {
+        Self::reconcile_mirror_with_resolutions(
+            profile,
+            peer_a_inventory,
+            peer_b_inventory,
+            current,
+            journal,
+            &[],
+        )
+    }
+
+    /// Reconcile a Mirror run against its frozen inventories and the explicit
+    /// decisions that defined its approved post-resolution state. A Keep
+    /// decision changes the expected target to the selected peer's reviewed
+    /// version; Preserve Both and Defer intentionally remain unresolved.
+    pub fn reconcile_mirror_with_resolutions(
+        profile: &SyncProfile,
+        peer_a_inventory: &SourceInventorySnapshot,
+        peer_b_inventory: &SourceInventorySnapshot,
+        current: &FreshAnalysis,
+        journal: &[ActionJournalEntry],
+        resolutions: &[crate::ConflictResolutionAction],
+    ) -> Self {
+        Self::reconcile_mirror_with_resolutions_and_deletions(
+            profile,
+            peer_a_inventory,
+            peer_b_inventory,
+            current,
+            journal,
+            resolutions,
+            &[],
+        )
+    }
+
+    /// Reconcile a Mirror run after explicit baseline-backed deletion
+    /// outcomes. A completed deletion approves absence on both peers for that
+    /// path; failed or deferred deletion outcomes remain review-required.
+    pub fn reconcile_mirror_with_deletions(
+        profile: &SyncProfile,
+        peer_a_inventory: &SourceInventorySnapshot,
+        peer_b_inventory: &SourceInventorySnapshot,
+        current: &FreshAnalysis,
+        journal: &[ActionJournalEntry],
+        deletions: &[MirrorDeletionResult],
+    ) -> Self {
+        Self::reconcile_mirror_with_resolutions_and_deletions(
+            profile,
+            peer_a_inventory,
+            peer_b_inventory,
+            current,
+            journal,
+            &[],
+            deletions,
+        )
+    }
+
+    pub fn reconcile_mirror_with_resolutions_and_deletions(
+        profile: &SyncProfile,
+        peer_a_inventory: &SourceInventorySnapshot,
+        peer_b_inventory: &SourceInventorySnapshot,
+        current: &FreshAnalysis,
+        journal: &[ActionJournalEntry],
+        resolutions: &[crate::ConflictResolutionAction],
+        deletions: &[MirrorDeletionResult],
+    ) -> Self {
         let mut findings = Vec::new();
         let expected_paths: BTreeSet<PathBuf> = peer_a_inventory
             .items()
@@ -424,10 +489,34 @@ impl CompletionReconciliation {
             .collect();
 
         for relative_path in &expected_paths {
-            let peer_a_expected = peer_a_inventory.item(relative_path);
-            let peer_b_expected = peer_b_inventory.item(relative_path);
+            let reviewed_resolution = resolutions
+                .iter()
+                .find(|action| action.relative_path() == relative_path);
+            let peer_a_expected = match reviewed_resolution.map(|action| action.resolution()) {
+                Some(crate::ConflictResolution::KeepPeerB) => peer_b_inventory.item(relative_path),
+                _ => peer_a_inventory.item(relative_path),
+            };
+            let peer_b_expected = match reviewed_resolution.map(|action| action.resolution()) {
+                Some(crate::ConflictResolution::KeepPeerA) => peer_a_inventory.item(relative_path),
+                _ => peer_b_inventory.item(relative_path),
+            };
             let peer_a_current = current.source_inventory().item(relative_path);
             let peer_b_current = current.destination_inventory().item(relative_path);
+
+            if deletions.iter().any(|result| {
+                result.relative_path() == relative_path
+                    && result.outcome() == MirrorDeletionOutcome::Completed
+                    && !result.requires_review()
+            }) {
+                if peer_a_current.is_some() || peer_b_current.is_some() {
+                    push_unique(
+                        &mut findings,
+                        relative_path.clone(),
+                        ReconciliationReason::Changed,
+                    );
+                }
+                continue;
+            }
 
             if peer_a_expected
                 .is_some_and(|item| item.outcome() == AnalysisOutcome::Excluded)
@@ -466,10 +555,20 @@ impl CompletionReconciliation {
             match (peer_a_expected, peer_b_expected) {
                 (Some(peer_a_expected), Some(peer_b_expected)) => {
                     let stable = peer_a_current
-                        .is_some_and(|current| source_matches_snapshot(profile, peer_a_expected, current))
+                        .is_some_and(|current| {
+                            mirror_item_matches(profile, peer_a_expected, current)
+                        })
                         && peer_b_current
-                            .is_some_and(|current| source_matches_snapshot(profile, peer_b_expected, current));
-                    if !stable || !snapshot_items_match(peer_a_expected, peer_b_expected) {
+                            .is_some_and(|current| {
+                                mirror_item_matches(profile, peer_b_expected, current)
+                            });
+                    if !stable
+                        || !snapshot_items_match(
+                            profile.options().metadata,
+                            peer_a_expected,
+                            peer_b_expected,
+                        )
+                    {
                         push_unique(
                             &mut findings,
                             relative_path.clone(),
@@ -479,7 +578,9 @@ impl CompletionReconciliation {
                 }
                 (Some(peer_a_expected), None) => {
                     let source_stable = peer_a_current
-                        .is_some_and(|current| source_matches_snapshot(profile, peer_a_expected, current));
+                        .is_some_and(|current| {
+                            mirror_item_matches(profile, peer_a_expected, current)
+                        });
                     let destination_verified = peer_b_current
                         .is_some_and(|current| destination_matches_source(profile, peer_a_expected, current));
                     if !source_stable || !destination_verified {
@@ -492,7 +593,9 @@ impl CompletionReconciliation {
                 }
                 (None, Some(peer_b_expected)) => {
                     let source_stable = peer_b_current
-                        .is_some_and(|current| source_matches_snapshot(profile, peer_b_expected, current));
+                        .is_some_and(|current| {
+                            mirror_item_matches(profile, peer_b_expected, current)
+                        });
                     let destination_verified = peer_a_current
                         .is_some_and(|current| destination_matches_source(profile, peer_b_expected, current));
                     if !source_stable || !destination_verified {
@@ -604,35 +707,24 @@ fn destination_matches_source(
     expected: &InventorySnapshotItem,
     destination: &InventoryItem,
 ) -> bool {
-    if destination.outcome() != AnalysisOutcome::Included
-        || expected.item_type() != destination.item_type()
-    {
-        return false;
-    }
-    if expected.executable_permissions() != destination.metadata().executable_permissions() {
-        return false;
-    }
-    match expected.item_type() {
-        ItemType::RegularFile => {
-            expected.size() == destination.metadata().size()
-                && expected.content_fingerprint().is_some()
-                && expected.content_fingerprint() == destination.content_fingerprint()
-        }
-        ItemType::Symlink => {
-            !profile.options().metadata.symlink_targets()
-                || expected.symlink_target() == destination.metadata().symlink_target()
-        }
-        ItemType::Directory => true,
-        ItemType::Unsupported => false,
-    }
+    mirror_item_matches(profile, expected, destination)
 }
 
-fn snapshot_items_match(left: &InventorySnapshotItem, right: &InventorySnapshotItem) -> bool {
-    left.item_type() == right.item_type()
-        && left.size() == right.size()
-        && left.executable_permissions() == right.executable_permissions()
-        && left.symlink_target() == right.symlink_target()
-        && left.content_fingerprint() == right.content_fingerprint()
+fn mirror_item_matches(
+    profile: &SyncProfile,
+    expected: &InventorySnapshotItem,
+    current: &InventoryItem,
+) -> bool {
+    let current = InventorySnapshotItem::from_item(current);
+    MirrorEquality::new(profile.options().metadata).equal(expected, &current)
+}
+
+fn snapshot_items_match(
+    metadata: crate::MetadataRequirements,
+    left: &InventorySnapshotItem,
+    right: &InventorySnapshotItem,
+) -> bool {
+    MirrorEquality::new(metadata).equal(left, right)
 }
 
 fn removal_evidence_matches(expected: &InventorySnapshotItem, evidence: &crate::RecoveryEvidence) -> bool {
@@ -844,5 +936,52 @@ mod tests {
                 && finding.kind() == ReconciliationFindingKind::Unexplained
         }));
         assert_eq!(result.source_drain_status(), SourceDrainStatus::NotEmpty);
+    }
+
+    #[test]
+    fn mirror_reconciliation_checks_enabled_timestamp_metadata_on_first_run_copies() {
+        let fixture = Fixture::new();
+        let source_path = fixture.source().join("timestamped.txt");
+        let destination_path = fixture.destination().join("timestamped.txt");
+        write(&source_path, b"same bytes");
+        let source_time = UNIX_EPOCH + std::time::Duration::from_secs(10);
+        fs::File::open(&source_path)
+            .expect("source should open")
+            .set_times(std::fs::FileTimes::new().set_modified(source_time))
+            .expect("source timestamp should be set");
+        let profile = fixture
+            .profile()
+            .with_mode(crate::SyncMode::Mirror)
+            .with_options(SyncOptions {
+                safe_delete: false,
+                deletion_method: None,
+                metadata: crate::MetadataRequirements::new(true, true, true, true),
+                ..SyncOptions::default()
+            });
+        let initial = FreshAnalysis::analyze(&profile).expect("initial analysis");
+        let peer_a = SourceInventorySnapshot::from_inventory(initial.source_inventory());
+        let peer_b = SourceInventorySnapshot::from_inventory(initial.destination_inventory());
+
+        write(&destination_path, b"same bytes");
+        let destination_time = UNIX_EPOCH + std::time::Duration::from_secs(11);
+        fs::File::open(&destination_path)
+            .expect("destination should open")
+            .set_times(std::fs::FileTimes::new().set_modified(destination_time))
+            .expect("destination timestamp should be set");
+        let current = FreshAnalysis::analyze(&profile).expect("current analysis");
+
+        let result = CompletionReconciliation::reconcile_mirror(
+            &profile,
+            &peer_a,
+            &peer_b,
+            &current,
+            &[],
+        );
+
+        assert!(result.requires_review());
+        assert!(result.findings().iter().any(|finding| {
+            finding.relative_path() == Path::new("timestamped.txt")
+                && finding.kind() == ReconciliationFindingKind::Unverifiable
+        }));
     }
 }

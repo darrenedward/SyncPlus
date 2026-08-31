@@ -1,6 +1,6 @@
 # SyncPlus — a safety-first desktop synchronization app
 
-> Status: implementation complete pending review · 2026-08-30 · controlled transfer, cancellation, interruption classification, bounded retry, Fresh Analysis resume, and integrated Completion Reconciliation are implemented for issues #13–#16, including frozen Source Inventories, durable reconciliation findings, and fail-closed completion gates
+> Status: implementation complete pending review · 2026-08-31 · Mirror Resolution Runs now share the verified workflow, durable resolution reports, and strict two-peer Completion Reconciliation for issue #47
 
 ## Product goal
 
@@ -178,6 +178,7 @@ The shared core `RunWorkflow` persists the frozen Source Inventory and complete 
 - Mirror deletion candidates are derived only when a two-sided Sync Baseline proves one peer absent and the remaining peer unchanged. Each candidate exposes its baseline/current evidence and affected peer; a missing baseline, changed counterpart, exclusion, or other uncertainty produces no deletion candidate.
 - Mirror deletion requires an explicit per-path decision and final Execution Confirmation. A failed deletion preserves the remaining copy and leaves the Mirror Invariant unresolved.
 - A Resolution Run starts with Fresh Analysis, binds every reviewed decision to both peer revisions and the applicable Sync Baseline state, and refuses stale content, metadata, path identity, or baseline evidence. Data-changing resolutions require fresh Execution Confirmation; failed actions remain unresolved and preserved.
+- Resolution Runs execute through the shared core workflow, persist each reviewed outcome and preserved-copy path in SQLite, and reconcile Keep decisions against the selected post-resolution version before updating the Sync Baseline.
 - Preserved conflict copies use the effective destination naming policy to reserve deterministic generated paths before execution. The local preserved-copy boundary creates each copy with no-replace installation, verifies its content, and reports any failed copy as Review Later; a later Resolution Run owns explicit removal.
 - Only successfully reconciled and verified paths enter the Sync Baseline.
 
