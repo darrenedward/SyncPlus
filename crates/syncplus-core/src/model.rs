@@ -240,9 +240,21 @@ impl fmt::Display for SshPeerError {
 impl std::error::Error for SshPeerError {}
 
 fn is_valid_ssh_server(server: &str) -> bool {
+    if server.starts_with('[') || server.ends_with(']') {
+        let Some(address) = server.strip_prefix('[').and_then(|value| value.strip_suffix(']'))
+        else {
+            return false;
+        };
+        return !address.is_empty()
+            && address.chars().all(|character| {
+                character.is_ascii_hexdigit()
+                    || character.is_ascii_alphanumeric()
+                    || matches!(character, ':' | '%' | '.' | '-')
+            });
+    }
+
     server.chars().all(|character| {
-        character.is_ascii_alphanumeric()
-            || matches!(character, '.' | '-' | ':' | '[' | ']' | '%')
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '-')
     })
 }
 

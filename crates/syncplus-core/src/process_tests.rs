@@ -144,7 +144,7 @@ fn local_to_ssh_profiles_use_structured_transport_and_remote_path_arguments() {
         .expect("the remote peer should be one typed argument");
     assert_eq!(
         remote_target.to_string_lossy(),
-        "sync-user@backup.example.test:'/srv/sync/$(touch pwned); user'\\''s report/世界\n'"
+        "sync-user@backup.example.test:/srv/sync/$(touch pwned); user's report/世界\n"
     );
     assert!(invocation.arguments().iter().any(|argument| {
         argument == "--rsh=ssh -p 2222 -i '/home/user/.ssh/id_sync'"
@@ -162,6 +162,13 @@ fn local_to_ssh_profiles_use_structured_transport_and_remote_path_arguments() {
         .iter()
         .all(|argument| argument != "touch"));
     assert!(specification.preview().contains("backup.example.test:"));
+    assert_eq!(
+        specification
+            .ssh_transport()
+            .expect("the SSH transport should be present")
+            .authentication(),
+        SshAuthentication::Key
+    );
 }
 
 #[test]
@@ -184,7 +191,7 @@ fn ssh_to_local_profiles_reverse_the_typed_peer_arguments() {
 
     assert_eq!(
         invocation.arguments()[end_of_options + 1].to_string_lossy(),
-        "sync-user@backup.example.test:'/srv/sync/incoming'"
+        "sync-user@backup.example.test:/srv/sync/incoming"
     );
     assert_eq!(
         invocation.arguments()[end_of_options + 2],
@@ -283,6 +290,17 @@ fn malformed_ssh_fields_are_rejected_at_the_structured_peer_boundary() {
     assert!(matches!(cases[3], Err(SshPeerError::InvalidPort)));
     assert!(matches!(cases[4], Err(SshPeerError::EmptyRemotePath)));
     assert!(matches!(cases[5], Err(SshPeerError::NulInRemotePath)));
+    assert!(matches!(
+        SshPeer::new(
+            "backup.example.test:2222",
+            "sync-user",
+            22,
+            None,
+            SshAuthentication::Agent,
+            "/srv/sync",
+        ),
+        Err(SshPeerError::InvalidServer)
+    ));
 }
 
 #[test]

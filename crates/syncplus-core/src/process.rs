@@ -97,6 +97,7 @@ impl SshTarget {
 pub struct SshTransport {
     port: u16,
     identity: Option<PathBuf>,
+    authentication: crate::SshAuthentication,
 }
 
 impl SshTransport {
@@ -104,6 +105,7 @@ impl SshTransport {
         Self {
             port: peer.port(),
             identity: peer.identity().map(Path::to_path_buf),
+            authentication: peer.authentication(),
         }
     }
 
@@ -113,6 +115,10 @@ impl SshTransport {
 
     pub fn identity(&self) -> Option<&Path> {
         self.identity.as_deref()
+    }
+
+    pub const fn authentication(&self) -> crate::SshAuthentication {
+        self.authentication
     }
 }
 
@@ -589,7 +595,9 @@ impl SshTarget {
         target.push("@");
         target.push(self.server.as_str());
         target.push(":");
-        target.push(encode_remote_shell_word(&self.remote_path));
+        // This is one argv item. Rsync owns the subsequent remote-shell
+        // escaping, so quotes must not be inserted into this value.
+        target.push(self.remote_path.as_os_str());
         target
     }
 }
