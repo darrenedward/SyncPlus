@@ -2,6 +2,7 @@ mod model;
 mod process;
 mod analysis;
 mod conflict;
+mod resolution;
 mod baseline;
 mod evidence;
 mod precheck;
@@ -35,6 +36,10 @@ pub use analysis::{
 };
 pub use conflict::{
     ConflictEntry, ConflictEvidence, ConflictKind, ConflictReview, FileReviewClassification,
+};
+pub use resolution::{
+    ConflictDecision, ConflictResolution, ConflictResolutionAction, ConflictResolutionError,
+    ConflictResolutionPlan, ConfirmedConflictResolutionPlan, ResolutionOperation,
 };
 pub use baseline::{
     MirrorEquality, SyncBaseline, SyncBaselineComparison, SyncBaselineItem,
@@ -88,6 +93,11 @@ mod analysis_tests;
 
 #[cfg(test)]
 mod conflict_tests;
+
+#[cfg(test)]
+mod resolution_tests;
+
+#[cfg(test)]
 mod baseline_tests;
 
 #[cfg(test)]
