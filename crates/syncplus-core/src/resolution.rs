@@ -106,6 +106,10 @@ pub struct ConflictResolutionAction {
 }
 
 impl ConflictResolutionAction {
+    pub fn new(relative_path: impl Into<PathBuf>, resolution: ConflictResolution) -> Self {
+        Self::from_decision(ConflictDecision::new(relative_path, resolution))
+    }
+
     fn from_decision(decision: ConflictDecision) -> Self {
         let (operation, source_side, target_side) = match decision.resolution {
             ConflictResolution::KeepPeerA => (

@@ -1501,6 +1501,22 @@ impl DestinationNamingPolicy {
         self
     }
 
+    /// Return the path key used to detect collisions for this effective
+    /// destination policy. Callers should pass the policy selected for the
+    /// actual destination filesystem, including its case and normalization
+    /// behavior.
+    pub fn collision_key(&self, path: &Path) -> String {
+        self.key(path)
+    }
+
+    /// Validate a generated relative path against this destination policy.
+    /// The path is still relative here; the destination root is intentionally
+    /// not part of the generated-name decision.
+    pub fn validate_generated_path(&self, relative: &Path) -> Option<NamingRule> {
+        self.validate_relative(relative, relative.to_path_buf())
+            .map(|conflict| conflict.rule())
+    }
+
     fn find_conflicts(
         &self,
         source: &Path,
