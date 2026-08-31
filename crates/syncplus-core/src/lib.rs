@@ -21,6 +21,7 @@ mod workflow;
 mod reconciliation;
 mod volume;
 mod ssh_host;
+mod ssh;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
@@ -28,6 +29,12 @@ pub use model::{
     OneWaySource, PartialTransferPolicy, Peer, PeerEndpoint, ProfileSnapshot, ProfileSnapshotId,
     RetryPolicy, RunEvent, RunId, RunState, SafetyViolation, SshAuthentication, SshPeer,
     SshPeerError, SyncMode, SyncOptions, SyncProfile, SyncRun, TerminalOutcome,
+    SavedSecretReference, SecretReferenceError,
+};
+pub use ssh::{
+    AskpassError, AskpassProvider, CredentialAvailability, CredentialResolutionError,
+    CredentialResolver, DesktopKeyring, PasswordSource, ResolvedSshCredential, SecretStore,
+    SecretStoreError, SecretValue, SshRunMode, SystemCredentialAvailability, SSH_KEYRING_SERVICE,
 };
 pub use ssh_host::{
     HostTrustDecision, HostTrustError, HostTrustMode, HostTrustStoreError, SshHost,

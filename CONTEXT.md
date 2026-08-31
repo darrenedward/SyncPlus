@@ -306,6 +306,7 @@ _Avoid_: Hostname alone, automatic trust
 
 **SSH Authentication Preference**:
 SSH key authentication is the recommended default and is presented through a simple connection flow; password authentication is an optional fallback and, if saved, uses a Saved Secret in the desktop keyring.
+The core represents a saved password with an opaque reference and resolves exactly the selected method; a missing key, keyring secret, or controlled prompt stops the run without trying another credential.
 _Avoid_: Password-first, key-only UI requirement
 
 **SSH Connection Wizard**:

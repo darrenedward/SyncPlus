@@ -147,7 +147,7 @@ fn local_to_ssh_profiles_use_structured_transport_and_remote_path_arguments() {
         "sync-user@backup.example.test:/srv/sync/$(touch pwned); user's report/世界\n"
     );
     assert!(invocation.arguments().iter().any(|argument| {
-        argument == "--rsh=ssh -p 2222 -i '/home/user/.ssh/id_sync'"
+        argument == "--rsh=ssh -p 2222 -o IdentitiesOnly=yes -o IdentityAgent=none -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -i '/home/user/.ssh/id_sync'"
     }));
     assert_eq!(
         invocation
@@ -197,6 +197,61 @@ fn ssh_to_local_profiles_reverse_the_typed_peer_arguments() {
         invocation.arguments()[end_of_options + 2],
         "/home/user/destination"
     );
+}
+
+#[test]
+fn ssh_transport_disables_unselected_authentication_methods() {
+    let cases = [
+        (
+            SshAuthentication::Key,
+            Some(PathBuf::from("/home/user/.ssh/id_sync")),
+            "--rsh=ssh -p 2222 -o IdentitiesOnly=yes -o IdentityAgent=none -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -i '/home/user/.ssh/id_sync'",
+        ),
+        (
+            SshAuthentication::Agent,
+            None,
+            "--rsh=ssh -p 2222 -o IdentityFile=none -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no",
+        ),
+        (
+            SshAuthentication::InteractivePassword,
+            None,
+            "--rsh=ssh -p 2222 -o IdentityFile=none -o IdentityAgent=none -o PreferredAuthentications=keyboard-interactive,password -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes",
+        ),
+        (
+            SshAuthentication::SavedPassword(
+                crate::SavedSecretReference::new("backup-password").expect("valid reference"),
+            ),
+            None,
+            "--rsh=ssh -p 2222 -o IdentityFile=none -o IdentityAgent=none -o PreferredAuthentications=keyboard-interactive,password -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes",
+        ),
+    ];
+
+    for (authentication, identity, expected_transport) in cases {
+        let remote = Peer::ssh(
+            "SSH peer",
+            "backup.example.test",
+            "sync-user",
+            2222,
+            identity,
+            authentication,
+            "/srv/sync",
+        )
+        .expect("SSH fixture should be valid");
+        let profile = SyncProfile::new(
+            "SSH profile",
+            Peer::new("Local", PathBuf::from("/source")),
+            remote,
+        );
+        let invocation = ProcessSpecification::from_profile(&profile)
+            .expect("valid SSH profile")
+            .invocation()
+            .expect("One-Way invocation");
+
+        assert!(invocation
+            .arguments()
+            .iter()
+            .any(|argument| argument == expected_transport));
+    }
 }
 
 #[test]
@@ -300,6 +355,17 @@ fn malformed_ssh_fields_are_rejected_at_the_structured_peer_boundary() {
             "/srv/sync",
         ),
         Err(SshPeerError::InvalidServer)
+    ));
+    assert!(matches!(
+        SshPeer::new(
+            "backup.example.test",
+            "sync-user",
+            22,
+            None,
+            SshAuthentication::Key,
+            "/srv/sync",
+        ),
+        Err(SshPeerError::MissingIdentityForKey)
     ));
 }
 

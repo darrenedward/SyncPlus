@@ -207,6 +207,7 @@ V1 supports one local peer and one SSH peer in either direction. SSH-to-SSH is n
 - SSH keys are recommended; the identity-file picker defaults to `~/.ssh`.
 - Interactive password authentication is supported through a controlled askpass bridge. Passwords are held in memory only unless the user explicitly saves a secret in the desktop keyring.
 - Unattended SSH requires a noninteractive credential available through the configured key, SSH agent, or keyring. Missing credentials stop and notify; there is no hidden prompt or silent fallback.
+- Core credential resolution carries only the selected key, agent, or in-memory askpass/keyring secret; saved-password profile state is an opaque keyring reference.
 - A new host fingerprint requires explicit approval. A changed fingerprint is rejected and reported for review.
 - Host-trust state is persisted as a nonsecret server/port fingerprint record; only an explicit interactive approval can create or replace that record.
 - A non-mutating remote preflight verifies compatible `rsync` and controlled SHA-256 capability before changes.

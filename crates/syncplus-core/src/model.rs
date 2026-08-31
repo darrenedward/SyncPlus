@@ -45,12 +45,71 @@ pub enum PeerEndpoint {
     Ssh(SshPeer),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshAuthentication {
     Key,
     Agent,
     InteractivePassword,
+    SavedPassword(SavedSecretReference),
 }
+
+impl Default for SshAuthentication {
+    fn default() -> Self {
+        Self::Key
+    }
+}
+
+/// A nonsecret identifier for a password stored in the desktop OS keyring.
+/// The password itself is never part of a profile or run snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SavedSecretReference {
+    id: String,
+}
+
+impl SavedSecretReference {
+    const MAX_LENGTH: usize = 128;
+
+    pub fn new(id: impl Into<String>) -> Result<Self, SecretReferenceError> {
+        let id = id.into();
+        if id.is_empty() {
+            return Err(SecretReferenceError::Empty);
+        }
+        if id.len() > Self::MAX_LENGTH {
+            return Err(SecretReferenceError::TooLong);
+        }
+        if !id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-'))
+        {
+            return Err(SecretReferenceError::Invalid);
+        }
+        Ok(Self { id })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.id
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretReferenceError {
+    Empty,
+    Invalid,
+    TooLong,
+}
+
+impl fmt::Display for SecretReferenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::Empty => "saved secret reference must not be empty",
+            Self::Invalid => "saved secret reference contains unsupported characters",
+            Self::TooLong => "saved secret reference is too long",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for SecretReferenceError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshPeer {
@@ -71,6 +130,7 @@ pub enum SshPeerError {
     InvalidPort,
     EmptyIdentity,
     NulInIdentity,
+    MissingIdentityForKey,
     EmptyRemotePath,
     NulInRemotePath,
 }
@@ -113,6 +173,10 @@ impl SshPeer {
             }
         }
 
+        if matches!(&authentication, SshAuthentication::Key) && identity.is_none() {
+            return Err(SshPeerError::MissingIdentityForKey);
+        }
+
         let remote_path = remote_path.into();
         if remote_path.is_empty() {
             return Err(SshPeerError::EmptyRemotePath);
@@ -147,8 +211,8 @@ impl SshPeer {
         self.identity.as_deref()
     }
 
-    pub const fn authentication(&self) -> SshAuthentication {
-        self.authentication
+    pub fn authentication(&self) -> SshAuthentication {
+        self.authentication.clone()
     }
 
     pub fn remote_path(&self) -> &Path {
@@ -230,6 +294,9 @@ impl fmt::Display for SshPeerError {
             Self::InvalidPort => "SSH port must be between 1 and 65535",
             Self::EmptyIdentity => "SSH identity path must not be empty",
             Self::NulInIdentity => "SSH identity path contains NUL",
+            Self::MissingIdentityForKey => {
+                "SSH key authentication requires a selected identity file"
+            }
             Self::EmptyRemotePath => "SSH remote path must not be empty",
             Self::NulInRemotePath => "SSH remote path contains NUL",
         };
