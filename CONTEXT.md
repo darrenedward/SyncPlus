@@ -40,6 +40,12 @@ The first Mirror Sync has no Sync Baseline. One-sided items are treated as copy 
 
 Only paths successfully reconciled and verified enter the Sync Baseline. Skipped, failed, unstable, or otherwise unresolved paths remain unsettled.
 
+The baseline is durable SQLite evidence associated with the Sync Profile and
+peer pair. Later comparisons classify each peer's path state as unchanged,
+new, changed, or absent using Mirror Equality; content and item type are always
+fundamental, while other fields are checked only when their named metadata
+requirement is enabled.
+
 **Resolution**:
 The per-path decision that determines whether a conflict is copied from peer A to peer B, from peer B to peer A, preserved on both peers, skipped, or otherwise handled.
 _Avoid_: Merge, overwrite

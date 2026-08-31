@@ -175,6 +175,12 @@ The shared core `RunWorkflow` persists the frozen Source Inventory and complete 
 - Same-hash files at different paths are possible duplicates/rename candidates only; hash equality never automatically moves or deletes them.
 - Only successfully reconciled and verified paths enter the Sync Baseline.
 
+The core `SyncBaseline` is persisted in SQLite per Sync Profile and peer pair. It
+stores the verified state of each settled path and compares later inventories
+per peer as unchanged, new, changed, or absent. `MirrorEquality` always
+requires content and item type and applies only the enabled metadata
+requirements; unavailable required evidence leaves a path unsettled.
+
 ## Filesystem and path policy
 
 - Hidden files and folders are included by default.

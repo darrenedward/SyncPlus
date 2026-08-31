@@ -1029,7 +1029,11 @@ fn build_plan(
             Some(destination_item)
                 if !destination_item.is_eligible() => None,
             Some(destination_item)
-                if !same_item_state(source_item, destination_item) =>
+                if !same_item_state(
+                    source_item,
+                    destination_item,
+                    specification.options().metadata(),
+                ) =>
             {
                 Some(PlanActionKind::OverwriteDestination)
             }
@@ -1098,28 +1102,12 @@ fn build_plan(
     Ok(plan)
 }
 
-fn same_item_state(source_item: &InventoryItem, destination_item: &InventoryItem) -> bool {
-    if source_item.item_type != destination_item.item_type {
-        return false;
-    }
-
-    let source_metadata = &source_item.metadata;
-    let destination_metadata = &destination_item.metadata;
-    if source_metadata.size != destination_metadata.size
-        || source_metadata.modified_at != destination_metadata.modified_at
-        || source_metadata.readonly != destination_metadata.readonly
-        || source_metadata.executable_permissions()
-            != destination_metadata.executable_permissions()
-        || source_metadata.symlink_target != destination_metadata.symlink_target
-    {
-        return false;
-    }
-
-    if source_item.item_type != ItemType::RegularFile {
-        return true;
-    }
-
-    source_item.content_fingerprint == destination_item.content_fingerprint
+fn same_item_state(
+    source_item: &InventoryItem,
+    destination_item: &InventoryItem,
+    metadata: crate::MetadataRequirements,
+) -> bool {
+    crate::MirrorEquality::new(metadata).equal_inventory(source_item, destination_item)
 }
 
 fn consequence_for(kind: PlanActionKind) -> &'static str {

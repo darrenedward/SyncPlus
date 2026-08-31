@@ -16,7 +16,7 @@ use crate::{
     RunReport, RunReportStatus, RunSnapshot, SafeDeleteError, ScopeLockOwner,
     PeerScopeLockRegistry,
     SourceInventorySnapshot, StorageError, TransferError, VerificationError,
-    VerifiedReplacement, CompletionReconciliation, PrecheckBlocked,
+    VerifiedReplacement, CompletionReconciliation, PrecheckBlocked, SyncBaseline,
 };
 
 #[derive(Debug)]
@@ -508,9 +508,9 @@ impl RunWorkflow {
         store: &mut RunEvidenceStore,
     ) -> Result<RunReport, WorkflowError> {
         let journal = store.load_journal(run_id)?;
-        let reconciliation = match FreshAnalysis::analyze(profile) {
+        let (reconciliation, current_analysis) = match FreshAnalysis::analyze(profile) {
             Ok(current) => {
-                if profile.mode() == crate::SyncMode::Mirror {
+                let reconciliation = if profile.mode() == crate::SyncMode::Mirror {
                     CompletionReconciliation::reconcile_mirror(
                         profile,
                         inventory,
@@ -520,13 +520,33 @@ impl RunWorkflow {
                     )
                 } else {
                     CompletionReconciliation::reconcile(profile, inventory, &current, &journal)
-                }
+                };
+                (reconciliation, Some(current))
             }
             Err(error) => {
-                CompletionReconciliation::unavailable(profile, inventory, &journal, &error)
+                (
+                    CompletionReconciliation::unavailable(profile, inventory, &journal, &error),
+                    None,
+                )
             }
         };
         store.record_reconciliation(run_id, &reconciliation)?;
+        if profile.mode() == crate::SyncMode::Mirror {
+            if let Some(current) = current_analysis.as_ref() {
+                let current_peer_a = SourceInventorySnapshot::from_inventory(current.source_inventory());
+                let current_peer_b =
+                    SourceInventorySnapshot::from_inventory(current.destination_inventory());
+                let baseline = SyncBaseline::from_reconciled_inventories(
+                    profile.name(),
+                    &current_peer_a,
+                    &current_peer_b,
+                    &journal,
+                    &reconciliation,
+                    profile.options().metadata,
+                );
+                store.update_mirror_baseline(&baseline)?;
+            }
+        }
         Ok(store.load_report(run_id)?)
     }
 
@@ -1234,6 +1254,15 @@ mod tests {
         assert_eq!(fs::read(fixture.source().join("from-b.txt")).unwrap(), b"from B");
         assert_eq!(report.peer_a_inventory().unwrap().peer_name(), "source");
         assert_eq!(report.peer_b_inventory().unwrap().peer_name(), "destination");
+        let baseline = store
+            .load_mirror_baseline(profile.name())
+            .expect("the Mirror baseline should load")
+            .expect("a completed Mirror run should persist a baseline");
+        assert_eq!(baseline.items().len(), 2);
+        assert!(baseline.item("from-a.txt").unwrap().peer_a().is_some());
+        assert!(baseline.item("from-a.txt").unwrap().peer_b().is_some());
+        assert!(baseline.item("from-b.txt").unwrap().peer_a().is_some());
+        assert!(baseline.item("from-b.txt").unwrap().peer_b().is_some());
 
         let from_a = report
             .items()

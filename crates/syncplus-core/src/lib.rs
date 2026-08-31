@@ -2,6 +2,7 @@ mod model;
 mod process;
 mod analysis;
 mod conflict;
+mod baseline;
 mod evidence;
 mod precheck;
 mod scope_lock;
@@ -34,6 +35,10 @@ pub use analysis::{
 };
 pub use conflict::{
     ConflictEntry, ConflictEvidence, ConflictKind, ConflictReview, FileReviewClassification,
+};
+pub use baseline::{
+    MirrorEquality, SyncBaseline, SyncBaselineComparison, SyncBaselineItem,
+    SyncBaselineItemState, SyncBaselineItemStatus,
 };
 pub use evidence::{
     ActionId, ActionJournalEntry, ActionOutcome, ActionReason, FileIdentity,
@@ -83,6 +88,7 @@ mod analysis_tests;
 
 #[cfg(test)]
 mod conflict_tests;
+mod baseline_tests;
 
 #[cfg(test)]
 mod evidence_tests;
