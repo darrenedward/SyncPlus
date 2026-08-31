@@ -129,6 +129,13 @@ impl ConflictEntry {
     pub const fn is_read_only(&self) -> bool {
         true
     }
+
+    /// Every review entry uses the same explicit whole-file decision set. The
+    /// selected decision is validated separately before it can become an
+    /// executable resolution plan.
+    pub const fn available_resolutions(&self) -> &'static [crate::ConflictResolution; 5] {
+        crate::ConflictResolution::all()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

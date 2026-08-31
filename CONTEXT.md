@@ -50,6 +50,12 @@ requirement is enabled.
 The per-path decision that determines whether a conflict is copied from peer A to peer B, from peer B to peer A, preserved on both peers, skipped, or otherwise handled.
 _Avoid_: Merge, overwrite
 
+The typed Mirror choices are **Keep Peer A**, **Keep Peer B**, **Preserve Both**,
+**Rename/Preserve for Review**, and **Defer**. SyncPlus requires one decision for
+each reviewed path and a final Execution Confirmation before exposing any
+whole-file copy operation. Preservation and deferral never remove either peer
+version and keep the run reviewable.
+
 **Removal**:
 An action that deletes a path from one peer because the reviewed synchronization decision requires it to be absent there.
 _Avoid_: Cleanup, overwrite
