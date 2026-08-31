@@ -10,6 +10,7 @@ mod verification;
 mod replacement;
 mod transfer;
 mod removal;
+mod restore;
 mod workflow;
 mod reconciliation;
 mod volume;
@@ -48,6 +49,7 @@ pub use verification::{
 };
 pub use transfer::{ControlledTransfer, TransferError};
 pub use removal::{RecoveryMethod, RemovalReceipt, SafeDeleteError, SafeDeleteExecutor};
+pub use restore::{CollisionSafeRestore, RecoveryProvenance, RestoreError, RestoreJournalEvent, RestoreOutcome};
 pub use workflow::{RunWorkflow, WorkflowError};
 pub use reconciliation::{
     CompletionReconciliation, InventorySnapshotItem, ReconciliationFinding,
@@ -88,3 +90,5 @@ mod volume_tests;
 
 #[cfg(test)]
 mod removal_tests;
+#[cfg(test)]
+mod restore_tests;
