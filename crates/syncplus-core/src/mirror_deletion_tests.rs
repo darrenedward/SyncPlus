@@ -71,6 +71,20 @@ fn changed_remaining_peer_is_not_safe_deletion_evidence() {
 }
 
 #[test]
+fn divergent_two_sided_baseline_is_not_deletion_evidence() {
+    let baseline = SyncBaseline::from_inventories(
+        "profile",
+        &inventory("A", vec![file("gone.txt", 2)]),
+        &inventory("B", vec![file("gone.txt", 1)]),
+        Default::default(),
+    );
+    let current_a = inventory("A", Vec::new());
+    let current_b = inventory("B", vec![file("gone.txt", 1)]);
+
+    assert!(baseline.deletion_candidates(&current_a, &current_b).is_empty());
+}
+
+#[test]
 fn an_excluded_current_path_is_not_treated_as_a_deletion() {
     let baseline = settled_baseline();
     let excluded = InventorySnapshotItem::from_parts_with_permissions(

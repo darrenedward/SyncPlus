@@ -245,6 +245,10 @@ impl SyncBaselineItemState {
         let current = Self::from_snapshot(current);
         self.equal(&current, equality)
     }
+
+    pub(crate) fn equal_state(&self, other: &Self, equality: MirrorEquality) -> bool {
+        self.equal(other, equality)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

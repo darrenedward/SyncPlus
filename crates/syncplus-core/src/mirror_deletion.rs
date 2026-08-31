@@ -215,6 +215,9 @@ impl SyncBaseline {
             let Some(baseline_b) = baseline_item.peer_b() else {
                 continue;
             };
+            if !baseline_a.equal_state(baseline_b, equality) {
+                continue;
+            }
             let path = baseline_item.relative_path();
             let item_a = current_a.get(path).copied();
             let item_b = current_b.get(path).copied();
@@ -378,6 +381,15 @@ impl MirrorDeletionAction {
     }
 
     pub fn completed(&self) -> MirrorDeletionResult {
+        if !self.mutates_files() {
+            return MirrorDeletionResult {
+                relative_path: self.candidate.relative_path.clone(),
+                affected_peer: self.candidate.affected_peer,
+                outcome: MirrorDeletionOutcome::Deferred,
+                preserves_remaining_copy: true,
+                mirror_invariant_restored: false,
+            };
+        }
         MirrorDeletionResult {
             relative_path: self.candidate.relative_path.clone(),
             affected_peer: self.candidate.affected_peer,
