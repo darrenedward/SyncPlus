@@ -108,7 +108,12 @@ pub use precheck::{
     NamingConflict, NamingRule, PathRiskLevel, PathRiskWarning, PrecheckBlocker,
     PrecheckBlockerKind, PrecheckBlocked, PrecheckError, PrecheckErrorKind, PrecheckFailure,
     PrecheckLease, PrecheckProbe, PrecheckResult, PermissionIssue, RunPrecheck,
-    SpecialistMetadataCapabilities,
+    RemoteAccessRequirements, RemotePrecheckBlocker, RemotePrecheckBlockerKind,
+    RemotePrecheckBlocked, RemotePrecheckError, RemotePrecheckObservation,
+    RemotePrecheckPermit, RemotePrecheckProfileError, RemotePrecheckRequest,
+    RemotePrecheckResult, RemoteRsyncCapability, RemoteSha256Capability,
+    RemoteTrashCapability, RemoteTrashCapabilityError, SpecialistMetadataCapabilities,
+    SshRemotePrecheckProbe, SshRemotePrecheck,
 };
 pub use scope_lock::{
     PeerScope, PeerScopeLock, PeerScopeLockRegistry, ScopeLockConflict, ScopeLockError,

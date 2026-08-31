@@ -10,8 +10,8 @@ use unicode_normalization::UnicodeNormalization;
 use crate::{
     DeletionMethod, Peer, PeerScope, PeerScopeLock, PeerScopeLockRegistry, ProcessSpecError,
     ProcessSpecification, ScopeLockConflict, ScopeLockOwner, SyncMode, SyncProfile,
-    ValidatedSyncOptions,
-    VolumeIdentity, VolumeIdentityError,
+    ValidatedSyncOptions, VolumeIdentity, VolumeIdentityError,
+    ResolvedSshCredential, SshHost, SshHostTrustPermit, SshPeer,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -100,6 +100,487 @@ impl std::fmt::Display for PrecheckError {
 }
 
 impl std::error::Error for PrecheckError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteAccessRequirements {
+    read: bool,
+    write: bool,
+    remove: bool,
+}
+
+impl RemoteAccessRequirements {
+    pub(crate) const fn new(read: bool, write: bool, remove: bool) -> Self {
+        Self { read, write, remove }
+    }
+
+    pub const fn read(self) -> bool {
+        self.read
+    }
+
+    pub const fn write(self) -> bool {
+        self.write
+    }
+
+    pub const fn remove(self) -> bool {
+        self.remove
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemotePrecheckRequest {
+    access: RemoteAccessRequirements,
+    require_recovery: bool,
+}
+
+impl RemotePrecheckRequest {
+    pub(crate) const fn new(access: RemoteAccessRequirements, require_recovery: bool) -> Self {
+        Self { access, require_recovery }
+    }
+
+    pub const fn access(self) -> RemoteAccessRequirements {
+        self.access
+    }
+
+    pub const fn require_recovery(self) -> bool {
+        self.require_recovery
+    }
+
+    pub fn from_profile(profile: &SyncProfile) -> Result<(SshPeer, Self), RemotePrecheckProfileError> {
+        let specification = ProcessSpecification::from_profile(profile)
+            .map_err(RemotePrecheckProfileError::InvalidSpecification)?;
+        let options = specification.options();
+        let (source, destination) = selected_peers(profile);
+        let (remote, remote_is_source) = if let Some(peer) = source.ssh_peer() {
+            (peer, true)
+        } else if let Some(peer) = destination.ssh_peer() {
+            (peer, false)
+        } else {
+            return Err(RemotePrecheckProfileError::NoSshPeer);
+        };
+
+        let access = if profile.mode() == SyncMode::Mirror {
+            RemoteAccessRequirements::new(true, true, false)
+        } else if remote_is_source {
+            RemoteAccessRequirements::new(true, false, options.safe_delete())
+        } else {
+            RemoteAccessRequirements::new(false, true, options.destination_cleanup())
+        };
+        let require_recovery = access.remove() && options.deletion_method() == Some(DeletionMethod::Trash);
+        Ok((remote.clone(), Self::new(access, require_recovery)))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemotePrecheckProfileError {
+    InvalidSpecification(ProcessSpecError),
+    NoSshPeer,
+}
+
+impl std::fmt::Display for RemotePrecheckProfileError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSpecification(error) => {
+                write!(formatter, "invalid SSH precheck profile: {error}")
+            }
+            Self::NoSshPeer => formatter.write_str("the profile has no SSH peer to preflight"),
+        }
+    }
+}
+
+impl std::error::Error for RemotePrecheckProfileError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteRsyncCapability {
+    Compatible,
+    Missing,
+    Incompatible,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteSha256Capability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteTrashCapability {
+    location: Option<PathBuf>,
+}
+
+impl RemoteTrashCapability {
+    pub fn verified(location: impl Into<PathBuf>) -> Result<Self, RemoteTrashCapabilityError> {
+        let location = location.into();
+        if location.as_os_str().is_empty() {
+            return Err(RemoteTrashCapabilityError::EmptyLocation);
+        }
+        Ok(Self { location: Some(location) })
+    }
+
+    pub const fn unavailable() -> Self {
+        Self { location: None }
+    }
+
+    pub fn location(&self) -> Option<&Path> {
+        self.location.as_deref()
+    }
+
+    pub const fn is_verified(&self) -> bool {
+        self.location.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTrashCapabilityError {
+    EmptyLocation,
+}
+
+impl std::fmt::Display for RemoteTrashCapabilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("verified remote Trash requires a non-empty location")
+    }
+}
+
+impl std::error::Error for RemoteTrashCapabilityError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePrecheckObservation {
+    authenticated: bool,
+    account_access: AccessSnapshot,
+    rsync: RemoteRsyncCapability,
+    sha256: RemoteSha256Capability,
+    trash: RemoteTrashCapability,
+}
+
+impl RemotePrecheckObservation {
+    pub const fn new(
+        authenticated: bool,
+        account_access: AccessSnapshot,
+        rsync: RemoteRsyncCapability,
+        sha256: RemoteSha256Capability,
+        trash: RemoteTrashCapability,
+    ) -> Self {
+        Self { authenticated, account_access, rsync, sha256, trash }
+    }
+
+    pub const fn authenticated(&self) -> bool {
+        self.authenticated
+    }
+
+    pub const fn account_access(&self) -> AccessSnapshot {
+        self.account_access
+    }
+
+    pub const fn rsync(&self) -> RemoteRsyncCapability {
+        self.rsync
+    }
+
+    pub const fn sha256(&self) -> RemoteSha256Capability {
+        self.sha256
+    }
+
+    pub fn trash(&self) -> &RemoteTrashCapability {
+        &self.trash
+    }
+}
+
+/// A read-only remote capability probe. Implementations must authenticate
+/// with the supplied selected credential, use the supplied host-trust permit,
+/// and never create, alter, remove, or rename remote user data. Capability
+/// probes may inspect a configured recovery location, but must not claim it is
+/// verified unless both its location and access were checked.
+pub trait SshRemotePrecheckProbe {
+    fn probe(
+        &self,
+        peer: &SshPeer,
+        credential: &ResolvedSshCredential,
+        host_permit: &SshHostTrustPermit,
+        request: &RemotePrecheckRequest,
+    ) -> Result<RemotePrecheckObservation, PrecheckError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemotePrecheckBlockerKind {
+    AuthenticationUnavailable,
+    AccountPermission,
+    RemoteRsyncUnavailable,
+    RemoteSha256Unavailable,
+    RemoteTrashUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePrecheckBlocker {
+    kind: RemotePrecheckBlockerKind,
+    account: String,
+    path: PathBuf,
+    requirement: String,
+    reason: String,
+    remediation: String,
+}
+
+impl RemotePrecheckBlocker {
+    fn new(
+        kind: RemotePrecheckBlockerKind,
+        peer: &SshPeer,
+        requirement: impl Into<String>,
+        reason: impl Into<String>,
+        remediation: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            account: peer.username().to_owned(),
+            path: peer.remote_path().to_path_buf(),
+            requirement: requirement.into(),
+            reason: reason.into(),
+            remediation: remediation.into(),
+        }
+    }
+
+    pub const fn kind(&self) -> RemotePrecheckBlockerKind {
+        self.kind
+    }
+
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn requirement(&self) -> &str {
+        &self.requirement
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn remediation(&self) -> &str {
+        &self.remediation
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePrecheckBlocked {
+    blockers: Vec<RemotePrecheckBlocker>,
+}
+
+impl RemotePrecheckBlocked {
+    pub fn blockers(&self) -> &[RemotePrecheckBlocker] {
+        &self.blockers
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePrecheckPermit {
+    host: SshHost,
+    account: String,
+    path: PathBuf,
+    trash_location: Option<PathBuf>,
+}
+
+impl RemotePrecheckPermit {
+    pub fn host(&self) -> &SshHost {
+        &self.host
+    }
+
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn trash_location(&self) -> Option<&Path> {
+        self.trash_location.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePrecheckResult {
+    host: SshHost,
+    account: String,
+    path: PathBuf,
+    blockers: Vec<RemotePrecheckBlocker>,
+    trash_location: Option<PathBuf>,
+}
+
+impl RemotePrecheckResult {
+    pub fn host(&self) -> &SshHost {
+        &self.host
+    }
+
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn blockers(&self) -> &[RemotePrecheckBlocker] {
+        &self.blockers
+    }
+
+    pub fn trash_location(&self) -> Option<&Path> {
+        self.trash_location.as_deref()
+    }
+
+    pub fn can_execute(&self) -> bool {
+        self.blockers.is_empty()
+    }
+
+    pub fn require_passed(self) -> Result<RemotePrecheckPermit, RemotePrecheckBlocked> {
+        if self.can_execute() {
+            Ok(RemotePrecheckPermit {
+                host: self.host,
+                account: self.account,
+                path: self.path,
+                trash_location: self.trash_location,
+            })
+        } else {
+            Err(RemotePrecheckBlocked { blockers: self.blockers })
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemotePrecheckError {
+    HostTrustPermitMismatch,
+    CredentialDoesNotMatchPeer,
+    Probe(PrecheckError),
+}
+
+impl std::fmt::Display for RemotePrecheckError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::HostTrustPermitMismatch => {
+                "SSH host-trust permit does not match the remote peer"
+            }
+            Self::CredentialDoesNotMatchPeer => {
+                "the resolved SSH credential does not match the selected peer authentication"
+            }
+            Self::Probe(error) => return write!(formatter, "remote precheck probe failed: {error}"),
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for RemotePrecheckError {}
+
+pub struct SshRemotePrecheck;
+
+impl SshRemotePrecheck {
+    pub fn check<P: SshRemotePrecheckProbe>(
+        peer: &SshPeer,
+        credential: &ResolvedSshCredential,
+        host_permit: &SshHostTrustPermit,
+        request: &RemotePrecheckRequest,
+        probe: &P,
+    ) -> Result<RemotePrecheckResult, RemotePrecheckError> {
+        if host_permit.host() != &SshHost::from_peer(peer) {
+            return Err(RemotePrecheckError::HostTrustPermitMismatch);
+        }
+        if !credential_matches_peer(peer, credential) {
+            return Err(RemotePrecheckError::CredentialDoesNotMatchPeer);
+        }
+        let observation = probe
+            .probe(peer, credential, host_permit, request)
+            .map_err(RemotePrecheckError::Probe)?;
+        let mut result = RemotePrecheckResult {
+            host: SshHost::from_peer(peer),
+            account: peer.username().to_owned(),
+            path: peer.remote_path().to_path_buf(),
+            blockers: Vec::new(),
+            trash_location: observation.trash().location().map(Path::to_path_buf),
+        };
+
+        if !observation.authenticated() {
+            result.blockers.push(RemotePrecheckBlocker::new(
+                RemotePrecheckBlockerKind::AuthenticationUnavailable,
+                peer,
+                "the configured SSH account must authenticate successfully",
+                "the selected SSH credential did not establish an authenticated session",
+                "correct the selected key, agent, saved secret, or controlled askpass setup and retry the precheck",
+            ));
+        }
+        let access = observation.account_access();
+        let requested = request.access();
+        if (requested.read() && !access.readable())
+            || (requested.write() && !access.writable())
+            || (requested.remove() && !access.removable())
+        {
+            result.blockers.push(RemotePrecheckBlocker::new(
+                RemotePrecheckBlockerKind::AccountPermission,
+                peer,
+                format!(
+                    "the remote account must provide read={}, write={}, remove={} access for the configured path",
+                    requested.read(), requested.write(), requested.remove()
+                ),
+                format!(
+                    "the account currently provides read={}, write={}, remove={} access",
+                    access.readable(), access.writable(), access.removable()
+                ),
+                "grant the remote account only the required access to the configured path, then retry the precheck",
+            ));
+        }
+        match observation.rsync() {
+            RemoteRsyncCapability::Compatible => {}
+            RemoteRsyncCapability::Missing | RemoteRsyncCapability::Incompatible => {
+                result.blockers.push(RemotePrecheckBlocker::new(
+                    RemotePrecheckBlockerKind::RemoteRsyncUnavailable,
+                    peer,
+                    "the remote account must provide a compatible controlled rsync capability",
+                    match observation.rsync() {
+                        RemoteRsyncCapability::Missing => "the remote rsync capability is unavailable",
+                        RemoteRsyncCapability::Incompatible => "the remote rsync capability is incompatible with this SyncPlus run",
+                        RemoteRsyncCapability::Compatible => unreachable!(),
+                    },
+                    "install or select a compatible remote rsync without changing the requested command policy, then retry the precheck",
+                ));
+            }
+        }
+        if observation.sha256() != RemoteSha256Capability::Available {
+            result.blockers.push(RemotePrecheckBlocker::new(
+                RemotePrecheckBlockerKind::RemoteSha256Unavailable,
+                peer,
+                "the remote account must provide controlled SHA-256 hashing",
+                "the remote SHA-256 capability is missing or unavailable",
+                "enable a controlled SHA-256 helper on the remote peer and retry; the source remains preserved until verification is available",
+            ));
+        }
+        if request.require_recovery() && !observation.trash().is_verified() {
+            result.trash_location = None;
+            result.blockers.push(RemotePrecheckBlocker::new(
+                RemotePrecheckBlockerKind::RemoteTrashUnavailable,
+                peer,
+                "the configured remote Trash location must exist and be accessible to the remote account",
+                "remote Trash location or account access could not be verified",
+                "configure an accessible remote Trash location and retry, or choose a separately authorized Permanent Removal policy",
+            ));
+        }
+        Ok(result)
+    }
+}
+
+fn credential_matches_peer(peer: &SshPeer, credential: &ResolvedSshCredential) -> bool {
+    match (peer.authentication(), credential) {
+        (crate::SshAuthentication::Key, ResolvedSshCredential::Key { identity }) => {
+            peer.identity() == Some(identity.as_path())
+        }
+        (crate::SshAuthentication::Agent, ResolvedSshCredential::Agent) => true,
+        (
+            crate::SshAuthentication::InteractivePassword,
+            ResolvedSshCredential::Password { source: crate::PasswordSource::InteractiveAskpass, .. },
+        ) => true,
+        (
+            crate::SshAuthentication::SavedPassword(_),
+            ResolvedSshCredential::Password { source: crate::PasswordSource::SavedSecret, .. },
+        ) => true,
+        _ => false,
+    }
+}
 
 /// Read-only probes used by the precheck. Implementations must never create,
 /// alter, remove, or rename user files.
