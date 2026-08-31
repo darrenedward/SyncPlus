@@ -216,7 +216,11 @@ impl RunWorkflow {
         )?;
         store.begin_run(&snapshot)?;
         let inventory = SourceInventorySnapshot::from_inventory(plan.source_inventory());
+        let destination_inventory = SourceInventorySnapshot::from_inventory(plan.destination_inventory());
         store.record_source_inventory(run_id, &inventory)?;
+        if confirmed.profile().mode() == crate::SyncMode::Mirror {
+            store.record_destination_inventory(run_id, &destination_inventory)?;
+        }
         self.persist_plan(run_id, plan, store)?;
 
         let cancel = &should_cancel as &dyn Fn() -> bool;
@@ -236,7 +240,13 @@ impl RunWorkflow {
             }
         }
 
-        self.reconcile_run(run_id, confirmed.profile(), &inventory, store)
+        self.reconcile_run(
+            run_id,
+            confirmed.profile(),
+            &inventory,
+            &destination_inventory,
+            store,
+        )
     }
 
     /// Reopen an incomplete run safely. Open action boundaries are first
@@ -308,7 +318,11 @@ impl RunWorkflow {
         let expected_source_volume_identity = report
             .snapshot()
             .volume_identity(crate::PeerSide::from(profile.source()));
-        let source_side = crate::PeerSide::from(profile.source());
+        let source_side = if profile.mode() == crate::SyncMode::Mirror {
+            crate::PeerSide::PeerA
+        } else {
+            crate::PeerSide::from(profile.source())
+        };
         let expected_destination_volume_identity = report
             .snapshot()
             .volume_identity(source_side.opposite());
@@ -490,12 +504,23 @@ impl RunWorkflow {
         run_id: RunId,
         profile: &crate::SyncProfile,
         inventory: &SourceInventorySnapshot,
+        destination_inventory: &SourceInventorySnapshot,
         store: &mut RunEvidenceStore,
     ) -> Result<RunReport, WorkflowError> {
         let journal = store.load_journal(run_id)?;
         let reconciliation = match FreshAnalysis::analyze(profile) {
             Ok(current) => {
-                CompletionReconciliation::reconcile(profile, inventory, &current, &journal)
+                if profile.mode() == crate::SyncMode::Mirror {
+                    CompletionReconciliation::reconcile_mirror(
+                        profile,
+                        inventory,
+                        destination_inventory,
+                        &current,
+                        &journal,
+                    )
+                } else {
+                    CompletionReconciliation::reconcile(profile, inventory, &current, &journal)
+                }
             }
             Err(error) => {
                 CompletionReconciliation::unavailable(profile, inventory, &journal, &error)
@@ -552,8 +577,10 @@ impl RunWorkflow {
             == crate::PartialTransferPolicy::KeepPartialForResume
             && report.status() == RunReportStatus::Completed
         {
-            cleanup_partial_transfer_artifacts(destination_root(confirmed.profile()))
-                .map_err(|error| WorkflowError::Io(error.to_string()))?;
+            for root in partial_cleanup_roots(confirmed.profile()) {
+                cleanup_partial_transfer_artifacts(root)
+                    .map_err(|error| WorkflowError::Io(error.to_string()))?;
+            }
         }
         Ok(())
     }
@@ -946,6 +973,14 @@ fn destination_root(profile: &crate::SyncProfile) -> &Path {
     }
 }
 
+fn partial_cleanup_roots(profile: &crate::SyncProfile) -> Vec<&Path> {
+    if profile.mode() == crate::SyncMode::Mirror {
+        vec![profile.peer_a().root(), profile.peer_b().root()]
+    } else {
+        vec![destination_root(profile)]
+    }
+}
+
 fn unix_nanos(time: Option<SystemTime>) -> Option<i64> {
     let time = time?;
     match time.duration_since(UNIX_EPOCH) {
@@ -960,12 +995,16 @@ fn observe_journal_boundary(
     profile: &crate::SyncProfile,
     action: &crate::PlanRecord,
 ) -> RecoveryEvidence {
-    let specification = match ProcessSpecification::from_profile(profile) {
-        Ok(specification) => specification,
-        Err(_) => return empty_recovery_evidence(),
+    let source_root = match action.affected_side() {
+        crate::PeerSide::PeerA => profile.peer_a().root(),
+        crate::PeerSide::PeerB => profile.peer_b().root(),
     };
-    let source = specification.source_root().join(action.relative_path());
-    let destination = destination_root(profile).join(action.relative_path());
+    let destination_root = match action.affected_side() {
+        crate::PeerSide::PeerA => profile.peer_b().root(),
+        crate::PeerSide::PeerB => profile.peer_a().root(),
+    };
+    let source = source_root.join(action.relative_path());
+    let destination = destination_root.join(action.relative_path());
     observe_paths(&source, &destination)
 }
 
@@ -1046,6 +1085,9 @@ fn orient_volume_identities(
     Option<crate::VolumeIdentity>,
     Option<crate::VolumeIdentity>,
 ) {
+    if profile.mode() == crate::SyncMode::Mirror {
+        return (source_volume_identity, destination_volume_identity);
+    }
     match profile.source() {
         crate::OneWaySource::PeerA => (source_volume_identity, destination_volume_identity),
         crate::OneWaySource::PeerB => (destination_volume_identity, source_volume_identity),
@@ -1107,7 +1149,8 @@ mod tests {
         PreActionState, ProcessError, RecoveryEvidence, RecoveryMethod, RetryPolicy,
         LocalPrecheckProbe, PartialTransferPolicy, PeerScope, PeerScopeLockRegistry,
         PrecheckFailure, PrecheckProbe,
-        RunEvidenceStore, RunId, RunReportStatus, ScopeLockOwner, SyncOptions, SyncProfile,
+        RunEvidenceStore, RunId, RunReportStatus, ScopeLockOwner, SyncMode, SyncOptions,
+        SyncProfile,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(1);
@@ -1160,6 +1203,47 @@ mod tests {
             fs::create_dir_all(parent).expect("fixture parent should be creatable");
         }
         fs::write(path, contents).expect("fixture file should be writable");
+    }
+
+    #[test]
+    fn mirror_workflow_transfers_both_directions_and_reports_both_peer_views() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.source()).expect("Peer A should be creatable");
+        fs::create_dir_all(fixture.destination()).expect("Peer B should be creatable");
+        write_file(&fixture.source().join("from-a.txt"), b"from A");
+        write_file(&fixture.destination().join("from-b.txt"), b"from B");
+        let profile = fixture
+            .profile()
+            .with_source(OneWaySource::PeerB)
+            .with_mode(SyncMode::Mirror);
+
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute(
+                RunId::new(1),
+                &profile,
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("a first Mirror run should transfer both one-sided items");
+
+        assert_eq!(report.status(), RunReportStatus::Completed, "report: {report:?}");
+        assert_eq!(fs::read(fixture.destination().join("from-a.txt")).unwrap(), b"from A");
+        assert_eq!(fs::read(fixture.source().join("from-b.txt")).unwrap(), b"from B");
+        assert_eq!(report.peer_a_inventory().unwrap().peer_name(), "source");
+        assert_eq!(report.peer_b_inventory().unwrap().peer_name(), "destination");
+
+        let from_a = report
+            .items()
+            .iter()
+            .find(|item| item.relative_path() == Path::new("from-a.txt"))
+            .expect("Peer A action should be in the report");
+        assert_eq!(from_a.affected_side(), PeerSide::PeerA);
+        assert_eq!(from_a.source_path(), fixture.source().join("from-a.txt"));
+        assert_eq!(from_a.destination_path(), fixture.destination().join("from-a.txt"));
+        assert!(from_a.consequence().contains("Peer A"));
     }
 
     #[cfg(unix)]

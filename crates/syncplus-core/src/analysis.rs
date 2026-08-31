@@ -366,6 +366,7 @@ impl std::error::Error for PlanError {}
 pub struct OneWayPlan {
     specification: ProcessSpecification,
     source_inventory: SourceInventory,
+    destination_inventory: PeerInventory,
     approved_scope: ApprovedSyncScope,
     actions: Vec<PlanAction>,
     summary: PlanSummary,
@@ -386,6 +387,10 @@ impl OneWayPlan {
 
     pub fn inventory(&self) -> &SourceInventory {
         self.source_inventory()
+    }
+
+    pub fn destination_inventory(&self) -> &PeerInventory {
+        &self.destination_inventory
     }
 
     pub fn approved_scope(&self) -> &ApprovedSyncScope {
@@ -421,8 +426,15 @@ impl OneWayPlan {
 
     pub fn validate(&self) -> Result<(), PlanError> {
         for action in &self.actions {
-            if self
-                .source_inventory
+            let inventory = if self.specification.mode() == crate::SyncMode::Mirror {
+                match action.source_side() {
+                    PeerSide::PeerA => &self.source_inventory,
+                    PeerSide::PeerB => &self.destination_inventory,
+                }
+            } else {
+                &self.source_inventory
+            };
+            if inventory
                 .item(&action.relative_path)
                 .is_some_and(|item| !item.is_eligible())
             {
@@ -448,7 +460,16 @@ impl OneWayPlan {
             }
         }
 
-        if summary_for(&self.actions, &self.source_inventory) != self.summary {
+        let expected_summary = if self.specification.mode() == crate::SyncMode::Mirror {
+            mirror_summary_for(
+                &self.actions,
+                &self.source_inventory,
+                &self.destination_inventory,
+            )
+        } else {
+            summary_for(&self.actions, &self.source_inventory)
+        };
+        if expected_summary != self.summary {
             return Err(PlanError::SummaryMismatch);
         }
 
@@ -544,7 +565,11 @@ impl FreshAnalysis {
     pub fn analyze(profile: &SyncProfile) -> Result<Self, AnalysisError> {
         let specification = ProcessSpecification::from_profile(profile)
             .map_err(AnalysisError::ProcessSpecification)?;
-        let (source, destination) = selected_peers(profile);
+        let (source, destination) = if profile.mode() == crate::SyncMode::Mirror {
+            (profile.peer_a(), profile.peer_b())
+        } else {
+            selected_peers(profile)
+        };
         let exclusions: Vec<String> = specification
             .exclusions()
             .map(ToOwned::to_owned)
@@ -938,6 +963,61 @@ fn build_plan(
     let mut actions = Vec::new();
     let mut next_action_id: ActionId = 1;
 
+    if specification.mode() == crate::SyncMode::Mirror {
+        let all_paths: BTreeSet<PathBuf> = source_by_path
+            .keys()
+            .chain(destination_by_path.keys())
+            .cloned()
+            .collect();
+        for relative_path in all_paths {
+            let source_item = source_by_path.get(&relative_path).copied();
+            let destination_item = destination_by_path.get(&relative_path).copied();
+            match (source_item, destination_item) {
+                (Some(item), None) if item.is_eligible() => {
+                    actions.push(PlanAction {
+                        action_id: next_action_id,
+                        relative_path,
+                        kind: PlanActionKind::CopyToDestination,
+                        consequence: mirror_consequence_for(
+                            PlanActionKind::CopyToDestination,
+                            PeerSide::PeerA,
+                        ),
+                        source_side: PeerSide::PeerA,
+                        size: data_size(item),
+                    });
+                    next_action_id += 1;
+                }
+                (None, Some(item)) if item.is_eligible() => {
+                    actions.push(PlanAction {
+                        action_id: next_action_id,
+                        relative_path,
+                        kind: PlanActionKind::CopyToDestination,
+                        consequence: mirror_consequence_for(
+                            PlanActionKind::CopyToDestination,
+                            PeerSide::PeerB,
+                        ),
+                        source_side: PeerSide::PeerB,
+                        size: data_size(item),
+                    });
+                    next_action_id += 1;
+                }
+                _ => {}
+            }
+        }
+        let approved_scope = mirror_approved_scope(&source, &destination);
+        let summary = mirror_summary_for(&actions, &source, &destination);
+        let plan = OneWayPlan {
+            specification,
+            source_inventory: source,
+            destination_inventory: destination,
+            approved_scope,
+            actions,
+            summary,
+        };
+        plan.validate().map_err(AnalysisError::Plan)?;
+        return Ok(plan);
+    }
+
     for source_item in source.included_items() {
         let destination_item = destination_by_path
             .get(source_item.relative_path())
@@ -1008,6 +1088,7 @@ fn build_plan(
     let plan = OneWayPlan {
         specification,
         source_inventory: source,
+        destination_inventory: destination,
         approved_scope,
         actions,
         summary,
@@ -1057,6 +1138,18 @@ fn consequence_for(kind: PlanActionKind) -> &'static str {
     }
 }
 
+fn mirror_consequence_for(kind: PlanActionKind, source_side: PeerSide) -> &'static str {
+    match (kind, source_side) {
+        (PlanActionKind::CopyToDestination, PeerSide::PeerA) => {
+            "Copy the Peer A item to Peer B; preserve the item on Peer A."
+        }
+        (PlanActionKind::CopyToDestination, PeerSide::PeerB) => {
+            "Copy the Peer B item to Peer A; preserve the item on Peer B."
+        }
+        _ => consequence_for(kind),
+    }
+}
+
 fn data_size(item: &InventoryItem) -> Option<u64> {
     (item.item_type == ItemType::RegularFile).then_some(item.metadata.size)
 }
@@ -1091,6 +1184,74 @@ fn summary_for(actions: &[PlanAction], source: &SourceInventory) -> PlanSummary 
         }
     }
 
+    summary
+}
+
+fn mirror_approved_scope(
+    peer_a: &SourceInventory,
+    peer_b: &PeerInventory,
+) -> ApprovedSyncScope {
+    let mut included_paths = BTreeSet::new();
+    let mut excluded_paths = BTreeSet::new();
+    for inventory in [peer_a, peer_b] {
+        for item in &inventory.items {
+            match item.outcome {
+                AnalysisOutcome::Included => {
+                    included_paths.insert(item.relative_path.clone());
+                }
+                AnalysisOutcome::Excluded => {
+                    excluded_paths.insert(item.relative_path.clone());
+                }
+                AnalysisOutcome::Unsupported => {}
+            }
+        }
+    }
+    excluded_paths.retain(|path| !included_paths.contains(path));
+    ApprovedSyncScope {
+        included_paths: included_paths.into_iter().collect(),
+        excluded_paths: excluded_paths.into_iter().collect(),
+    }
+}
+
+fn mirror_summary_for(
+    actions: &[PlanAction],
+    peer_a: &SourceInventory,
+    peer_b: &PeerInventory,
+) -> PlanSummary {
+    let approved_scope = mirror_approved_scope(peer_a, peer_b);
+    let mut summary = PlanSummary {
+        considered_count: peer_a
+            .items
+            .iter()
+            .map(|item| item.relative_path.clone())
+            .chain(peer_b.items.iter().map(|item| item.relative_path.clone()))
+            .collect::<BTreeSet<_>>()
+            .len(),
+        included_count: approved_scope.included_count(),
+        excluded_count: approved_scope.excluded_count(),
+        ..PlanSummary::default()
+    };
+
+    for action in actions {
+        match action.kind {
+            PlanActionKind::CopyToDestination => {
+                summary.copy_count += 1;
+                summary.copy_bytes += action.size.unwrap_or_default();
+            }
+            PlanActionKind::OverwriteDestination => {
+                summary.overwrite_count += 1;
+                summary.overwrite_bytes += action.size.unwrap_or_default();
+            }
+            PlanActionKind::RemoveDestination => {
+                summary.destination_removal_count += 1;
+                summary.destination_removal_bytes += action.size.unwrap_or_default();
+            }
+            PlanActionKind::RemoveSourceAfterVerification => {
+                summary.source_removal_count += 1;
+                summary.source_removal_bytes += action.size.unwrap_or_default();
+            }
+        }
+    }
     summary
 }
 
