@@ -1,6 +1,7 @@
 mod model;
 mod process;
 mod analysis;
+mod baseline;
 mod evidence;
 mod precheck;
 mod scope_lock;
@@ -30,6 +31,10 @@ pub use analysis::{
     AnalysisError, AnalysisOutcome, AnalysisRevision, ApprovedSyncScope, ConfirmedPlan,
     FreshAnalysis, InventoryItem, ItemMetadata, ItemType, OneWayPlan, PeerInventory, PeerSide,
     PlanAction, PlanActionKind, PlanError, PlanSummary, ScopeDecision, SourceInventory,
+};
+pub use baseline::{
+    MirrorEquality, SyncBaseline, SyncBaselineComparison, SyncBaselineItem,
+    SyncBaselineItemState, SyncBaselineItemStatus,
 };
 pub use evidence::{
     ActionId, ActionJournalEntry, ActionOutcome, ActionReason, FileIdentity,
@@ -76,6 +81,9 @@ mod process_tests;
 
 #[cfg(test)]
 mod analysis_tests;
+
+#[cfg(test)]
+mod baseline_tests;
 
 #[cfg(test)]
 mod evidence_tests;
