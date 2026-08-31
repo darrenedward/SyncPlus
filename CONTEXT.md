@@ -436,6 +436,11 @@ _Avoid_: Raw command fields, free-form shell input, or silently conflicting flag
 The reviewed decision to propagate a deletion from one Mirror peer to the other. A baseline may provide evidence that the deletion was intentional, but absence alone never authorizes removal. The decision must be visible in the plan and included in final confirmation.
 _Avoid_: Treating baseline inference as silent deletion permission
 
+The decision is available only for a candidate backed by a two-sided baseline,
+where the missing peer is absent and the remaining peer is still unchanged.
+Deletion, preservation, or deferral is selected per path; failed removal keeps
+the remaining copy and leaves the Mirror Invariant unresolved.
+
 **Content Verification Hash**:
 The streamed SHA-256 digest used when SyncPlus needs cryptographic evidence that two regular files have identical bytes or that a destination transfer is safe for Verified Removal. Metadata may avoid unnecessary hashing, but metadata equality alone is not verification. Equal hashes at different paths indicate byte equality, not automatic logical identity or rename.
 _Avoid_: Treating size/mtime as proof, or automatically merging same-hash files at different paths
