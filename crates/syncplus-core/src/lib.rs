@@ -3,6 +3,7 @@ mod process;
 mod analysis;
 mod conflict;
 mod baseline;
+mod mirror_deletion;
 mod evidence;
 mod precheck;
 mod scope_lock;
@@ -39,6 +40,11 @@ pub use conflict::{
 pub use baseline::{
     MirrorEquality, SyncBaseline, SyncBaselineComparison, SyncBaselineItem,
     SyncBaselineItemState, SyncBaselineItemStatus,
+};
+pub use mirror_deletion::{
+    ConfirmedMirrorDeletionPlan, MirrorDeletionAction, MirrorDeletionCandidate,
+    MirrorDeletionChoice, MirrorDeletionDecision, MirrorDeletionError, MirrorDeletionEvidence,
+    MirrorDeletionOutcome, MirrorDeletionPlan, MirrorDeletionReview, MirrorDeletionResult,
 };
 pub use evidence::{
     ActionId, ActionJournalEntry, ActionOutcome, ActionReason, FileIdentity,
@@ -88,7 +94,12 @@ mod analysis_tests;
 
 #[cfg(test)]
 mod conflict_tests;
+
+#[cfg(test)]
 mod baseline_tests;
+
+#[cfg(test)]
+mod mirror_deletion_tests;
 
 #[cfg(test)]
 mod evidence_tests;

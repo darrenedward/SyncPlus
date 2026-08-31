@@ -173,6 +173,8 @@ The shared core `RunWorkflow` persists the frozen Source Inventory and complete 
 - Preserved copies receive deterministic human-readable collision-safe names and remain listed with both original and new paths under the report's conflict section.
 - A skipped/deferred item keeps the run open. Removing an item from scope is an explicit recorded decision and does not count as a successful transfer.
 - Same-hash files at different paths are possible duplicates/rename candidates only; hash equality never automatically moves or deletes them.
+- Mirror deletion candidates are derived only when a two-sided Sync Baseline proves one peer absent and the remaining peer unchanged. Each candidate exposes its baseline/current evidence and affected peer; a missing baseline, changed counterpart, exclusion, or other uncertainty produces no deletion candidate.
+- Mirror deletion requires an explicit per-path decision and final Execution Confirmation. A failed deletion preserves the remaining copy and leaves the Mirror Invariant unresolved.
 - Only successfully reconciled and verified paths enter the Sync Baseline.
 
 The core `SyncBaseline` is persisted in SQLite per Sync Profile and peer pair. It
