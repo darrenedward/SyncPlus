@@ -1,8 +1,10 @@
 use std::{fs, path::PathBuf};
 
 use crate::{
-    DeletionMethod, FreshAnalysis, MetadataRequirements, OneWaySource, ProcessArgument, ProcessSpecError,
-    ProcessSpecification, Peer, RsyncFlag, SyncMode, SyncOptions, SyncProfile,
+    AnalysisError, AuthorizationSnapshot, DeletionMethod, FreshAnalysis, MetadataRequirements,
+    OneWaySource, ProcessArgument, ProcessSpecError, ProcessSpecification, Peer, RsyncFlag,
+    RunId, RunSnapshot, SshAuthentication, SshPeer, SshPeerError, StorageError, SyncMode,
+    SyncOptions, SyncProfile,
     SpecialistMetadataRequirements,
 };
 
@@ -13,6 +15,19 @@ fn profile(source: PathBuf, destination: PathBuf) -> SyncProfile {
         Peer::new("Destination", destination),
     )
     .with_source(OneWaySource::PeerA)
+}
+
+fn ssh_peer(remote_path: &str) -> Peer {
+    Peer::ssh(
+        "SSH peer",
+        "backup.example.test",
+        "sync-user",
+        2222,
+        Some(PathBuf::from("/home/user/.ssh/id_sync")),
+        SshAuthentication::Key,
+        remote_path,
+    )
+    .expect("the SSH fixture should be valid")
 }
 
 #[test]
@@ -106,6 +121,186 @@ fn peer_paths_are_single_structured_process_arguments() {
     assert!(invocation.arguments()[end_of_options + 1..]
         .iter()
         .all(|argument| argument != std::ffi::OsStr::new("--not-a-real-option")));
+}
+
+#[test]
+fn local_to_ssh_profiles_use_structured_transport_and_remote_path_arguments() {
+    let remote_path = "/srv/sync/$(touch pwned); user's report/世界\n";
+    let specification = ProcessSpecification::from_profile(
+        &SyncProfile::new(
+            "SSH process specification",
+            Peer::new("Local", PathBuf::from("/home/user/source")),
+            ssh_peer(remote_path),
+        )
+        .with_source(OneWaySource::PeerA),
+    )
+    .expect("local-to-SSH profiles should produce a specification");
+    let invocation = specification.invocation().expect("One-Way invocation");
+
+    let remote_target = invocation
+        .arguments()
+        .iter()
+        .find(|argument| argument.to_string_lossy().contains("backup.example.test:"))
+        .expect("the remote peer should be one typed argument");
+    assert_eq!(
+        remote_target.to_string_lossy(),
+        "sync-user@backup.example.test:/srv/sync/$(touch pwned); user's report/世界\n"
+    );
+    assert!(invocation.arguments().iter().any(|argument| {
+        argument == "--rsh=ssh -p 2222 -i '/home/user/.ssh/id_sync'"
+    }));
+    assert_eq!(
+        invocation
+            .arguments()
+            .iter()
+            .filter(|argument| argument.to_string_lossy().contains("backup.example.test:"))
+            .count(),
+        1
+    );
+    assert!(invocation
+        .arguments()
+        .iter()
+        .all(|argument| argument != "touch"));
+    assert!(specification.preview().contains("backup.example.test:"));
+    assert_eq!(
+        specification
+            .ssh_transport()
+            .expect("the SSH transport should be present")
+            .authentication(),
+        SshAuthentication::Key
+    );
+}
+
+#[test]
+fn ssh_to_local_profiles_reverse_the_typed_peer_arguments() {
+    let specification = ProcessSpecification::from_profile(
+        &SyncProfile::new(
+            "SSH process specification",
+            ssh_peer("/srv/sync/incoming"),
+            Peer::new("Local", PathBuf::from("/home/user/destination")),
+        )
+        .with_source(OneWaySource::PeerA),
+    )
+    .expect("SSH-to-local profiles should produce a specification");
+    let invocation = specification.invocation().expect("One-Way invocation");
+    let end_of_options = invocation
+        .arguments()
+        .iter()
+        .position(|argument| argument == "--")
+        .expect("peer arguments should follow the option boundary");
+
+    assert_eq!(
+        invocation.arguments()[end_of_options + 1].to_string_lossy(),
+        "sync-user@backup.example.test:/srv/sync/incoming"
+    );
+    assert_eq!(
+        invocation.arguments()[end_of_options + 2],
+        "/home/user/destination"
+    );
+}
+
+#[test]
+fn two_ssh_peers_are_rejected_before_process_construction() {
+    let error = ProcessSpecification::from_profile(
+        &SyncProfile::new(
+            "SSH topology",
+            ssh_peer("/srv/one"),
+            ssh_peer("/srv/two"),
+        ),
+    )
+    .expect_err("SSH-to-SSH is outside the supported topology");
+
+    assert!(matches!(error, ProcessSpecError::UnsupportedSshTopology));
+}
+
+#[test]
+fn remote_peers_are_blocked_from_local_filesystem_workflows() {
+    let profile = SyncProfile::new(
+        "SSH workflow boundary",
+        Peer::new("Local", PathBuf::from("/home/user/source")),
+        ssh_peer("/srv/sync"),
+    );
+
+    assert!(matches!(
+        FreshAnalysis::analyze(&profile),
+        Err(AnalysisError::UnsupportedRemotePeer { peer }) if peer == "SSH peer"
+    ));
+    assert!(matches!(
+        RunSnapshot::from_profile(RunId::new(1), &profile, AuthorizationSnapshot::default()),
+        Err(StorageError::UnsupportedRemotePeer)
+    ));
+}
+
+#[test]
+fn malformed_ssh_fields_are_rejected_at_the_structured_peer_boundary() {
+    let cases = [
+        SshPeer::new(
+            "",
+            "sync-user",
+            22,
+            None,
+            SshAuthentication::Agent,
+            "/srv/sync",
+        ),
+        SshPeer::new(
+            "backup.example.test;touch",
+            "sync-user",
+            22,
+            None,
+            SshAuthentication::Agent,
+            "/srv/sync",
+        ),
+        SshPeer::new(
+            "backup.example.test",
+            "sync user",
+            22,
+            None,
+            SshAuthentication::Agent,
+            "/srv/sync",
+        ),
+        SshPeer::new(
+            "backup.example.test",
+            "sync-user",
+            0,
+            None,
+            SshAuthentication::Agent,
+            "/srv/sync",
+        ),
+        SshPeer::new(
+            "backup.example.test",
+            "sync-user",
+            22,
+            None,
+            SshAuthentication::Agent,
+            "",
+        ),
+        SshPeer::new(
+            "backup.example.test",
+            "sync-user",
+            22,
+            None,
+            SshAuthentication::Agent,
+            "/srv/sync\0unsafe",
+        ),
+    ];
+
+    assert!(matches!(cases[0], Err(SshPeerError::EmptyServer)));
+    assert!(matches!(cases[1], Err(SshPeerError::InvalidServer)));
+    assert!(matches!(cases[2], Err(SshPeerError::InvalidUsername)));
+    assert!(matches!(cases[3], Err(SshPeerError::InvalidPort)));
+    assert!(matches!(cases[4], Err(SshPeerError::EmptyRemotePath)));
+    assert!(matches!(cases[5], Err(SshPeerError::NulInRemotePath)));
+    assert!(matches!(
+        SshPeer::new(
+            "backup.example.test:2222",
+            "sync-user",
+            22,
+            None,
+            SshAuthentication::Agent,
+            "/srv/sync",
+        ),
+        Err(SshPeerError::InvalidServer)
+    ));
 }
 
 #[test]

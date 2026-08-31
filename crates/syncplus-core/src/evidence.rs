@@ -55,6 +55,9 @@ impl RunSnapshot {
     ) -> Result<Self, StorageError> {
         let specification =
             ProcessSpecification::from_profile(profile).map_err(StorageError::InvalidProfile)?;
+        if profile.peer_a().is_ssh() || profile.peer_b().is_ssh() {
+            return Err(StorageError::UnsupportedRemotePeer);
+        }
         if authorizations.allow_unattended_permanent_removal()
             && (specification.options().deletion_method()
                 != Some(DeletionMethod::PermanentRemoval)
@@ -771,6 +774,7 @@ pub enum StorageError {
     Sqlite(rusqlite::Error),
     Io(io::Error),
     InvalidProfile(ProcessSpecError),
+    UnsupportedRemotePeer,
     InvalidSnapshot(String),
     InvalidEvent(String),
     CorruptEvidence(String),
@@ -782,6 +786,10 @@ impl fmt::Display for StorageError {
             Self::Sqlite(error) => write!(formatter, "SQLite error: {error}"),
             Self::Io(error) => write!(formatter, "storage filesystem error: {error}"),
             Self::InvalidProfile(error) => write!(formatter, "invalid profile: {error}"),
+            Self::UnsupportedRemotePeer => write!(
+                formatter,
+                "remote peers cannot be persisted in a local filesystem run snapshot yet"
+            ),
             Self::InvalidSnapshot(reason) => write!(formatter, "invalid run snapshot: {reason}"),
             Self::InvalidEvent(reason) => write!(formatter, "invalid journal event: {reason}"),
             Self::CorruptEvidence(reason) => write!(formatter, "corrupt run evidence: {reason}"),

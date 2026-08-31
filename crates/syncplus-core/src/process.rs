@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     DeletionMethod, MetadataRequirements, OneWaySource, PartialTransferPolicy, PeerSide,
-    PlanAction, PlanActionKind, RetryPolicy, SyncMode, SyncOptions, SyncProfile,
+    Peer, PlanAction, PlanActionKind, RetryPolicy, SshPeer, SyncMode, SyncOptions, SyncProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,6 +60,66 @@ pub enum ProcessArgument {
     Flag(RsyncFlag),
     ExclusionPattern(String),
     PeerPath(PathBuf),
+    RemotePeerPath(SshTarget),
+    SshTransport(SshTransport),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTarget {
+    username: String,
+    server: String,
+    remote_path: PathBuf,
+}
+
+impl SshTarget {
+    fn from_peer(peer: &SshPeer) -> Self {
+        Self {
+            username: peer.username().to_owned(),
+            server: peer.server().to_owned(),
+            remote_path: peer.remote_path().to_path_buf(),
+        }
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    pub fn remote_path(&self) -> &Path {
+        &self.remote_path
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTransport {
+    port: u16,
+    identity: Option<PathBuf>,
+    authentication: crate::SshAuthentication,
+}
+
+impl SshTransport {
+    fn from_peer(peer: &SshPeer) -> Self {
+        Self {
+            port: peer.port(),
+            identity: peer.identity().map(Path::to_path_buf),
+            authentication: peer.authentication(),
+        }
+    }
+
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn identity(&self) -> Option<&Path> {
+        self.identity.as_deref()
+    }
+
+    pub const fn authentication(&self) -> crate::SshAuthentication {
+        self.authentication
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +176,8 @@ pub enum ProcessSpecError {
     InvalidExclusionPattern { reason: &'static str },
     InvalidSecretBinding { value: String },
     UnsupportedSyncMode,
+    UnsupportedSshTopology,
+    UnsupportedSshFilesystemOperation,
     MirrorRequiresReviewedPlan,
     ActionNotAllowed { kind: PlanActionKind },
     ActionSourceMismatch,
@@ -144,6 +206,12 @@ impl fmt::Display for ProcessSpecError {
                 write!(formatter, "invalid secret binding name: {value}")
             }
             Self::UnsupportedSyncMode => write!(formatter, "unsupported synchronization mode"),
+            Self::UnsupportedSshTopology => {
+                write!(formatter, "SSH-to-SSH synchronization is not supported")
+            }
+            Self::UnsupportedSshFilesystemOperation => {
+                write!(formatter, "local filesystem operations cannot use an SSH peer yet")
+            }
             Self::MirrorRequiresReviewedPlan => write!(
                 formatter,
                 "Mirror execution requires the reviewed per-item plan"
@@ -246,6 +314,7 @@ pub struct ProcessSpecification {
     mode: SyncMode,
     peer_a_root: PathBuf,
     peer_b_root: PathBuf,
+    ssh_transport: Option<SshTransport>,
 }
 
 impl ProcessSpecification {
@@ -267,8 +336,18 @@ impl ProcessSpecification {
             OneWaySource::PeerB => (profile.peer_b(), profile.peer_a()),
         };
 
+        if profile.peer_a().is_ssh() && profile.peer_b().is_ssh() {
+            return Err(ProcessSpecError::UnsupportedSshTopology);
+        }
+
         validate_peer_path(source.name(), source.root())?;
         validate_peer_path(destination.name(), destination.root())?;
+
+        let ssh_transport = profile
+            .peer_a()
+            .ssh_peer()
+            .or_else(|| profile.peer_b().ssh_peer())
+            .map(SshTransport::from_peer);
 
         let mut arguments = vec![
             ProcessArgument::Flag(RsyncFlag::Archive),
@@ -291,11 +370,13 @@ impl ProcessSpecification {
             arguments.push(ProcessArgument::ExclusionPattern(exclusion.clone()));
         }
 
-        arguments.extend([
-            ProcessArgument::Flag(RsyncFlag::EndOfOptions),
-            ProcessArgument::PeerPath(source.root().to_path_buf()),
-            ProcessArgument::PeerPath(destination.root().to_path_buf()),
-        ]);
+        if let Some(ssh_transport) = &ssh_transport {
+            arguments.push(ProcessArgument::SshTransport(ssh_transport.clone()));
+        }
+
+        arguments.push(ProcessArgument::Flag(RsyncFlag::EndOfOptions));
+        arguments.push(peer_argument(source));
+        arguments.push(peer_argument(destination));
 
         Ok(Self {
             arguments,
@@ -307,6 +388,7 @@ impl ProcessSpecification {
             mode: profile.mode(),
             peer_a_root: profile.peer_a().root().to_path_buf(),
             peer_b_root: profile.peer_b().root().to_path_buf(),
+            ssh_transport,
         })
     }
 
@@ -326,10 +408,17 @@ impl ProcessSpecification {
         self.mode
     }
 
+    pub fn ssh_transport(&self) -> Option<&SshTransport> {
+        self.ssh_transport.as_ref()
+    }
+
     pub fn exclusions(&self) -> impl Iterator<Item = &str> {
         self.arguments.iter().filter_map(|argument| match argument {
             ProcessArgument::ExclusionPattern(pattern) => Some(pattern.as_str()),
-            ProcessArgument::Flag(_) | ProcessArgument::PeerPath(_) => None,
+            ProcessArgument::Flag(_)
+            | ProcessArgument::PeerPath(_)
+            | ProcessArgument::RemotePeerPath(_)
+            | ProcessArgument::SshTransport(_) => None,
         })
     }
 
@@ -372,6 +461,9 @@ impl ProcessSpecification {
         source: &Path,
         temporary_destination: &Path,
     ) -> Result<ProcessInvocation, ProcessSpecError> {
+        if self.ssh_transport.is_some() {
+            return Err(ProcessSpecError::UnsupportedSshFilesystemOperation);
+        }
         validate_peer_path("item source", source)?;
         validate_peer_path("temporary destination", temporary_destination)?;
         Ok(ProcessInvocation {
@@ -413,6 +505,7 @@ impl ProcessSpecification {
         if self.mode == SyncMode::OneWay && action.source_side() != PeerSide::from(self.source) {
             return Err(ProcessSpecError::ActionSourceMismatch);
         }
+        self.ensure_local_filesystem_operations()?;
         validate_relative_transfer_path(action.relative_path())?;
         Ok((
             self.source_path(action)?,
@@ -424,6 +517,7 @@ impl ProcessSpecification {
         if self.mode == SyncMode::OneWay && action.source_side() != PeerSide::from(self.source) {
             return Err(ProcessSpecError::ActionSourceMismatch);
         }
+        self.ensure_local_filesystem_operations()?;
         validate_relative_transfer_path(action.relative_path())?;
         let root = match action.source_side() {
             PeerSide::PeerA => &self.peer_a_root,
@@ -439,6 +533,7 @@ impl ProcessSpecification {
         if self.mode == SyncMode::OneWay && action.source_side() != PeerSide::from(self.source) {
             return Err(ProcessSpecError::ActionSourceMismatch);
         }
+        self.ensure_local_filesystem_operations()?;
         validate_relative_transfer_path(action.relative_path())?;
         let root = match action.source_side() {
             PeerSide::PeerA => &self.peer_b_root,
@@ -461,6 +556,14 @@ impl ProcessSpecification {
             .expect("a validated One-Way specification has a whole-tree invocation")
             .preview()
     }
+
+    fn ensure_local_filesystem_operations(&self) -> Result<(), ProcessSpecError> {
+        if self.ssh_transport.is_some() {
+            Err(ProcessSpecError::UnsupportedSshFilesystemOperation)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl ProcessArgument {
@@ -473,8 +576,54 @@ impl ProcessArgument {
                 argument
             }
             Self::PeerPath(path) => path.as_os_str().to_os_string(),
+            Self::RemotePeerPath(target) => target.to_os_string(),
+            Self::SshTransport(transport) => transport.to_os_string(),
         }
     }
+}
+
+fn peer_argument(peer: &Peer) -> ProcessArgument {
+    match peer.ssh_peer() {
+        Some(ssh) => ProcessArgument::RemotePeerPath(SshTarget::from_peer(ssh)),
+        None => ProcessArgument::PeerPath(peer.root().to_path_buf()),
+    }
+}
+
+impl SshTarget {
+    fn to_os_string(&self) -> OsString {
+        let mut target = OsString::from(self.username.as_str());
+        target.push("@");
+        target.push(self.server.as_str());
+        target.push(":");
+        // This is one argv item. Rsync owns the subsequent remote-shell
+        // escaping, so quotes must not be inserted into this value.
+        target.push(self.remote_path.as_os_str());
+        target
+    }
+}
+
+impl SshTransport {
+    fn to_os_string(&self) -> OsString {
+        let mut transport = format!("--rsh=ssh -p {}", self.port);
+        if let Some(identity) = &self.identity {
+            transport.push_str(" -i ");
+            transport.push_str(&encode_remote_shell_word(identity));
+        }
+        OsString::from(transport)
+    }
+}
+
+fn encode_remote_shell_word(path: &Path) -> String {
+    let mut encoded = String::from("'");
+    for character in path.to_string_lossy().chars() {
+        if character == '\'' {
+            encoded.push_str("'\\''");
+        } else {
+            encoded.push(character);
+        }
+    }
+    encoded.push('\'');
+    encoded
 }
 
 fn validate_peer_path(peer: &str, path: &Path) -> Result<(), ProcessSpecError> {

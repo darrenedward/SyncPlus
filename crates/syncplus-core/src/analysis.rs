@@ -495,6 +495,7 @@ struct RevisionItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnalysisError {
     ProcessSpecification(ProcessSpecError),
+    UnsupportedRemotePeer { peer: String },
     RootUnavailable { peer: String, path: PathBuf },
     RootNotDirectory { peer: String, path: PathBuf },
     ReadDirectory { peer: String, path: PathBuf },
@@ -509,6 +510,10 @@ impl fmt::Display for AnalysisError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ProcessSpecification(error) => write!(formatter, "process specification: {error}"),
+            Self::UnsupportedRemotePeer { peer } => write!(
+                formatter,
+                "remote peer {peer} cannot be analyzed by the local filesystem workflow yet"
+            ),
             Self::RootUnavailable { peer, path } => {
                 write!(formatter, "root for peer {peer} is unavailable: {path:?}")
             }
@@ -565,6 +570,14 @@ impl FreshAnalysis {
     pub fn analyze(profile: &SyncProfile) -> Result<Self, AnalysisError> {
         let specification = ProcessSpecification::from_profile(profile)
             .map_err(AnalysisError::ProcessSpecification)?;
+        if let Some(peer) = [profile.peer_a(), profile.peer_b()]
+            .into_iter()
+            .find(|peer| peer.is_ssh())
+        {
+            return Err(AnalysisError::UnsupportedRemotePeer {
+                peer: peer.name().to_owned(),
+            });
+        }
         let (source, destination) = if profile.mode() == crate::SyncMode::Mirror {
             (profile.peer_a(), profile.peer_b())
         } else {

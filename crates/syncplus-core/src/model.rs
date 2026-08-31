@@ -36,14 +36,160 @@ impl ProfileSnapshotId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Peer {
     name: String,
-    root: PathBuf,
+    endpoint: PeerEndpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerEndpoint {
+    Local { root: PathBuf },
+    Ssh(SshPeer),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshAuthentication {
+    Key,
+    Agent,
+    InteractivePassword,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshPeer {
+    server: String,
+    username: String,
+    port: u16,
+    identity: Option<PathBuf>,
+    authentication: SshAuthentication,
+    remote_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshPeerError {
+    EmptyServer,
+    InvalidServer,
+    EmptyUsername,
+    InvalidUsername,
+    InvalidPort,
+    EmptyIdentity,
+    NulInIdentity,
+    EmptyRemotePath,
+    NulInRemotePath,
+}
+
+impl SshPeer {
+    pub fn new(
+        server: impl Into<String>,
+        username: impl Into<String>,
+        port: u16,
+        identity: Option<PathBuf>,
+        authentication: SshAuthentication,
+        remote_path: impl Into<String>,
+    ) -> Result<Self, SshPeerError> {
+        let server = server.into();
+        if server.is_empty() {
+            return Err(SshPeerError::EmptyServer);
+        }
+        if !is_valid_ssh_server(&server) {
+            return Err(SshPeerError::InvalidServer);
+        }
+
+        let username = username.into();
+        if username.is_empty() {
+            return Err(SshPeerError::EmptyUsername);
+        }
+        if !is_valid_ssh_username(&username) {
+            return Err(SshPeerError::InvalidUsername);
+        }
+
+        if port == 0 {
+            return Err(SshPeerError::InvalidPort);
+        }
+
+        if let Some(identity) = &identity {
+            if identity.as_os_str().is_empty() {
+                return Err(SshPeerError::EmptyIdentity);
+            }
+            if path_contains_nul(identity) {
+                return Err(SshPeerError::NulInIdentity);
+            }
+        }
+
+        let remote_path = remote_path.into();
+        if remote_path.is_empty() {
+            return Err(SshPeerError::EmptyRemotePath);
+        }
+        if remote_path.contains('\0') {
+            return Err(SshPeerError::NulInRemotePath);
+        }
+
+        Ok(Self {
+            server,
+            username,
+            port,
+            identity,
+            authentication,
+            remote_path: PathBuf::from(remote_path),
+        })
+    }
+
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn identity(&self) -> Option<&Path> {
+        self.identity.as_deref()
+    }
+
+    pub const fn authentication(&self) -> SshAuthentication {
+        self.authentication
+    }
+
+    pub fn remote_path(&self) -> &Path {
+        &self.remote_path
+    }
 }
 
 impl Peer {
     pub fn new(name: impl Into<String>, root: PathBuf) -> Self {
         Self {
             name: name.into(),
-            root,
+            endpoint: PeerEndpoint::Local { root },
+        }
+    }
+
+    pub fn ssh(
+        name: impl Into<String>,
+        server: impl Into<String>,
+        username: impl Into<String>,
+        port: u16,
+        identity: Option<PathBuf>,
+        authentication: SshAuthentication,
+        remote_path: impl Into<String>,
+    ) -> Result<Self, SshPeerError> {
+        Ok(Self {
+            name: name.into(),
+            endpoint: PeerEndpoint::Ssh(SshPeer::new(
+                server,
+                username,
+                port,
+                identity,
+                authentication,
+                remote_path,
+            )?),
+        })
+    }
+
+    pub fn from_ssh(name: impl Into<String>, ssh: SshPeer) -> Self {
+        Self {
+            name: name.into(),
+            endpoint: PeerEndpoint::Ssh(ssh),
         }
     }
 
@@ -52,8 +198,82 @@ impl Peer {
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        match &self.endpoint {
+            PeerEndpoint::Local { root } => root,
+            PeerEndpoint::Ssh(ssh) => ssh.remote_path(),
+        }
     }
+
+    pub fn endpoint(&self) -> &PeerEndpoint {
+        &self.endpoint
+    }
+
+    pub fn is_ssh(&self) -> bool {
+        matches!(self.endpoint, PeerEndpoint::Ssh(_))
+    }
+
+    pub fn ssh_peer(&self) -> Option<&SshPeer> {
+        match &self.endpoint {
+            PeerEndpoint::Local { .. } => None,
+            PeerEndpoint::Ssh(ssh) => Some(ssh),
+        }
+    }
+}
+
+impl fmt::Display for SshPeerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::EmptyServer => "SSH server must not be empty",
+            Self::InvalidServer => "SSH server contains unsupported characters",
+            Self::EmptyUsername => "SSH username must not be empty",
+            Self::InvalidUsername => "SSH username contains unsupported characters",
+            Self::InvalidPort => "SSH port must be between 1 and 65535",
+            Self::EmptyIdentity => "SSH identity path must not be empty",
+            Self::NulInIdentity => "SSH identity path contains NUL",
+            Self::EmptyRemotePath => "SSH remote path must not be empty",
+            Self::NulInRemotePath => "SSH remote path contains NUL",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for SshPeerError {}
+
+fn is_valid_ssh_server(server: &str) -> bool {
+    if server.starts_with('[') || server.ends_with(']') {
+        let Some(address) = server.strip_prefix('[').and_then(|value| value.strip_suffix(']'))
+        else {
+            return false;
+        };
+        return !address.is_empty()
+            && address.chars().all(|character| {
+                character.is_ascii_hexdigit()
+                    || character.is_ascii_alphanumeric()
+                    || matches!(character, ':' | '%' | '.' | '-')
+            });
+    }
+
+    server.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '-')
+    })
+}
+
+fn is_valid_ssh_username(username: &str) -> bool {
+    username.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+    })
+}
+
+#[cfg(unix)]
+fn path_contains_nul(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    path.as_os_str().as_bytes().contains(&0)
+}
+
+#[cfg(not(unix))]
+fn path_contains_nul(path: &Path) -> bool {
+    path.to_string_lossy().contains('\0')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
