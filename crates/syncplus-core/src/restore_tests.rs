@@ -27,3 +27,13 @@ fn restore_cancellation_leaves_destination_absent_and_no_temporary() {
     assert!(!root.join("target").exists());
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn sidecar_tampering_is_rejected_before_restore() {
+    let root = temp_dir(); let sidecar = root.join("item.manifest");
+    let provenance = RecoveryProvenance::new("local", root.clone(), PathBuf::from("target"), RunId::new(9), ItemType::RegularFile, None, None).unwrap();
+    provenance.write_sidecar(&sidecar).unwrap();
+    let mut bytes = fs::read(&sidecar).unwrap(); bytes[0] = b'X'; fs::write(&sidecar, bytes).unwrap();
+    assert!(matches!(RecoveryProvenance::read_sidecar(&sidecar), Err(RestoreError::SidecarInvalid(_))));
+    let _ = fs::remove_dir_all(root);
+}

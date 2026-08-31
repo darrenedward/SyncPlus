@@ -1,6 +1,7 @@
 use std::{fs, io, path::{Component, Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
 
 use crate::{ContentProof, FileIdentity, ItemType};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryProvenance {
@@ -34,6 +35,35 @@ impl RecoveryProvenance {
         }
         Ok(destination)
     }
+
+    /// Write a validated, content-free provenance sidecar for custom Trash.
+    pub fn write_sidecar(&self, path: &Path) -> Result<(), RestoreError> {
+        let payload = self.sidecar_payload();
+        let checksum = digest_text(&payload);
+        let contents = format!("{payload}checksum={checksum}\n");
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(io_error)?;
+        use io::Write;
+        file.write_all(contents.as_bytes()).map_err(io_error)?;
+        file.sync_all().map_err(io_error)
+    }
+
+    pub fn read_sidecar(path: &Path) -> Result<Self, RestoreError> {
+        let contents = fs::read_to_string(path).map_err(io_error)?;
+        let checksum = contents.lines().find_map(|line| line.strip_prefix("checksum=")).ok_or_else(|| RestoreError::SidecarInvalid("checksum is missing".into()))?;
+        let payload = contents.strip_suffix(&format!("checksum={checksum}\n")).ok_or_else(|| RestoreError::SidecarInvalid("sidecar is malformed".into()))?;
+        if digest_text(payload) != checksum { return Err(RestoreError::SidecarInvalid("sidecar integrity check failed".into())); }
+        let values: std::collections::BTreeMap<_, _> = payload.lines().filter_map(|line| line.split_once('=')).collect();
+        let root = PathBuf::from(values.get("root").ok_or_else(|| RestoreError::SidecarInvalid("original root is missing".into()))?);
+        let relative = PathBuf::from(values.get("relative").ok_or_else(|| RestoreError::SidecarInvalid("relative path is missing".into()))?);
+        let run_id = values.get("run_id").and_then(|v| v.parse().ok()).ok_or_else(|| RestoreError::SidecarInvalid("run id is invalid".into()))?;
+        let item_type = match values.get("item_type").copied() { Some("regular_file") => ItemType::RegularFile, Some("directory") => ItemType::Directory, Some("symlink") => ItemType::Symlink, _ => return Err(RestoreError::SidecarInvalid("item type is invalid".into())) };
+        Self::new(values.get("peer").copied().unwrap_or_default(), root, relative, crate::RunId::new(run_id), item_type, None, None).map_err(|e| RestoreError::SidecarInvalid(e.to_string()))
+    }
+
+    fn sidecar_payload(&self) -> String {
+        let item_type = match self.item_type { ItemType::RegularFile => "regular_file", ItemType::Directory => "directory", ItemType::Symlink => "symlink", ItemType::Unsupported => "unsupported" };
+        format!("peer={}\nroot={}\nrelative={}\nrun_id={}\nitem_type={}\n", self.peer, self.original_root.display(), self.relative_path.display(), self.run_id.value(), item_type)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +74,9 @@ fn io_error(e: io::Error) -> RestoreError { RestoreError::Io(e.to_string()) }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestoreOutcome { Restored, AlreadyPresent }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreJournalEvent { Decision { run_id: crate::RunId, path: PathBuf }, Completed { run_id: crate::RunId, path: PathBuf, outcome: RestoreOutcome }, Refused { run_id: crate::RunId, path: PathBuf, reason: String } }
 
 pub struct CollisionSafeRestore;
 impl CollisionSafeRestore {
@@ -74,7 +107,18 @@ impl CollisionSafeRestore {
         if result.is_err() { let _ = fs::remove_file(&temporary); }
         result
     }
+
+    pub fn restore_with_journal<C, J>(recovered: &Path, provenance: &RecoveryProvenance, should_cancel: C, mut journal: J) -> Result<RestoreOutcome, RestoreError>
+    where C: Fn() -> bool, J: FnMut(RestoreJournalEvent) {
+        let path = provenance.destination()?;
+        journal(RestoreJournalEvent::Decision { run_id: provenance.run_id(), path: path.clone() });
+        match Self::restore(recovered, provenance, should_cancel) {
+            Ok(outcome) => { journal(RestoreJournalEvent::Completed { run_id: provenance.run_id(), path, outcome }); Ok(outcome) }
+            Err(error) => { journal(RestoreJournalEvent::Refused { run_id: provenance.run_id(), path, reason: error.to_string() }); Err(error) }
+        }
+    }
 }
 
 fn validate_relative_path(path: &Path) -> Result<(), RestoreError> { if path.as_os_str().is_empty() || path.is_absolute() || path.components().any(|c| !matches!(c, Component::Normal(_))) { return Err(RestoreError::InvalidProvenance("original path must be a non-empty normalized relative path".into())); } Ok(()) }
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).ok().and_then(|d| i64::try_from(d.as_nanos()).ok()).unwrap_or_default() }
+fn digest_text(value: &str) -> String { let mut digest = Sha256::new(); digest.update(value.as_bytes()); digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect() }

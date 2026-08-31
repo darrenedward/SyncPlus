@@ -49,7 +49,7 @@ pub use verification::{
 };
 pub use transfer::{ControlledTransfer, TransferError};
 pub use removal::{RecoveryMethod, RemovalReceipt, SafeDeleteError, SafeDeleteExecutor};
-pub use restore::{CollisionSafeRestore, RecoveryProvenance, RestoreError, RestoreOutcome};
+pub use restore::{CollisionSafeRestore, RecoveryProvenance, RestoreError, RestoreJournalEvent, RestoreOutcome};
 pub use workflow::{RunWorkflow, WorkflowError};
 pub use reconciliation::{
     CompletionReconciliation, InventorySnapshotItem, ReconciliationFinding,
