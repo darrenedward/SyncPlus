@@ -18,6 +18,10 @@ pub enum RecoveryMethod {
     /// Native OS Trash discovery, provenance, and Restore remain part of the
     /// parent recovery-method issue.
     VerifiedRecoveryFolder { root: PathBuf },
+    /// The platform's user Trash data root. The caller must pass the
+    /// validated per-user XDG data directory; this never invokes a shell or
+    /// silently changes to permanent removal.
+    NativeTrash { data_root: PathBuf },
     PermanentRemoval,
 }
 
@@ -30,20 +34,25 @@ impl RecoveryMethod {
         Self::VerifiedRecoveryFolder { root: root.into() }
     }
 
+    pub fn native_trash(data_root: impl Into<PathBuf>) -> Self {
+        Self::NativeTrash { data_root: data_root.into() }
+    }
+
     pub const fn permanent_removal() -> Self {
         Self::PermanentRemoval
     }
 
     pub const fn deletion_method(&self) -> DeletionMethod {
         match self {
-            Self::VerifiedRecoveryFolder { .. } => DeletionMethod::Trash,
+            Self::VerifiedRecoveryFolder { .. } | Self::NativeTrash { .. } => DeletionMethod::Trash,
             Self::PermanentRemoval => DeletionMethod::PermanentRemoval,
         }
     }
 
-    fn recovery_root(&self) -> Option<&Path> {
+    fn recovery_root(&self) -> Option<PathBuf> {
         match self {
-            Self::VerifiedRecoveryFolder { root } => Some(root),
+            Self::VerifiedRecoveryFolder { root } => Some(root.clone()),
+            Self::NativeTrash { data_root } => Some(data_root.join("Trash/files")),
             Self::PermanentRemoval => None,
         }
     }
@@ -324,7 +333,7 @@ impl SafeDeleteExecutor {
         }
         let recovery_target = if let Some(recovery_root) = self.recovery_method.recovery_root() {
             let (_recovery_root, recovery_target, same_filesystem) =
-                match validate_recovery_root(&source_root, &source, recovery_root)
+                match validate_recovery_root(&source_root, &source, &recovery_root)
                 {
                     Ok(layout) => layout,
                     Err(error) => {
@@ -360,7 +369,7 @@ impl SafeDeleteExecutor {
             if !same_filesystem {
                 if let Err(error) =
                     ensure_recovery_space(
-                        recovery_root,
+                        &recovery_root,
                         proof
                             .source_after()
                             .content_proof()
@@ -501,8 +510,9 @@ impl SafeDeleteExecutor {
         match self.recovery_method.recovery_root() {
             Some(recovery_root) => {
                 let (recovery_root, recovery_target, same_filesystem) =
-                    validate_recovery_root(source_root, source, recovery_root)?;
-                if same_filesystem {
+                    validate_recovery_root(source_root, source, &recovery_root)?;
+                let provenance = self.prepare_native_provenance(&source, &recovery_target)?;
+                let result = if same_filesystem {
                     self.move_to_same_filesystem_recovery(
                         source_root,
                         &recovery_root,
@@ -522,12 +532,45 @@ impl SafeDeleteExecutor {
                         proof,
                         metadata_requirements,
                     )
+                };
+                if result.is_err() {
+                    if let Some(path) = provenance {
+                        let _ = fs::remove_file(path);
+                    }
                 }
+                result
             }
             None => Err(SafeDeleteError::RecoveryUnavailable(
                 "Permanent Removal is not available in this core slice".to_owned(),
             )),
         }
+    }
+
+    fn prepare_native_provenance(
+        &self,
+        source: &Path,
+        recovery_target: &Path,
+    ) -> Result<Option<PathBuf>, SafeDeleteError> {
+        let RecoveryMethod::NativeTrash { .. } = self.recovery_method else {
+            return Ok(None);
+        };
+        let info_root = recovery_target.parent().and_then(Path::parent).ok_or_else(|| {
+            SafeDeleteError::RecoveryUnavailable("native Trash target has no info directory".to_owned())
+        })?.join("info");
+        fs::create_dir_all(&info_root).map_err(io_error)?;
+        let name = recovery_target.file_name().ok_or_else(|| {
+            SafeDeleteError::RecoveryUnavailable("native Trash target has no file name".to_owned())
+        })?;
+        let info = info_root.join(name).with_extension("trashinfo");
+        if info.exists() {
+            return Err(SafeDeleteError::RecoveryUnavailable("native Trash provenance already exists".to_owned()));
+        }
+        let escaped = source.to_string_lossy().replace('%', "%25").replace('\n', "%0A");
+        let contents = format!("[Trash Info]\nPath={escaped}\nDeletionDate={}\n", now_unix_nanos());
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&info).map_err(io_error)?;
+        file.write_all(contents.as_bytes()).map_err(io_error)?;
+        file.sync_all().map_err(io_error)?;
+        Ok(Some(info))
     }
 
     fn move_to_same_filesystem_recovery(
