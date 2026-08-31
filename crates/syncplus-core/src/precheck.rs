@@ -165,6 +165,13 @@ pub trait PrecheckProbe {
         destination: &Path,
         exclusions: &[String],
     ) -> Result<Vec<NamingConflict>, PrecheckError>;
+
+    /// Return the naming policy that applies to generated paths on this
+    /// destination filesystem. Implementations that cannot discover a more
+    /// specific policy use the conservative default.
+    fn destination_naming_policy(&self, _destination: &Path) -> DestinationNamingPolicy {
+        DestinationNamingPolicy::default()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1257,6 +1264,14 @@ impl LocalPrecheckProbe {
     pub fn new(naming_policy: DestinationNamingPolicy) -> Self {
         Self { naming_policy }
     }
+
+    pub fn naming_policy(&self, destination: &Path) -> DestinationNamingPolicy {
+        if self.naming_policy.auto_detect {
+            self.naming_policy.detect_for_destination(destination)
+        } else {
+            self.naming_policy.clone()
+        }
+    }
 }
 
 impl Default for LocalPrecheckProbe {
@@ -1414,6 +1429,10 @@ impl PrecheckProbe for LocalPrecheckProbe {
     ) -> Result<Vec<NamingConflict>, PrecheckError> {
         self.naming_policy
             .find_conflicts(source, destination, exclusions)
+    }
+
+    fn destination_naming_policy(&self, destination: &Path) -> DestinationNamingPolicy {
+        self.naming_policy(destination)
     }
 }
 

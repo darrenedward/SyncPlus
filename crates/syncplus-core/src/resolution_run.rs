@@ -7,8 +7,9 @@ use std::{
 use crate::{
     ActionReason, AnalysisError, ConflictDecision, ConflictResolution, ConflictResolutionError,
     ConflictResolutionAction, ConflictResolutionPlan, ControlledTransfer, FreshAnalysis,
-    OneWayPlan, SourceInventorySnapshot, SyncBaseline, SyncBaselineItem, SyncBaselineItemStatus,
-    SyncMode, SyncProfile, TransferError,
+    DestinationNamingPolicy, OneWayPlan, PreservedCopyError, PreservedCopyExecutionReport,
+    PreservedCopyExecutor, PreservedCopyPlanner, PreservedPathInventory, SourceInventorySnapshot,
+    SyncBaseline, SyncBaselineItem, SyncBaselineItemStatus, SyncMode, SyncProfile, TransferError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub enum ResolutionRunError {
     StaleDecision { changed_paths: Vec<PathBuf> },
     FinalConfirmationRequired,
     UnknownAction { relative_path: PathBuf },
+    PreservedCopy(PreservedCopyError),
 }
 
 impl fmt::Display for ResolutionRunError {
@@ -41,6 +43,9 @@ impl fmt::Display for ResolutionRunError {
             }
             Self::UnknownAction { relative_path } => {
                 write!(formatter, "Resolution Run has no action for {relative_path:?}")
+            }
+            Self::PreservedCopy(error) => {
+                write!(formatter, "preserved-copy planning failed: {error}")
             }
         }
     }
@@ -307,27 +312,58 @@ impl ConfirmedResolutionRun {
         &self,
         executor: &mut E,
     ) -> ResolutionExecutionReport {
-        let results = self
-            .plan
-            .actions()
-            .iter()
-            .map(|action| {
-                let relative_path = action.relative_path().to_path_buf();
-                if action.resolution() == ConflictResolution::Defer {
-                    return ResolutionRunResult::deferred(relative_path);
-                }
-                let outcome = executor
+        let actions = self.plan.actions();
+        let mut results = Vec::with_capacity(actions.len());
+        for (index, action) in actions.iter().enumerate() {
+            let relative_path = action.relative_path().to_path_buf();
+            let outcome = if action.resolution() == ConflictResolution::Defer {
+                executor
+                    .defer(action, &self.fresh_analysis)
+                    .map_or_else(ResolutionRunOutcome::Unresolved, |_| {
+                        ResolutionRunOutcome::Deferred
+                    })
+            } else {
+                executor
                     .execute(action, &self.fresh_analysis)
                     .map_or_else(ResolutionRunOutcome::Unresolved, |_| {
                         ResolutionRunOutcome::Completed
+                    })
+            };
+            let stop_after_action = matches!(
+                outcome,
+                ResolutionRunOutcome::Unresolved(
+                    ActionReason::CancellationRequested | ActionReason::InterruptedBoundary
+                )
+            );
+            results.push(ResolutionRunResult {
+                relative_path,
+                outcome,
+                preserves_item: !matches!(outcome, ResolutionRunOutcome::Completed)
+                    || matches!(
+                        action.resolution(),
+                        ConflictResolution::PreserveBoth
+                            | ConflictResolution::RenamePreserveForReview
+                    ),
+            });
+            if stop_after_action {
+                for remaining in &actions[index + 1..] {
+                    let relative_path = remaining.relative_path().to_path_buf();
+                    let outcome = executor
+                        .cancel(remaining, &self.fresh_analysis)
+                        .map_or_else(ResolutionRunOutcome::Unresolved, |_| {
+                            ResolutionRunOutcome::Unresolved(
+                                ActionReason::CancellationRequested,
+                            )
+                        });
+                    results.push(ResolutionRunResult {
+                        relative_path,
+                        outcome,
+                        preserves_item: true,
                     });
-                ResolutionRunResult {
-                    relative_path,
-                    outcome,
-                    preserves_item: !matches!(outcome, ResolutionRunOutcome::Completed),
                 }
-            })
-            .collect();
+                break;
+            }
+        }
         ResolutionExecutionReport { results }
     }
 }
@@ -342,17 +378,35 @@ pub trait ResolutionActionExecutor {
         action: &ConflictResolutionAction,
         analysis: &FreshAnalysis,
     ) -> Result<(), ActionReason>;
+
+    fn defer(
+        &mut self,
+        _action: &ConflictResolutionAction,
+        _analysis: &FreshAnalysis,
+    ) -> Result<(), ActionReason> {
+        Ok(())
+    }
+
+    fn cancel(
+        &mut self,
+        _action: &ConflictResolutionAction,
+        _analysis: &FreshAnalysis,
+    ) -> Result<(), ActionReason> {
+        Ok(())
+    }
 }
 
 /// Executes Keep Peer A/B actions through the same controlled rsync and
 /// Verified Replacement boundary used by ordinary Sync Runs. Preserve Both and
-/// Rename/Preserve remain unresolved here until their collision-safe copy
-/// planner is supplied by the corresponding resolution implementation.
+/// Rename/Preserve use the collision-safe preserved-copy boundary and retain
+/// their generated-path reports for durable Run Report integration.
 #[derive(Debug)]
 pub struct FilesystemResolutionExecutor<F> {
     transfer: ControlledTransfer,
     plan: OneWayPlan,
     should_cancel: F,
+    preserved_plans: BTreeMap<PathBuf, crate::PreservedCopyPlan>,
+    preserved_reports: BTreeMap<PathBuf, PreservedCopyExecutionReport>,
 }
 
 impl<F> FilesystemResolutionExecutor<F>
@@ -364,15 +418,81 @@ where
         transfer: ControlledTransfer,
         should_cancel: F,
     ) -> Result<Self, ResolutionRunError> {
+        Self::new_with_naming_policies(
+            confirmed,
+            transfer,
+            should_cancel,
+            DestinationNamingPolicy::default(),
+            DestinationNamingPolicy::default(),
+        )
+    }
+
+    pub fn new_with_naming_policies(
+        confirmed: &ConfirmedResolutionRun,
+        transfer: ControlledTransfer,
+        should_cancel: F,
+        peer_a_policy: DestinationNamingPolicy,
+        peer_b_policy: DestinationNamingPolicy,
+    ) -> Result<Self, ResolutionRunError> {
         let plan = confirmed
             .fresh_analysis
             .resolution_transfer_plan(confirmed.actions())
             .map_err(ResolutionRunError::Analysis)?;
+        let occupied_a = confirmed
+            .fresh_analysis
+            .source_inventory()
+            .items()
+            .iter()
+            .map(|item| item.relative_path().to_path_buf())
+            .collect::<Vec<_>>();
+        let occupied_b = confirmed
+            .fresh_analysis
+            .destination_inventory()
+            .items()
+            .iter()
+            .map(|item| item.relative_path().to_path_buf())
+            .collect::<Vec<_>>();
+        let mut planner = PreservedCopyPlanner::new(PreservedPathInventory::new_with_policies(
+            peer_a_policy,
+            peer_b_policy,
+            occupied_a,
+            occupied_b,
+        ));
+        let mut preserved_plans = BTreeMap::new();
+        for action in confirmed.actions().iter().filter(|action| {
+            matches!(
+                action.resolution(),
+                ConflictResolution::PreserveBoth | ConflictResolution::RenamePreserveForReview
+            )
+        }) {
+            if let Some(plan) = planner
+                .plan(action)
+                .map_err(ResolutionRunError::PreservedCopy)?
+            {
+                preserved_plans.insert(action.relative_path().to_path_buf(), plan);
+            }
+        }
         Ok(Self {
             transfer,
             plan,
             should_cancel,
+            preserved_plans,
+            preserved_reports: BTreeMap::new(),
         })
+    }
+
+    pub fn preserved_copy_report(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Option<&PreservedCopyExecutionReport> {
+        self.preserved_reports.get(relative_path.as_ref())
+    }
+
+    pub(crate) fn preserved_copy_plan(
+        &self,
+        relative_path: impl AsRef<Path>,
+    ) -> Option<&crate::PreservedCopyPlan> {
+        self.preserved_plans.get(relative_path.as_ref())
     }
 }
 
@@ -383,8 +503,28 @@ where
     fn execute(
         &mut self,
         action: &ConflictResolutionAction,
-        _analysis: &FreshAnalysis,
+        analysis: &FreshAnalysis,
     ) -> Result<(), ActionReason> {
+        if matches!(
+            action.resolution(),
+            ConflictResolution::PreserveBoth | ConflictResolution::RenamePreserveForReview
+        ) {
+            let Some(plan) = self.preserved_plans.get(action.relative_path()) else {
+                return Err(ActionReason::TransferFailed);
+            };
+            let report = PreservedCopyExecutor::new(
+                analysis.profile().peer_a().root().to_path_buf(),
+                analysis.profile().peer_b().root().to_path_buf(),
+            )
+            .execute(plan);
+            let unresolved = report.has_unresolved();
+            self.preserved_reports
+                .insert(action.relative_path().to_path_buf(), report);
+            if unresolved {
+                return Err(ActionReason::VerificationMismatch);
+            }
+            return Ok(());
+        }
         if action.operation() != crate::ResolutionOperation::CopyWholeFile {
             return Err(ActionReason::DeferredForReview);
         }
@@ -424,7 +564,7 @@ impl ResolutionExecutionReport {
             && self
                 .results
                 .iter()
-                .all(|result| result.outcome() == ResolutionRunOutcome::Completed)
+                .all(|result| !result.requires_review())
     }
 }
 
@@ -443,14 +583,6 @@ pub struct ResolutionRunResult {
 }
 
 impl ResolutionRunResult {
-    fn deferred(relative_path: PathBuf) -> Self {
-        Self {
-            relative_path,
-            outcome: ResolutionRunOutcome::Deferred,
-            preserves_item: true,
-        }
-    }
-
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
     }
@@ -464,7 +596,7 @@ impl ResolutionRunResult {
     }
 
     pub const fn requires_review(&self) -> bool {
-        !matches!(self.outcome, ResolutionRunOutcome::Completed)
+        self.preserves_item || !matches!(self.outcome, ResolutionRunOutcome::Completed)
     }
 }
 

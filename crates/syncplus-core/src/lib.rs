@@ -68,6 +68,7 @@ pub use evidence::{
     ActionId, ActionJournalEntry, ActionOutcome, ActionReason, FileIdentity,
     JournalEvent, PlanRecord, PreActionState, RecoveryEvidence, RecoveryResolution,
     RemovalResult, RunEvidenceStore, RunExecutionResult, RunLifecycle, RunReport, RunReportItem,
+    MirrorResolutionOutcome, MirrorResolutionReportItem, MirrorResolutionReviewState,
     RunReportStatus, RunSnapshot, StorageError,
 };
 pub use parser::{
