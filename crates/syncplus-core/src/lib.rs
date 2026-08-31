@@ -118,6 +118,8 @@ mod resolution_tests;
 
 #[cfg(test)]
 mod resolution_run_tests;
+
+#[cfg(test)]
 mod preserved_copy_tests;
 
 #[cfg(test)]
