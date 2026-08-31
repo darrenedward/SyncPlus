@@ -615,6 +615,19 @@ impl FreshAnalysis {
         crate::ConflictReview::from_analysis(self)
     }
 
+    /// Validate user decisions against this analysis' read-only conflict
+    /// review. The returned plan is still non-executable until its separate
+    /// final Execution Confirmation boundary is accepted.
+    pub fn resolve_conflicts<I>(
+        &self,
+        decisions: I,
+    ) -> Result<crate::ConflictResolutionPlan, crate::ConflictResolutionError>
+    where
+        I: IntoIterator<Item = crate::ConflictDecision>,
+    {
+        self.conflict_review().resolve(decisions)
+    }
+
     pub fn revision(&self) -> AnalysisRevision {
         self.revision.clone()
     }
