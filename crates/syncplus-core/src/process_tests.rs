@@ -2,8 +2,9 @@ use std::{fs, path::PathBuf};
 
 use crate::{
     AnalysisError, AuthorizationSnapshot, DeletionMethod, FreshAnalysis, MetadataRequirements,
-    OneWaySource, ProcessArgument, ProcessSpecError, ProcessSpecification, Peer, RsyncFlag,
-    RunId, RunSnapshot, SshAuthentication, SshPeer, SshPeerError, StorageError, SyncMode,
+    OneWaySource, ProcessArgument, ProcessSpecError, ProcessSpecification, Peer,
+    RemoteHelperInvocation, RemoteHelperKind, RsyncFlag,
+    RunId, RunSnapshot, SshAuthentication, SshPeer, SshPeerError, SyncMode,
     SyncOptions, SyncProfile,
     SpecialistMetadataRequirements,
 };
@@ -269,7 +270,7 @@ fn two_ssh_peers_are_rejected_before_process_construction() {
 }
 
 #[test]
-fn remote_peers_are_blocked_from_local_filesystem_workflows() {
+fn remote_peers_use_the_ssh_workflow_boundary_but_not_local_filesystem_analysis() {
     let profile = SyncProfile::new(
         "SSH workflow boundary",
         Peer::new("Local", PathBuf::from("/home/user/source")),
@@ -280,10 +281,46 @@ fn remote_peers_are_blocked_from_local_filesystem_workflows() {
         FreshAnalysis::analyze(&profile),
         Err(AnalysisError::UnsupportedRemotePeer { peer }) if peer == "SSH peer"
     ));
-    assert!(matches!(
-        RunSnapshot::from_profile(RunId::new(1), &profile, AuthorizationSnapshot::default()),
-        Err(StorageError::UnsupportedRemotePeer)
-    ));
+    assert!(RunSnapshot::from_profile(
+        RunId::new(1),
+        &profile,
+        AuthorizationSnapshot::default()
+    )
+    .is_ok());
+}
+
+#[test]
+fn remote_sha256_helper_is_fixed_and_keeps_the_path_in_one_encoded_command_argument() {
+    let peer = SshPeer::new(
+        "backup.example.test",
+        "sync-user",
+        2222,
+        None,
+        SshAuthentication::Agent,
+        "/srv/sync",
+    )
+    .expect("SSH fixture should be valid");
+    let path = PathBuf::from("/srv/sync/$(touch pwned); user's report/世界\n");
+    let helper = RemoteHelperInvocation::sha256(&peer, path.clone())
+        .expect("the fixed helper should accept a validated path");
+
+    assert_eq!(helper.kind(), RemoteHelperKind::Sha256);
+    assert_eq!(helper.path(), path.as_path());
+    assert_eq!(helper.invocation().program(), std::ffi::OsStr::new("ssh"));
+    assert_eq!(helper.invocation().arguments().len(), 12);
+    assert!(helper
+        .invocation()
+        .arguments()
+        .last()
+        .expect("fixed remote command")
+        .to_string_lossy()
+        .starts_with("sha256sum -- "));
+    assert!(helper
+        .invocation()
+        .arguments()
+        .iter()
+        .all(|argument| argument != std::ffi::OsStr::new("touch")));
+    assert!(helper.invocation().preview().contains("sha256sum"));
 }
 
 #[test]

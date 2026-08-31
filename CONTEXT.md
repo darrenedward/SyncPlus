@@ -316,6 +316,7 @@ _Avoid_: Raw SSH configuration, command-line setup
 For an Unattended Run, an unapproved or changed SSH Server Identity stops the affected remote operation, preserves source items, and creates a user notification for interactive review.
 
 SSH is a first-release peer type alongside local folders and external drives. Its first-release scope includes the same precheck, review, verification, confirmation, cancellation, resume, and reporting guarantees; SSH-specific capability and identity checks are mandatory rather than deferred features.
+The shared core executes local-to-SSH and SSH-to-local runs through one typed SSH backend boundary. The boundary must recheck remote capabilities around confirmation, supervise SSH and rsync in the run's process group, stage destination-side data before installation, and return endpoint-bound metadata and content proofs; the platform adapter owns the network runtime while the core owns policy and journal decisions.
 
 First-release SSH topology is one local peer and one SSH peer: local-to-SSH or SSH-to-local. SSH-to-SSH synchronization is outside the first-release scope.
 

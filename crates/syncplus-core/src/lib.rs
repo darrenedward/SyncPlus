@@ -22,6 +22,7 @@ mod reconciliation;
 mod volume;
 mod ssh_host;
 mod ssh;
+mod ssh_workflow;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
@@ -43,7 +44,8 @@ pub use ssh_host::{
 };
 pub use process::{
     EnvironmentBinding, ProcessArgument, ProcessInvocation, ProcessSpecError,
-    ProcessSpecification, RsyncFlag, SshTarget, SshTransport, ValidatedSyncOptions,
+    ProcessSpecification, RemoteHelperInvocation, RemoteHelperKind, RsyncFlag, SshTarget,
+    SshTransport, ValidatedSyncOptions,
 };
 pub use analysis::{
     AnalysisError, AnalysisOutcome, AnalysisRevision, ApprovedSyncScope, ConfirmedPlan,
@@ -98,6 +100,10 @@ pub use transfer::{ControlledTransfer, TransferError};
 pub use removal::{RecoveryMethod, RemovalReceipt, SafeDeleteError, SafeDeleteExecutor};
 pub use restore::{CollisionSafeRestore, RecoveryProvenance, RestoreError, RestoreJournalEvent, RestoreOutcome};
 pub use workflow::{RunWorkflow, WorkflowError};
+pub use ssh_workflow::{
+    SshMetadataProof, SshRunBackend, SshRunError, SshTransferBoundary,
+    SshTransferEvidence, SshTransferRequest,
+};
 pub use reconciliation::{
     CompletionReconciliation, InventorySnapshotItem, ReconciliationFinding,
     ReconciliationFindingKind, ReconciliationReason, SourceDrainStatus, SourceInventorySnapshot,

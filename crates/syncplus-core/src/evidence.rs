@@ -55,9 +55,6 @@ impl RunSnapshot {
     ) -> Result<Self, StorageError> {
         let specification =
             ProcessSpecification::from_profile(profile).map_err(StorageError::InvalidProfile)?;
-        if profile.peer_a().is_ssh() || profile.peer_b().is_ssh() {
-            return Err(StorageError::UnsupportedRemotePeer);
-        }
         if authorizations.allow_unattended_permanent_removal()
             && (specification.options().deletion_method()
                 != Some(DeletionMethod::PermanentRemoval)
@@ -869,7 +866,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 11 {
+        if version > 12 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -1176,6 +1173,41 @@ impl RunEvidenceStore {
             )?;
             transaction.pragma_update(None, "user_version", 11)?;
             transaction.commit()?;
+            version = 11;
+        }
+        if version == 11 {
+            let transaction = connection.transaction()?;
+            let columns = [
+                ("peer_a_endpoint_kind", "TEXT NOT NULL DEFAULT 'local'"),
+                ("peer_a_server", "TEXT"),
+                ("peer_a_username", "TEXT"),
+                ("peer_a_port", "INTEGER"),
+                ("peer_a_identity", "BLOB"),
+                ("peer_a_authentication", "TEXT"),
+                ("peer_b_endpoint_kind", "TEXT NOT NULL DEFAULT 'local'"),
+                ("peer_b_server", "TEXT"),
+                ("peer_b_username", "TEXT"),
+                ("peer_b_port", "INTEGER"),
+                ("peer_b_identity", "BLOB"),
+                ("peer_b_authentication", "TEXT"),
+            ];
+            for (name, definition) in columns {
+                let exists: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info('run_snapshots') WHERE name = ?1
+                    )",
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    transaction.execute(
+                        &format!("ALTER TABLE run_snapshots ADD COLUMN {name} {definition}"),
+                        [],
+                    )?;
+                }
+            }
+            transaction.pragma_update(None, "user_version", 12)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -1196,13 +1228,17 @@ impl RunEvidenceStore {
                 run_id, snapshot_id, profile_name,
                 peer_a_name, peer_a_root, peer_b_name, peer_b_root,
                 peer_a_volume_identity, peer_b_volume_identity,
+                peer_a_endpoint_kind, peer_a_server, peer_a_username, peer_a_port,
+                peer_a_identity, peer_a_authentication,
+                peer_b_endpoint_kind, peer_b_server, peer_b_username, peer_b_port,
+                peer_b_identity, peer_b_authentication,
                 mode, source, safe_delete, destination_cleanup, deletion_method,
                 allow_unattended_destructive, allow_unattended_permanent_removal,
                 metadata_file_type, metadata_executable_permissions,
                 metadata_symlink_targets, metadata_timestamps,
                 partial_transfer_policy, retry_max_attempts,
                 retry_initial_delay_millis
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
             params![
                 snapshot.run_id().value(),
                 snapshot.snapshot_id().value(),
@@ -1217,6 +1253,18 @@ impl RunEvidenceStore {
                 snapshot
                     .peer_b_volume_identity()
                     .map(volume_identity_to_blob),
+                endpoint_kind(profile.peer_a()),
+                endpoint_server(profile.peer_a()),
+                endpoint_username(profile.peer_a()),
+                endpoint_port(profile.peer_a()),
+                endpoint_identity(profile.peer_a()),
+                endpoint_authentication(profile.peer_a()),
+                endpoint_kind(profile.peer_b()),
+                endpoint_server(profile.peer_b()),
+                endpoint_username(profile.peer_b()),
+                endpoint_port(profile.peer_b()),
+                endpoint_identity(profile.peer_b()),
+                endpoint_authentication(profile.peer_b()),
                 encode_mode(profile.mode()),
                 encode_source(profile.source()),
                 bool_to_int(options.safe_delete()),
@@ -1930,6 +1978,10 @@ impl RunEvidenceStore {
                 "SELECT snapshot_id, profile_name, peer_a_name, peer_a_root,
                         peer_b_name, peer_b_root, peer_a_volume_identity,
                         peer_b_volume_identity, mode, source, safe_delete,
+                        peer_a_endpoint_kind, peer_a_server, peer_a_username,
+                        peer_a_port, peer_a_identity, peer_a_authentication,
+                        peer_b_endpoint_kind, peer_b_server, peer_b_username,
+                        peer_b_port, peer_b_identity, peer_b_authentication,
                         destination_cleanup, deletion_method,
                         allow_unattended_destructive, allow_unattended_permanent_removal,
                         metadata_file_type, metadata_executable_permissions,
@@ -1951,17 +2003,29 @@ impl RunEvidenceStore {
                         row.get::<_, String>(8)?,
                         row.get::<_, String>(9)?,
                         row.get::<_, bool>(10)?,
-                        row.get::<_, bool>(11)?,
+                        row.get::<_, String>(11)?,
                         row.get::<_, Option<String>>(12)?,
-                        row.get::<_, bool>(13)?,
-                        row.get::<_, bool>(14)?,
-                        row.get::<_, bool>(15)?,
-                        row.get::<_, bool>(16)?,
-                        row.get::<_, bool>(17)?,
-                        row.get::<_, bool>(18)?,
-                        row.get::<_, String>(19)?,
-                        row.get::<_, u8>(20)?,
-                        row.get::<_, u64>(21)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<u16>>(14)?,
+                        row.get::<_, Option<Vec<u8>>>(15)?,
+                        row.get::<_, Option<String>>(16)?,
+                        row.get::<_, String>(17)?,
+                        row.get::<_, Option<String>>(18)?,
+                        row.get::<_, Option<String>>(19)?,
+                        row.get::<_, Option<u16>>(20)?,
+                        row.get::<_, Option<Vec<u8>>>(21)?,
+                        row.get::<_, Option<String>>(22)?,
+                        row.get::<_, bool>(23)?,
+                        row.get::<_, Option<String>>(24)?,
+                        row.get::<_, bool>(25)?,
+                        row.get::<_, bool>(26)?,
+                        row.get::<_, bool>(27)?,
+                        row.get::<_, bool>(28)?,
+                        row.get::<_, bool>(29)?,
+                        row.get::<_, bool>(30)?,
+                        row.get::<_, String>(31)?,
+                        row.get::<_, u8>(32)?,
+                        row.get::<_, u64>(33)?,
                     ))
                 },
             )
@@ -1978,6 +2042,18 @@ impl RunEvidenceStore {
             mode,
             source,
             safe_delete,
+            peer_a_endpoint_kind,
+            peer_a_server,
+            peer_a_username,
+            peer_a_port,
+            peer_a_identity,
+            peer_a_authentication,
+            peer_b_endpoint_kind,
+            peer_b_server,
+            peer_b_username,
+            peer_b_port,
+            peer_b_identity,
+            peer_b_authentication,
             destination_cleanup,
             deletion_method,
             allow_unattended_destructive,
@@ -2006,8 +2082,26 @@ impl RunEvidenceStore {
             .collect::<Result<Vec<_>, _>>()?;
         let profile = SyncProfile::new(
             profile_name,
-            Peer::new(peer_a_name, blob_to_path(&peer_a_root)?),
-            Peer::new(peer_b_name, blob_to_path(&peer_b_root)?),
+            decode_snapshot_peer(
+                peer_a_name,
+                peer_a_root,
+                peer_a_endpoint_kind,
+                peer_a_server,
+                peer_a_username,
+                peer_a_port,
+                peer_a_identity,
+                peer_a_authentication,
+            )?,
+            decode_snapshot_peer(
+                peer_b_name,
+                peer_b_root,
+                peer_b_endpoint_kind,
+                peer_b_server,
+                peer_b_username,
+                peer_b_port,
+                peer_b_identity,
+                peer_b_authentication,
+            )?,
         )
         .with_mode(match mode.as_str() {
             "one_way" => SyncMode::OneWay,
@@ -2837,11 +2931,15 @@ fn apply_stored_event(
                 StorageError::CorruptEvidence("progress boundary has no byte count".to_owned())
             })?),
         "transfer_verified" => {
-            if entry.plan.operation() != PlanActionKind::RemoveSourceAfterVerification
-                || row.proof_metadata_verified != Some(true)
+            if !matches!(
+                entry.plan.operation(),
+                PlanActionKind::CopyToDestination
+                    | PlanActionKind::OverwriteDestination
+                    | PlanActionKind::RemoveSourceAfterVerification
+            ) || row.proof_metadata_verified != Some(true)
             {
                 return Err(StorageError::CorruptEvidence(
-                    "verified transfer boundary is only valid for Safe Delete with metadata proof"
+                    "verified transfer boundary needs a supported action and metadata proof"
                         .to_owned(),
                 ));
             }
@@ -3008,7 +3106,12 @@ fn validate_replayed_transition(
         "started" => entry.last_phase == "planned",
         "progress" => matches!(entry.last_phase.as_str(), "started" | "progress"),
         "transfer_verified" => {
-            entry.plan.operation() == PlanActionKind::RemoveSourceAfterVerification
+            matches!(
+                entry.plan.operation(),
+                PlanActionKind::CopyToDestination
+                    | PlanActionKind::OverwriteDestination
+                    | PlanActionKind::RemoveSourceAfterVerification
+            )
                 && matches!(entry.last_phase.as_str(), "started" | "progress")
                 && entry.transfer_evidence.is_none()
         }
@@ -3183,8 +3286,14 @@ fn validate_event(
         ..
     } = event
     {
-        if planned_operation != Some("remove_source_after_verification")
-            || !metadata_verified
+        if !matches!(
+            planned_operation,
+            Some(
+                "copy_to_destination"
+                    | "overwrite_destination"
+                    | "remove_source_after_verification"
+            )
+        ) || !metadata_verified
             || !evidence.source_present()
             || !evidence.destination_present()
             || evidence.recovery_present()
@@ -3838,6 +3947,111 @@ fn decode_mirror_review_state(value: &str) -> Result<MirrorResolutionReviewState
     }
 }
 
+fn endpoint_kind(peer: &Peer) -> &'static str {
+    if peer.is_ssh() { "ssh" } else { "local" }
+}
+
+fn endpoint_server(peer: &Peer) -> Option<&str> {
+    peer.ssh_peer().map(crate::SshPeer::server)
+}
+
+fn endpoint_username(peer: &Peer) -> Option<&str> {
+    peer.ssh_peer().map(crate::SshPeer::username)
+}
+
+fn endpoint_port(peer: &Peer) -> Option<i64> {
+    peer.ssh_peer().map(|ssh| i64::from(ssh.port()))
+}
+
+fn endpoint_identity(peer: &Peer) -> Option<Vec<u8>> {
+    peer.ssh_peer()
+        .and_then(crate::SshPeer::identity)
+        .map(path_to_blob)
+}
+
+fn endpoint_authentication(peer: &Peer) -> Option<String> {
+    peer.ssh_peer().map(|ssh| match ssh.authentication() {
+        crate::SshAuthentication::Key => "key".to_owned(),
+        crate::SshAuthentication::Agent => "agent".to_owned(),
+        crate::SshAuthentication::InteractivePassword => "interactive_password".to_owned(),
+        crate::SshAuthentication::SavedPassword(reference) => {
+            format!("saved_password:{}", reference.as_str())
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_snapshot_peer(
+    name: String,
+    root: Vec<u8>,
+    kind: String,
+    server: Option<String>,
+    username: Option<String>,
+    port: Option<u16>,
+    identity: Option<Vec<u8>>,
+    authentication: Option<String>,
+) -> Result<Peer, StorageError> {
+    let root = blob_to_path(&root)?;
+    match kind.as_str() {
+        "local" => Ok(Peer::new(name, root)),
+        "ssh" => {
+            let server = server.ok_or_else(|| {
+                StorageError::CorruptEvidence("SSH snapshot peer has no server".to_owned())
+            })?;
+            let username = username.ok_or_else(|| {
+                StorageError::CorruptEvidence("SSH snapshot peer has no username".to_owned())
+            })?;
+            let port = port.ok_or_else(|| {
+                StorageError::CorruptEvidence("SSH snapshot peer has no port".to_owned())
+            })?;
+            let authentication = decode_snapshot_authentication(authentication.as_deref())?;
+            let remote_path = root.to_string_lossy().into_owned();
+            let ssh = crate::SshPeer::new(
+                server,
+                username,
+                port,
+                identity.map(|bytes| blob_to_path(&bytes)).transpose()?,
+                authentication,
+                remote_path,
+            )
+            .map_err(|error| {
+                StorageError::CorruptEvidence(format!(
+                    "invalid SSH peer in run snapshot: {error}"
+                ))
+            })?;
+            Ok(Peer::from_ssh(name, ssh))
+        }
+        value => Err(StorageError::CorruptEvidence(format!(
+            "unsupported snapshot endpoint kind {value}"
+        ))),
+    }
+}
+
+fn decode_snapshot_authentication(
+    authentication: Option<&str>,
+) -> Result<crate::SshAuthentication, StorageError> {
+    match authentication {
+        Some("key") => Ok(crate::SshAuthentication::Key),
+        Some("agent") => Ok(crate::SshAuthentication::Agent),
+        Some("interactive_password") => Ok(crate::SshAuthentication::InteractivePassword),
+        Some(value) if value.starts_with("saved_password:") => {
+            let reference = value.trim_start_matches("saved_password:");
+            let reference = crate::SavedSecretReference::new(reference).map_err(|error| {
+                StorageError::CorruptEvidence(format!(
+                    "invalid saved SSH secret reference in snapshot: {error}"
+                ))
+            })?;
+            Ok(crate::SshAuthentication::SavedPassword(reference))
+        }
+        Some(value) => Err(StorageError::CorruptEvidence(format!(
+            "unsupported SSH authentication {value}"
+        ))),
+        None => Err(StorageError::CorruptEvidence(
+            "SSH snapshot peer has no authentication".to_owned(),
+        )),
+    }
+}
+
 fn encode_mode(mode: SyncMode) -> &'static str {
     match mode {
         SyncMode::OneWay => "one_way",
@@ -4239,7 +4453,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn existing_version_ten_database_migrates_host_trust_state_to_version_eleven() {
+    fn existing_version_ten_database_migrates_host_trust_and_endpoint_state() {
         let store = RunEvidenceStore::open_in_memory().expect("SQLite store should open");
         store
             .connection
@@ -4256,7 +4470,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         assert!(
             migrated
                 .connection

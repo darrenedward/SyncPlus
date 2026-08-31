@@ -376,6 +376,8 @@ pub struct RemotePrecheckPermit {
     host: SshHost,
     account: String,
     path: PathBuf,
+    access: RemoteAccessRequirements,
+    require_recovery: bool,
     trash_location: Option<PathBuf>,
 }
 
@@ -395,6 +397,38 @@ impl RemotePrecheckPermit {
     pub fn trash_location(&self) -> Option<&Path> {
         self.trash_location.as_deref()
     }
+
+    pub const fn access(&self) -> RemoteAccessRequirements {
+        self.access
+    }
+
+    pub const fn require_recovery(&self) -> bool {
+        self.require_recovery
+    }
+
+    pub(crate) fn validate_for(
+        &self,
+        peer: &SshPeer,
+        credential: &ResolvedSshCredential,
+        host_permit: &SshHostTrustPermit,
+        request: RemotePrecheckRequest,
+    ) -> Result<(), RemotePrecheckError> {
+        if host_permit.host() != &SshHost::from_peer(peer) {
+            return Err(RemotePrecheckError::HostTrustPermitMismatch);
+        }
+        if self.host != SshHost::from_peer(peer)
+            || self.account != peer.username()
+            || self.path != peer.remote_path()
+            || self.access != request.access
+            || self.require_recovery != request.require_recovery
+        {
+            return Err(RemotePrecheckError::RequestMismatch);
+        }
+        if !credential_matches_peer(peer, credential) {
+            return Err(RemotePrecheckError::CredentialDoesNotMatchPeer);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,6 +436,8 @@ pub struct RemotePrecheckResult {
     host: SshHost,
     account: String,
     path: PathBuf,
+    access: RemoteAccessRequirements,
+    require_recovery: bool,
     blockers: Vec<RemotePrecheckBlocker>,
     trash_location: Option<PathBuf>,
 }
@@ -437,6 +473,8 @@ impl RemotePrecheckResult {
                 host: self.host,
                 account: self.account,
                 path: self.path,
+                access: self.access,
+                require_recovery: self.require_recovery,
                 trash_location: self.trash_location,
             })
         } else {
@@ -448,6 +486,7 @@ impl RemotePrecheckResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemotePrecheckError {
     HostTrustPermitMismatch,
+    RequestMismatch,
     CredentialDoesNotMatchPeer,
     Probe(PrecheckError),
 }
@@ -457,6 +496,9 @@ impl std::fmt::Display for RemotePrecheckError {
         let message = match self {
             Self::HostTrustPermitMismatch => {
                 "SSH host-trust permit does not match the remote peer"
+            }
+            Self::RequestMismatch => {
+                "the remote precheck permit does not match the requested access or recovery policy"
             }
             Self::CredentialDoesNotMatchPeer => {
                 "the resolved SSH credential does not match the selected peer authentication"
@@ -492,6 +534,8 @@ impl SshRemotePrecheck {
             host: SshHost::from_peer(peer),
             account: peer.username().to_owned(),
             path: peer.remote_path().to_path_buf(),
+            access: request.access(),
+            require_recovery: request.require_recovery(),
             blockers: Vec::new(),
             trash_location: observation.trash().location().map(Path::to_path_buf),
         };

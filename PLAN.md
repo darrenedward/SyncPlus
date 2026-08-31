@@ -213,6 +213,7 @@ V1 supports one local peer and one SSH peer in either direction. SSH-to-SSH is n
 - A non-mutating remote preflight verifies compatible `rsync` and controlled SHA-256 capability before changes.
 - Remote preflight also verifies the authenticated account's requested access and remote Trash location/access when recovery is required; missing capabilities block without an execution permit or fallback.
 - After transfer, SyncPlus verifies the actual remote destination digest. If it cannot obtain or match the digest, the source remains preserved.
+- The shared core SSH workflow re-runs the typed remote precheck around confirmation, freezes endpoint-specific staging paths, and accepts only path-bound source/destination metadata and content proofs from the platform SSH adapter.
 - Remote Trash requires a verified recovery location and access for the remote account. Otherwise deletion stops or requires the separately authorized Permanent Removal option.
 - Server, username, port, identity, and remote path are structured fields. User values are safely encoded into controlled process arguments; no arbitrary remote command is accepted.
 - The core owns validated SSH endpoint fields and the typed Process Specification used by both preview and execution; credential handling, host trust, capability checks, and remote recovery remain mandatory pre-mutation gates.

@@ -11,14 +11,46 @@ use crate::RunId;
 /// deliberately performs lexical normalization rather than `canonicalize`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PeerScope {
+    namespace: ScopeNamespace,
     path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ScopeNamespace {
+    Local,
+    Ssh {
+        server: String,
+        username: String,
+        port: u16,
+    },
 }
 
 impl PeerScope {
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self {
+            namespace: ScopeNamespace::Local,
             path: normalize_path(path.as_ref()),
         }
+    }
+
+    /// Build a scope identity from the endpoint as well as its path. Remote
+    /// paths on different SSH hosts/accounts must not block one another merely
+    /// because their textual paths happen to match.
+    pub fn for_peer(peer: &crate::Peer) -> Self {
+        let namespace = peer
+            .ssh_peer()
+            .map(|ssh| ScopeNamespace::Ssh {
+                server: ssh.server().to_owned(),
+                username: ssh.username().to_owned(),
+                port: ssh.port(),
+            })
+            .unwrap_or(ScopeNamespace::Local);
+        let path = if let Some(ssh) = peer.ssh_peer() {
+            normalize_remote_path(ssh.remote_path())
+        } else {
+            normalize_path(peer.root())
+        };
+        Self { namespace, path }
     }
 
     pub fn path(&self) -> &Path {
@@ -26,7 +58,8 @@ impl PeerScope {
     }
 
     pub fn overlaps(&self, other: &Self) -> bool {
-        self.path.starts_with(&other.path) || other.path.starts_with(&self.path)
+        self.namespace == other.namespace
+            && (self.path.starts_with(&other.path) || other.path.starts_with(&self.path))
     }
 }
 
@@ -194,6 +227,24 @@ fn normalize_path(path: &Path) -> PathBuf {
 
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn normalize_remote_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
         match component {
             Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
             Component::RootDir => normalized.push(component.as_os_str()),
