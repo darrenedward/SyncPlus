@@ -117,8 +117,8 @@ impl SshTransport {
         self.identity.as_deref()
     }
 
-    pub const fn authentication(&self) -> crate::SshAuthentication {
-        self.authentication
+    pub fn authentication(&self) -> crate::SshAuthentication {
+        self.authentication.clone()
     }
 }
 
@@ -605,9 +605,27 @@ impl SshTarget {
 impl SshTransport {
     fn to_os_string(&self) -> OsString {
         let mut transport = format!("--rsh=ssh -p {}", self.port);
-        if let Some(identity) = &self.identity {
-            transport.push_str(" -i ");
-            transport.push_str(&encode_remote_shell_word(identity));
+        match &self.authentication {
+            crate::SshAuthentication::Key => {
+                transport.push_str(
+                    " -o IdentitiesOnly=yes -o IdentityAgent=none -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no",
+                );
+                if let Some(identity) = &self.identity {
+                    transport.push_str(" -i ");
+                    transport.push_str(&encode_remote_shell_word(identity));
+                }
+            }
+            crate::SshAuthentication::Agent => {
+                transport.push_str(
+                    " -o IdentityFile=none -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no",
+                );
+            }
+            crate::SshAuthentication::InteractivePassword
+            | crate::SshAuthentication::SavedPassword(_) => {
+                transport.push_str(
+                    " -o IdentityFile=none -o IdentityAgent=none -o PreferredAuthentications=keyboard-interactive,password -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=yes",
+                );
+            }
         }
         OsString::from(transport)
     }

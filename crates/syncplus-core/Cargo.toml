@@ -11,3 +11,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 libc = "0.2"
 sha2 = "0.10"
 unicode-normalization = "0.1"
+keyring = { version = "4.2", default-features = true }
+zeroize = "1"
