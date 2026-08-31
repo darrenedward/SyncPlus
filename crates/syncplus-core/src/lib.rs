@@ -1,6 +1,7 @@
 mod model;
 mod process;
 mod analysis;
+mod conflict;
 mod baseline;
 mod evidence;
 mod precheck;
@@ -31,6 +32,9 @@ pub use analysis::{
     AnalysisError, AnalysisOutcome, AnalysisRevision, ApprovedSyncScope, ConfirmedPlan,
     FreshAnalysis, InventoryItem, ItemMetadata, ItemType, OneWayPlan, PeerInventory, PeerSide,
     PlanAction, PlanActionKind, PlanError, PlanSummary, ScopeDecision, SourceInventory,
+};
+pub use conflict::{
+    ConflictEntry, ConflictEvidence, ConflictKind, ConflictReview, FileReviewClassification,
 };
 pub use baseline::{
     MirrorEquality, SyncBaseline, SyncBaselineComparison, SyncBaselineItem,
@@ -83,6 +87,7 @@ mod process_tests;
 mod analysis_tests;
 
 #[cfg(test)]
+mod conflict_tests;
 mod baseline_tests;
 
 #[cfg(test)]
