@@ -4,6 +4,7 @@ mod analysis;
 mod conflict;
 mod resolution;
 mod resolution_run;
+mod preserved_copy;
 mod baseline;
 mod mirror_deletion;
 mod evidence;
@@ -47,6 +48,12 @@ pub use resolution_run::{
     ConfirmedResolutionRun, FilesystemResolutionExecutor, ResolutionActionExecutor,
     ResolutionExecutionReport, ResolutionRun, ResolutionRunError, ResolutionRunOutcome,
     ResolutionRunResult,
+};
+pub use preserved_copy::{
+    PreservedCopyError, PreservedCopyExecutionError, PreservedCopyExecutionItem,
+    PreservedCopyExecutionOutcome, PreservedCopyExecutionReport, PreservedCopyExecutor,
+    PreservedCopyPlan, PreservedCopyPlanner, PreservedCopyReportItem, PreservedCopyReviewState,
+    PreservedPathInventory,
 };
 pub use baseline::{
     MirrorEquality, SyncBaseline, SyncBaselineComparison, SyncBaselineItem,
@@ -111,6 +118,7 @@ mod resolution_tests;
 
 #[cfg(test)]
 mod resolution_run_tests;
+mod preserved_copy_tests;
 
 #[cfg(test)]
 mod baseline_tests;
