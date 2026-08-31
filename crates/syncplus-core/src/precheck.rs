@@ -9,7 +9,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::{
     DeletionMethod, Peer, PeerScope, PeerScopeLock, PeerScopeLockRegistry, ProcessSpecError,
-    ProcessSpecification, ScopeLockConflict, ScopeLockOwner, SyncProfile, ValidatedSyncOptions,
+    ProcessSpecification, ScopeLockConflict, ScopeLockOwner, SyncMode, SyncProfile,
+    ValidatedSyncOptions,
     VolumeIdentity, VolumeIdentityError,
 };
 
@@ -725,7 +726,44 @@ impl RunPrecheck {
                 "connect or mount the destination peer and choose an available directory, then run the precheck again",
             ));
         }
-        if !source_available || !destination_available {
+        let mirror = profile.mode() == SyncMode::Mirror;
+        let reverse_source_available = if mirror {
+            probe
+                .peer_available(destination, false)
+                .map_err(PrecheckErrorKind::Probe)?
+        } else {
+            true
+        };
+        if mirror && !reverse_source_available {
+            result.blockers.push(PrecheckBlocker::with_reason(
+                PrecheckBlockerKind::PeerUnavailable,
+                destination,
+                "both Mirror peers must be available as transfer sources",
+                "Peer B is missing, unavailable, or not a directory",
+                "connect or mount Peer B, then run the precheck again",
+            ));
+        }
+        let reverse_destination_available = if mirror {
+            probe
+                .peer_available(source, true)
+                .map_err(PrecheckErrorKind::Probe)?
+        } else {
+            true
+        };
+        if mirror && !reverse_destination_available {
+            result.blockers.push(PrecheckBlocker::with_reason(
+                PrecheckBlockerKind::PeerUnavailable,
+                source,
+                "both Mirror peers must be available as transfer destinations",
+                "Peer A and its parent are unavailable",
+                "connect or mount Peer A, then run the precheck again",
+            ));
+        }
+        if !source_available
+            || !destination_available
+            || !reverse_source_available
+            || !reverse_destination_available
+        {
             return Ok(result);
         }
 
@@ -774,6 +812,47 @@ impl RunPrecheck {
             ));
         }
 
+        let reverse_source_access = if mirror {
+            Some(
+                probe
+                    .source_access(destination)
+                    .map_err(PrecheckErrorKind::Probe)?,
+            )
+        } else {
+            None
+        };
+        if let Some(access) = reverse_source_access
+            && !access.readable()
+        {
+            result.blockers.push(PrecheckBlocker::with_reason(
+                PrecheckBlockerKind::SourceUnreadable,
+                destination,
+                "both Mirror peers must be readable as transfer sources",
+                "Peer B could not be read with the current user's effective access",
+                "grant the current user read and directory-traverse access to Peer B, then retry",
+            ));
+        }
+        let reverse_destination_access = if mirror {
+            Some(
+                probe
+                    .destination_access(source)
+                    .map_err(PrecheckErrorKind::Probe)?,
+            )
+        } else {
+            None
+        };
+        if let Some(access) = reverse_destination_access
+            && !access.writable()
+        {
+            result.blockers.push(PrecheckBlocker::with_reason(
+                PrecheckBlockerKind::DestinationNotWritable,
+                source,
+                "both Mirror peers must be writable as transfer destinations",
+                "Peer A could not be written with the current user's effective access",
+                "grant the current user write and directory-traverse access to Peer A, then retry",
+            ));
+        }
+
         let options = specification.options();
         let requested_specialist = options.specialist_metadata();
         if requested_specialist.any() {
@@ -791,6 +870,23 @@ impl RunPrecheck {
                         capabilities.ownership(), capabilities.access_control_lists(), capabilities.extended_attributes()
                     ),
                     "choose a destination with the required capabilities or disable the named Advanced metadata options",
+                ));
+            }
+        }
+        if mirror && requested_specialist.any() {
+            let capabilities = probe
+                .specialist_metadata_capabilities(source)
+                .map_err(PrecheckErrorKind::Probe)?;
+            if !capabilities.supports(requested_specialist) {
+                result.blockers.push(PrecheckBlocker::with_reason(
+                    PrecheckBlockerKind::SpecialistMetadataUnsupported,
+                    source,
+                    "both Mirror peers must support every selected specialist metadata capability",
+                    format!(
+                        "Peer A reports ownership={}, ACLs={}, extended attributes={}, which does not satisfy the selected options",
+                        capabilities.ownership(), capabilities.access_control_lists(), capabilities.extended_attributes()
+                    ),
+                    "choose a compatible Peer A or disable the named Advanced metadata options",
                 ));
             }
         }
@@ -828,11 +924,44 @@ impl RunPrecheck {
                 format!("free space on the destination and retry; the precheck found only {available} bytes available"),
             ));
         }
+        if mirror {
+            let reverse_required = probe
+                .required_space(destination, source, options, profile.exclusions())
+                .map_err(PrecheckErrorKind::Probe)?;
+            let reverse_available = probe
+                .available_space(source)
+                .map_err(PrecheckErrorKind::Probe)?;
+            if reverse_available < reverse_required {
+                result.blockers.push(PrecheckBlocker::with_reason(
+                    PrecheckBlockerKind::InsufficientSpace,
+                    source,
+                    format!("Peer A needs at least {reverse_required} bytes for the reverse Mirror transfer"),
+                    format!("Peer A has only {reverse_available} bytes available"),
+                    format!("free space on Peer A and retry; the precheck found only {reverse_available} bytes available"),
+                ));
+            }
+        }
 
         let permission_issues = probe
             .item_permission_issues(source, destination, profile.exclusions(), options)
             .map_err(PrecheckErrorKind::Probe)?;
         for issue in &permission_issues {
+            result.blockers.push(PrecheckBlocker::with_reason(
+                PrecheckBlockerKind::RequiredPermission,
+                issue.path(),
+                issue.requirement(),
+                issue.reason(),
+                issue.remediation(),
+            ));
+        }
+        let reverse_permission_issues = if mirror {
+            probe
+                .item_permission_issues(destination, source, profile.exclusions(), options)
+                .map_err(PrecheckErrorKind::Probe)?
+        } else {
+            Vec::new()
+        };
+        for issue in &reverse_permission_issues {
             result.blockers.push(PrecheckBlocker::with_reason(
                 PrecheckBlockerKind::RequiredPermission,
                 issue.path(),
@@ -868,6 +997,36 @@ impl RunPrecheck {
                         conflict.rule()
                     ),
                     "rename or exclude the conflicting item, or choose a destination with compatible naming rules",
+                ));
+            }
+        }
+        if mirror
+            && reverse_source_access.is_some_and(|access| access.readable())
+            && reverse_destination_access.is_some_and(|access| access.readable())
+            && reverse_permission_issues.is_empty()
+        {
+            let naming_conflicts = probe
+                .naming_conflicts(destination, source, profile.exclusions())
+                .map_err(PrecheckErrorKind::Probe)?;
+            for conflict in naming_conflicts {
+                let related = conflict
+                    .related_path()
+                    .map(|path| format!("; it conflicts with {path:?}"))
+                    .unwrap_or_default();
+                result.blockers.push(PrecheckBlocker::with_reason(
+                    PrecheckBlockerKind::DestinationNamingConflict,
+                    conflict.source_path(),
+                    format!(
+                        "Peer A naming rule {:?} cannot represent {:?} safely{}",
+                        conflict.rule(),
+                        conflict.destination_path(),
+                        related
+                    ),
+                    format!(
+                        "Peer A would reject or collide with the Peer B item's name under {:?}",
+                        conflict.rule()
+                    ),
+                    "rename or exclude the conflicting item, or choose compatible peer filesystems",
                 ));
             }
         }
@@ -1056,6 +1215,9 @@ fn append_missing_recorded_identity_blocker(
 }
 
 fn selected_peers(profile: &SyncProfile) -> (&Peer, &Peer) {
+    if profile.mode() == SyncMode::Mirror {
+        return (profile.peer_a(), profile.peer_b());
+    }
     match profile.source() {
         crate::OneWaySource::PeerA => (profile.peer_a(), profile.peer_b()),
         crate::OneWaySource::PeerB => (profile.peer_b(), profile.peer_a()),

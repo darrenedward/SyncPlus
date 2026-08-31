@@ -70,12 +70,29 @@ fn mirror_first_run_plans_one_sided_items_in_both_directions_without_deletion() 
     assert!(analysis.plan().actions().iter().all(|action| {
         action.kind() == PlanActionKind::CopyToDestination
     }));
+    assert_eq!(analysis.plan().summary().considered_count(), 2);
+    assert_eq!(analysis.plan().summary().included_count(), 2);
+    assert!(analysis
+        .plan()
+        .approved_scope()
+        .included_paths()
+        .any(|path| path == Path::new("from-a.txt")));
+    assert!(analysis
+        .plan()
+        .approved_scope()
+        .included_paths()
+        .any(|path| path == Path::new("from-b.txt")));
     assert!(analysis.plan().actions().iter().any(|action| {
         action.relative_path() == Path::new("from-a.txt") && action.source_side() == PeerSide::PeerA
     }));
     assert!(analysis.plan().actions().iter().any(|action| {
         action.relative_path() == Path::new("from-b.txt") && action.source_side() == PeerSide::PeerB
     }));
+    assert!(analysis
+        .plan()
+        .actions()
+        .iter()
+        .all(|action| action.consequence().contains("Peer")));
     assert!(analysis.plan().actions().iter().all(|action| !analysis.plan().is_deletion_candidate(action.relative_path())));
 }
 

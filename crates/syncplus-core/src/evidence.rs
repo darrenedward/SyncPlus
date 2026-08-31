@@ -479,9 +479,37 @@ impl ActionJournalEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReportItem {
     journal: ActionJournalEntry,
+    source_path: PathBuf,
+    destination_path: PathBuf,
+    consequence: &'static str,
 }
 
 impl RunReportItem {
+    fn from_journal(snapshot: &RunSnapshot, journal: ActionJournalEntry) -> Self {
+        let side = journal.plan.affected_side();
+        let source_root = match side {
+            PeerSide::PeerA => snapshot.profile().peer_a().root(),
+            PeerSide::PeerB => snapshot.profile().peer_b().root(),
+        };
+        let destination_root = match side {
+            PeerSide::PeerA => snapshot.profile().peer_b().root(),
+            PeerSide::PeerB => snapshot.profile().peer_a().root(),
+        };
+        let source_path = source_root.join(journal.plan.relative_path());
+        let destination_path = destination_root.join(journal.plan.relative_path());
+        let consequence = report_consequence(
+            journal.plan.operation(),
+            side,
+            snapshot.profile().mode(),
+        );
+        Self {
+            journal,
+            source_path,
+            destination_path,
+            consequence,
+        }
+    }
+
     pub const fn action_id(&self) -> ActionId {
         self.journal.plan.action_id()
     }
@@ -492,6 +520,22 @@ impl RunReportItem {
 
     pub const fn operation(&self) -> PlanActionKind {
         self.journal.plan.operation()
+    }
+
+    pub const fn affected_side(&self) -> PeerSide {
+        self.journal.plan.affected_side()
+    }
+
+    pub fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    pub fn destination_path(&self) -> &Path {
+        &self.destination_path
+    }
+
+    pub const fn consequence(&self) -> &'static str {
+        self.consequence
     }
 
     pub fn outcome(&self) -> &ActionOutcome {
@@ -550,6 +594,8 @@ pub struct RunReport {
     blocked_reason: Option<String>,
     reconciliation: Option<CompletionReconciliation>,
     reconciliation_required: bool,
+    peer_a_inventory: Option<SourceInventorySnapshot>,
+    peer_b_inventory: Option<SourceInventorySnapshot>,
 }
 
 impl RunReport {
@@ -583,6 +629,14 @@ impl RunReport {
 
     pub fn reconciliation(&self) -> Option<&CompletionReconciliation> {
         self.reconciliation.as_ref()
+    }
+
+    pub fn peer_a_inventory(&self) -> Option<&SourceInventorySnapshot> {
+        self.peer_a_inventory.as_ref()
+    }
+
+    pub fn peer_b_inventory(&self) -> Option<&SourceInventorySnapshot> {
+        self.peer_b_inventory.as_ref()
     }
 
     pub fn can_mark_review_cleared(&self) -> bool {
@@ -691,7 +745,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 7 {
+        if version > 8 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -878,6 +932,34 @@ impl RunEvidenceStore {
             )?;
             transaction.pragma_update(None, "user_version", 7)?;
             transaction.commit()?;
+            version = 7;
+        }
+        if version == 7 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                ALTER TABLE run_snapshots
+                    ADD COLUMN destination_inventory_recorded INTEGER NOT NULL DEFAULT 0;
+                CREATE TABLE destination_inventory_items (
+                    run_id INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    relative_path BLOB NOT NULL,
+                    item_type TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    modified_at_unix_nanos INTEGER,
+                    readonly INTEGER NOT NULL,
+                    permissions INTEGER,
+                    symlink_target BLOB,
+                    content_fingerprint BLOB,
+                    PRIMARY KEY (run_id, ordinal),
+                    UNIQUE (run_id, relative_path),
+                    FOREIGN KEY (run_id) REFERENCES run_snapshots(run_id) ON DELETE CASCADE
+                );
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 8)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -989,26 +1071,93 @@ impl RunEvidenceStore {
         Ok(())
     }
 
+    /// Persist the frozen Peer B inventory for a Mirror run before mutation.
+    /// It is kept separately from the source inventory because both peers can
+    /// contain the same relative path.
+    pub fn record_destination_inventory(
+        &mut self,
+        run_id: RunId,
+        inventory: &SourceInventorySnapshot,
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.transaction()?;
+        for (ordinal, item) in inventory.items().iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO destination_inventory_items (
+                    run_id, ordinal, relative_path, item_type, outcome, size,
+                    modified_at_unix_nanos, readonly, permissions, symlink_target,
+                    content_fingerprint
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    run_id.value(),
+                    ordinal as i64,
+                    path_to_blob(item.relative_path()),
+                    encode_item_type(item.item_type()),
+                    encode_analysis_outcome(item.outcome()),
+                    item.size() as i64,
+                    item.modified_at_unix_nanos(),
+                    bool_to_int(item.is_readonly()),
+                    item.permissions().map(i64::from),
+                    item.symlink_target().map(path_to_blob),
+                    item.content_fingerprint().map(|hash| hash.to_vec()),
+                ],
+            )?;
+        }
+        let changed = transaction.execute(
+            "UPDATE run_snapshots SET destination_inventory_recorded = 1 WHERE run_id = ?1",
+            params![run_id.value()],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::InvalidEvent(format!(
+                "run {} does not exist",
+                run_id.value()
+            )));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn load_source_inventory(
         &self,
         run_id: RunId,
     ) -> Result<SourceInventorySnapshot, StorageError> {
         let snapshot = self.load_snapshot(run_id)?;
-        let (peer_name, root) = match snapshot.profile().source() {
-            OneWaySource::PeerA => (
+        let side = if snapshot.profile().mode() == SyncMode::Mirror {
+            PeerSide::PeerA
+        } else {
+            PeerSide::from(snapshot.profile().source())
+        };
+        self.load_inventory_table(run_id, "source_inventory_items", side)
+    }
+
+    pub fn load_destination_inventory(
+        &self,
+        run_id: RunId,
+    ) -> Result<SourceInventorySnapshot, StorageError> {
+        self.load_inventory_table(run_id, "destination_inventory_items", PeerSide::PeerB)
+    }
+
+    fn load_inventory_table(
+        &self,
+        run_id: RunId,
+        table: &str,
+        side: PeerSide,
+    ) -> Result<SourceInventorySnapshot, StorageError> {
+        let snapshot = self.load_snapshot(run_id)?;
+        let (peer_name, root) = match side {
+            PeerSide::PeerA => (
                 snapshot.profile().peer_a().name().to_owned(),
                 snapshot.profile().peer_a().root().to_path_buf(),
             ),
-            OneWaySource::PeerB => (
+            PeerSide::PeerB => (
                 snapshot.profile().peer_b().name().to_owned(),
                 snapshot.profile().peer_b().root().to_path_buf(),
             ),
         };
         let mut statement = self.connection.prepare(
-            "SELECT relative_path, item_type, outcome, size,
+            &format!("SELECT relative_path, item_type, outcome, size,
                     modified_at_unix_nanos, readonly, permissions,
                     symlink_target, content_fingerprint
-             FROM source_inventory_items WHERE run_id = ?1 ORDER BY ordinal",
+             FROM {table} WHERE run_id = ?1 ORDER BY ordinal"),
         )?;
         let rows = statement
             .query_map(params![run_id.value()], |row| {
@@ -1540,16 +1689,40 @@ impl RunEvidenceStore {
             params![run_id.value()],
             |row| row.get(0),
         )?;
+        let destination_inventory_recorded: bool = self.connection.query_row(
+            "SELECT destination_inventory_recorded FROM run_snapshots WHERE run_id = ?1",
+            params![run_id.value()],
+            |row| row.get(0),
+        )?;
+        let inventories_recorded = if snapshot.profile().mode() == SyncMode::Mirror {
+            inventory_recorded && destination_inventory_recorded
+        } else {
+            inventory_recorded
+        };
+        let peer_a_inventory = if snapshot.profile().mode() == SyncMode::Mirror
+            && inventory_recorded
+        {
+            Some(self.load_source_inventory(run_id)?)
+        } else {
+            None
+        };
+        let peer_b_inventory = if snapshot.profile().mode() == SyncMode::Mirror
+            && destination_inventory_recorded
+        {
+            Some(self.load_destination_inventory(run_id)?)
+        } else {
+            None
+        };
         let items: Vec<_> = journal
             .into_iter()
-            .map(|journal| RunReportItem { journal })
+            .map(|journal| RunReportItem::from_journal(&snapshot, journal))
             .collect();
         let status = report_status(
             &items,
             review_cleared,
             blocked_reason.is_some(),
             reconciliation.as_ref(),
-            inventory_recorded,
+            inventories_recorded,
         );
         let execution_result = execution_result(&items, blocked_reason.is_some(), reconciliation.is_some());
         let lifecycle = if review_cleared {
@@ -1584,7 +1757,9 @@ impl RunEvidenceStore {
             lifecycle,
             blocked_reason,
             reconciliation,
-            reconciliation_required: inventory_recorded,
+            reconciliation_required: inventories_recorded,
+            peer_a_inventory,
+            peer_b_inventory,
         })
     }
 
@@ -1852,6 +2027,33 @@ fn terminal_fields(phase: &'static str, reason: ActionReason) -> EventFields {
         proof_destination_sha256: None,
         proof_metadata_verified: None,
         deletion_method: None,
+    }
+}
+
+fn report_consequence(
+    operation: PlanActionKind,
+    affected_side: PeerSide,
+    mode: SyncMode,
+) -> &'static str {
+    if mode == SyncMode::Mirror && operation == PlanActionKind::CopyToDestination {
+        return match affected_side {
+            PeerSide::PeerA => "Copy the Peer A item to Peer B; preserve the item on Peer A.",
+            PeerSide::PeerB => "Copy the Peer B item to Peer A; preserve the item on Peer B.",
+        };
+    }
+    match operation {
+        PlanActionKind::CopyToDestination => {
+            "Copy the selected source item to the destination; preserve the source."
+        }
+        PlanActionKind::OverwriteDestination => {
+            "Replace the destination version with the selected source version after verification."
+        }
+        PlanActionKind::RemoveDestination => {
+            "Remove the destination item because it is absent from the selected source scope."
+        }
+        PlanActionKind::RemoveSourceAfterVerification => {
+            "Remove the source item only after the destination result is independently verified."
+        }
     }
 }
 

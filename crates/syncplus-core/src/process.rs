@@ -116,6 +116,7 @@ pub enum ProcessSpecError {
     InvalidExclusionPattern { reason: &'static str },
     InvalidSecretBinding { value: String },
     UnsupportedSyncMode,
+    MirrorRequiresReviewedPlan,
     ActionNotAllowed { kind: PlanActionKind },
     ActionSourceMismatch,
     InvalidTransferPath { path: PathBuf },
@@ -143,6 +144,10 @@ impl fmt::Display for ProcessSpecError {
                 write!(formatter, "invalid secret binding name: {value}")
             }
             Self::UnsupportedSyncMode => write!(formatter, "unsupported synchronization mode"),
+            Self::MirrorRequiresReviewedPlan => write!(
+                formatter,
+                "Mirror execution requires the reviewed per-item plan"
+            ),
             Self::ActionNotAllowed { kind } => {
                 write!(formatter, "plan action is not a file transfer: {kind:?}")
             }
@@ -344,8 +349,11 @@ impl ProcessSpecification {
         Ok(self)
     }
 
-    pub fn invocation(&self) -> ProcessInvocation {
-        ProcessInvocation {
+    pub fn invocation(&self) -> Result<ProcessInvocation, ProcessSpecError> {
+        if self.mode == SyncMode::Mirror {
+            return Err(ProcessSpecError::MirrorRequiresReviewedPlan);
+        }
+        Ok(ProcessInvocation {
             program: OsString::from("rsync"),
             arguments: self
                 .arguments
@@ -353,7 +361,7 @@ impl ProcessSpecification {
                 .map(ProcessArgument::to_os_string)
                 .collect(),
             secret_bindings: self.secret_bindings.clone(),
-        }
+        })
     }
 
     /// Builds the controlled per-item invocation used by the execution seam.
@@ -402,7 +410,7 @@ impl ProcessSpecification {
                 kind: action.kind(),
             });
         }
-        if action.source_side() != PeerSide::from(self.source) {
+        if self.mode == SyncMode::OneWay && action.source_side() != PeerSide::from(self.source) {
             return Err(ProcessSpecError::ActionSourceMismatch);
         }
         validate_relative_transfer_path(action.relative_path())?;
@@ -412,7 +420,7 @@ impl ProcessSpecification {
         ))
     }
 
-    pub(crate) fn source_path(&self, action: &PlanAction) -> Result<PathBuf, ProcessSpecError> {
+    pub fn source_path(&self, action: &PlanAction) -> Result<PathBuf, ProcessSpecError> {
         if self.mode == SyncMode::OneWay && action.source_side() != PeerSide::from(self.source) {
             return Err(ProcessSpecError::ActionSourceMismatch);
         }
@@ -424,7 +432,7 @@ impl ProcessSpecification {
         Ok(root.join(action.relative_path()))
     }
 
-    pub(crate) fn destination_path(
+    pub fn destination_path(
         &self,
         action: &PlanAction,
     ) -> Result<PathBuf, ProcessSpecError> {
@@ -444,7 +452,14 @@ impl ProcessSpecification {
     }
 
     pub fn preview(&self) -> String {
-        self.invocation().preview()
+        if self.mode == SyncMode::Mirror {
+            return String::from(
+                "Mirror Sync uses one controlled transfer per reviewed plan action; no whole-tree command is available.",
+            );
+        }
+        self.invocation()
+            .expect("a validated One-Way specification has a whole-tree invocation")
+            .preview()
     }
 }
 

@@ -399,6 +399,137 @@ impl CompletionReconciliation {
         }
     }
 
+    /// Reconcile a Mirror run against the frozen inventories of both peers.
+    /// A first-run copy is settled only when the item remains stable on its
+    /// original peer and the other peer contains an equivalent item. No
+    /// absence is interpreted as permission to delete anything.
+    pub fn reconcile_mirror(
+        profile: &SyncProfile,
+        peer_a_inventory: &SourceInventorySnapshot,
+        peer_b_inventory: &SourceInventorySnapshot,
+        current: &FreshAnalysis,
+        journal: &[ActionJournalEntry],
+    ) -> Self {
+        let mut findings = Vec::new();
+        let expected_paths: BTreeSet<PathBuf> = peer_a_inventory
+            .items()
+            .iter()
+            .map(|item| item.relative_path().to_path_buf())
+            .chain(
+                peer_b_inventory
+                    .items()
+                    .iter()
+                    .map(|item| item.relative_path().to_path_buf()),
+            )
+            .collect();
+
+        for relative_path in &expected_paths {
+            let peer_a_expected = peer_a_inventory.item(relative_path);
+            let peer_b_expected = peer_b_inventory.item(relative_path);
+            let peer_a_current = current.source_inventory().item(relative_path);
+            let peer_b_current = current.destination_inventory().item(relative_path);
+
+            if peer_a_expected
+                .is_some_and(|item| item.outcome() == AnalysisOutcome::Excluded)
+                || peer_b_expected
+                    .is_some_and(|item| item.outcome() == AnalysisOutcome::Excluded)
+            {
+                push_unique(
+                    &mut findings,
+                    relative_path.clone(),
+                    ReconciliationReason::Excluded,
+                );
+                continue;
+            }
+            if peer_a_expected
+                .is_some_and(|item| item.outcome() == AnalysisOutcome::Unsupported)
+                || peer_b_expected
+                    .is_some_and(|item| item.outcome() == AnalysisOutcome::Unsupported)
+            {
+                push_unique(
+                    &mut findings,
+                    relative_path.clone(),
+                    ReconciliationReason::Unverifiable,
+                );
+                continue;
+            }
+
+            let path_journal: Vec<_> = journal
+                .iter()
+                .filter(|entry| entry.relative_path() == relative_path)
+                .collect();
+            if let Some(reason) = journal_reason(&path_journal) {
+                push_unique(&mut findings, relative_path.clone(), reason);
+                continue;
+            }
+
+            match (peer_a_expected, peer_b_expected) {
+                (Some(peer_a_expected), Some(peer_b_expected)) => {
+                    let stable = peer_a_current
+                        .is_some_and(|current| source_matches_snapshot(profile, peer_a_expected, current))
+                        && peer_b_current
+                            .is_some_and(|current| source_matches_snapshot(profile, peer_b_expected, current));
+                    if !stable || !snapshot_items_match(peer_a_expected, peer_b_expected) {
+                        push_unique(
+                            &mut findings,
+                            relative_path.clone(),
+                            ReconciliationReason::Changed,
+                        );
+                    }
+                }
+                (Some(peer_a_expected), None) => {
+                    let source_stable = peer_a_current
+                        .is_some_and(|current| source_matches_snapshot(profile, peer_a_expected, current));
+                    let destination_verified = peer_b_current
+                        .is_some_and(|current| destination_matches_source(profile, peer_a_expected, current));
+                    if !source_stable || !destination_verified {
+                        push_unique(
+                            &mut findings,
+                            relative_path.clone(),
+                            ReconciliationReason::Unverifiable,
+                        );
+                    }
+                }
+                (None, Some(peer_b_expected)) => {
+                    let source_stable = peer_b_current
+                        .is_some_and(|current| source_matches_snapshot(profile, peer_b_expected, current));
+                    let destination_verified = peer_a_current
+                        .is_some_and(|current| destination_matches_source(profile, peer_b_expected, current));
+                    if !source_stable || !destination_verified {
+                        push_unique(
+                            &mut findings,
+                            relative_path.clone(),
+                            ReconciliationReason::Unverifiable,
+                        );
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+
+        for current_item in current
+            .source_inventory()
+            .items()
+            .iter()
+            .chain(current.destination_inventory().items().iter())
+        {
+            if expected_paths.contains(current_item.relative_path()) {
+                continue;
+            }
+            let reason = if current_item.outcome() == AnalysisOutcome::Excluded {
+                ReconciliationReason::Excluded
+            } else {
+                ReconciliationReason::NewlyAppeared
+            };
+            push_unique(&mut findings, current_item.relative_path().to_path_buf(), reason);
+        }
+
+        Self {
+            source_drain_status: SourceDrainStatus::NotApplicable,
+            findings,
+        }
+    }
+
     pub fn unavailable(
         profile: &SyncProfile,
         inventory: &SourceInventorySnapshot,
@@ -473,7 +604,9 @@ fn destination_matches_source(
     expected: &InventorySnapshotItem,
     destination: &InventoryItem,
 ) -> bool {
-    if expected.item_type() != destination.item_type() {
+    if destination.outcome() != AnalysisOutcome::Included
+        || expected.item_type() != destination.item_type()
+    {
         return false;
     }
     if expected.executable_permissions() != destination.metadata().executable_permissions() {
@@ -492,6 +625,14 @@ fn destination_matches_source(
         ItemType::Directory => true,
         ItemType::Unsupported => false,
     }
+}
+
+fn snapshot_items_match(left: &InventorySnapshotItem, right: &InventorySnapshotItem) -> bool {
+    left.item_type() == right.item_type()
+        && left.size() == right.size()
+        && left.executable_permissions() == right.executable_permissions()
+        && left.symlink_target() == right.symlink_target()
+        && left.content_fingerprint() == right.content_fingerprint()
 }
 
 fn removal_evidence_matches(expected: &InventorySnapshotItem, evidence: &crate::RecoveryEvidence) -> bool {

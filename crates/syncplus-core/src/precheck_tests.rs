@@ -3,7 +3,7 @@ use std::{fs, path::PathBuf};
 use crate::{
     AccessSnapshot, DestinationNamingPolicy, DeletionMethod, Peer,
     PeerScopeLockRegistry, PrecheckBlockerKind, PrecheckFailure, PrecheckProbe, RunId,
-    RunPrecheck, ScopeLockOwner, SyncOptions, SyncProfile,
+    RunPrecheck, ScopeLockOwner, SyncMode, SyncOptions, SyncProfile,
 };
 
 #[derive(Clone)]
@@ -86,6 +86,25 @@ fn passing_probe() -> FakeProbe {
         naming_conflicts: Vec::new(),
         probe_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     }
+}
+
+#[test]
+fn mirror_precheck_validates_both_transfer_directions() {
+    let probe = passing_probe();
+    let calls = probe.probe_calls.clone();
+    let result = RunPrecheck::check(
+        &profile(PathBuf::from("/peer-a"), PathBuf::from("/peer-b"))
+            .with_mode(SyncMode::Mirror),
+        &probe,
+    )
+    .expect("Mirror profile should produce a precheck result");
+
+    assert!(result.can_execute());
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        4,
+        "Mirror must probe both peers as source and destination"
+    );
 }
 
 #[test]

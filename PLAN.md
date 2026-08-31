@@ -119,7 +119,7 @@ Required permission, capability, naming, recovery, or database failures block al
 
 Opening a pending, interrupted, or review-needed run triggers a Fresh Analysis. A further Fresh Analysis happens immediately before confirmation. Completed reports remain historical and are not silently recalculated.
 
-Fresh Analysis records a Source Inventory after applying exclusions, with hidden files included by default. It distinguishes eligible, excluded, newly appeared, changed, unavailable, and unresolved items. Old plans are never blindly replayed.
+Fresh Analysis records a Source Inventory after applying exclusions, with hidden files included by default. A Mirror Run freezes one inventory for each peer so first-run copy candidates and both directions can be reconciled. It distinguishes eligible, excluded, newly appeared, changed, unavailable, and unresolved items. Old plans are never blindly replayed.
 
 ### Per-item Safe Delete proof
 
@@ -161,7 +161,7 @@ Cancel stops launching new actions and terminates the current transfer promptly.
 
 Crashes, process termination, transport loss, drive removal, and database-boundary ambiguity create an Interrupted Run or Recovery Review. Resume uses the durable journal, continues from the last verified boundary, performs Fresh Analysis, and requires new confirmation where needed. It never blindly replays deletion.
 
-The shared core `RunWorkflow` persists the frozen Source Inventory and complete action plan before mutation, uses the controlled process-group transfer boundary, applies the frozen Retry Policy only to typed transient failures, and creates a new Sync Run for resume. It performs Completion Reconciliation after every settled workflow run and persists its findings before deriving Source Drained, Source Not Empty, Completed with Review Required, or Review-Cleared status.
+The shared core `RunWorkflow` persists the frozen Source Inventory and complete action plan before mutation; Mirror additionally persists the Peer B inventory. It uses the controlled process-group transfer boundary, applies the frozen Retry Policy only to typed transient failures, and creates a new Sync Run for resume. It performs Completion Reconciliation after every settled workflow run and persists its findings before deriving Source Drained, Source Not Empty, Completed with Review Required, or Review-Cleared status.
 
 ## Mirror and conflict policy
 
