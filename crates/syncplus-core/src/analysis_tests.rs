@@ -9,7 +9,7 @@ use std::os::unix::fs::symlink;
 
 use crate::{
     AnalysisError, AnalysisOutcome, DeletionMethod, FreshAnalysis, ItemType, OneWaySource,
-    Peer, PlanActionKind, SyncOptions, SyncProfile,
+    Peer, PeerSide, PlanActionKind, SyncMode, SyncOptions, SyncProfile,
 };
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -54,6 +54,29 @@ fn write_file(path: &Path, contents: &[u8]) {
         fs::create_dir_all(parent).expect("test parent should be creatable");
     }
     fs::write(path, contents).expect("test file should be writable");
+}
+
+#[test]
+fn mirror_first_run_plans_one_sided_items_in_both_directions_without_deletion() {
+    let peer_a = TestDirectory::new("mirror-a");
+    let peer_b = TestDirectory::new("mirror-b");
+    write_file(&peer_a.join("from-a.txt"), b"a");
+    write_file(&peer_b.join("from-b.txt"), b"b");
+    let profile = profile(&peer_a, &peer_b).with_mode(SyncMode::Mirror);
+
+    let analysis = FreshAnalysis::analyze(&profile).expect("Mirror peers should be analyzable");
+    assert_eq!(analysis.specification().mode(), SyncMode::Mirror);
+    assert_eq!(analysis.plan().actions().len(), 2);
+    assert!(analysis.plan().actions().iter().all(|action| {
+        action.kind() == PlanActionKind::CopyToDestination
+    }));
+    assert!(analysis.plan().actions().iter().any(|action| {
+        action.relative_path() == Path::new("from-a.txt") && action.source_side() == PeerSide::PeerA
+    }));
+    assert!(analysis.plan().actions().iter().any(|action| {
+        action.relative_path() == Path::new("from-b.txt") && action.source_side() == PeerSide::PeerB
+    }));
+    assert!(analysis.plan().actions().iter().all(|action| !analysis.plan().is_deletion_candidate(action.relative_path())));
 }
 
 #[test]

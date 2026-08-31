@@ -2,7 +2,7 @@ use std::{fs, path::PathBuf};
 
 use crate::{
     DeletionMethod, FreshAnalysis, MetadataRequirements, OneWaySource, ProcessArgument, ProcessSpecError,
-    ProcessSpecification, Peer, RsyncFlag, SyncOptions, SyncProfile,
+    ProcessSpecification, Peer, RsyncFlag, SyncMode, SyncOptions, SyncProfile,
     SpecialistMetadataRequirements,
 };
 
@@ -42,6 +42,24 @@ fn specialist_metadata_is_named_and_disabled_by_default() {
     .expect("named specialist options should validate");
     assert!(specification.arguments().contains(&ProcessArgument::Flag(RsyncFlag::Acls)));
     assert!(specification.arguments().contains(&ProcessArgument::Flag(RsyncFlag::Xattrs)));
+}
+
+#[test]
+fn mirror_is_explicit_and_rejects_one_way_deletion_options() {
+    let mirror = profile(PathBuf::from("/a"), PathBuf::from("/b"))
+        .with_mode(SyncMode::Mirror);
+    assert_eq!(mirror.mode(), SyncMode::Mirror);
+    assert_eq!(ProcessSpecification::from_profile(&mirror).unwrap().mode(), SyncMode::Mirror);
+
+    let invalid = mirror.with_options(SyncOptions {
+        safe_delete: true,
+        deletion_method: Some(DeletionMethod::Trash),
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile(&invalid),
+        Err(ProcessSpecError::InvalidOptionCombination { .. })
+    ));
 }
 
 #[test]

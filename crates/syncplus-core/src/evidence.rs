@@ -1275,6 +1275,15 @@ impl RunEvidenceStore {
             Peer::new(peer_a_name, blob_to_path(&peer_a_root)?),
             Peer::new(peer_b_name, blob_to_path(&peer_b_root)?),
         )
+        .with_mode(match mode.as_str() {
+            "one_way" => SyncMode::OneWay,
+            "mirror" => SyncMode::Mirror,
+            value => {
+                return Err(StorageError::CorruptEvidence(format!(
+                    "unsupported stored sync mode {value}"
+                )))
+            }
+        })
         .with_source(decode_source(&source)?)
         .with_options(SyncOptions {
             safe_delete,
@@ -1307,11 +1316,6 @@ impl RunEvidenceStore {
             decode_volume_identity(peer_b_volume_identity.as_deref())?,
         )?;
         snapshot.snapshot_id = ProfileSnapshotId::new(snapshot_id);
-        if mode != "one_way" {
-            return Err(StorageError::CorruptEvidence(format!(
-                "unsupported stored sync mode {mode}"
-            )));
-        }
         Ok(snapshot)
     }
 
@@ -2868,6 +2872,7 @@ fn event_action_id(event: &JournalEvent) -> ActionId {
 fn encode_mode(mode: SyncMode) -> &'static str {
     match mode {
         SyncMode::OneWay => "one_way",
+        SyncMode::Mirror => "mirror",
     }
 }
 

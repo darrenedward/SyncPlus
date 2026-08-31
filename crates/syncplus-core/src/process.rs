@@ -238,15 +238,25 @@ pub struct ProcessSpecification {
     source_root: PathBuf,
     destination_root: PathBuf,
     secret_bindings: Vec<EnvironmentBinding>,
+    mode: SyncMode,
+    peer_a_root: PathBuf,
+    peer_b_root: PathBuf,
 }
 
 impl ProcessSpecification {
     pub fn from_profile(profile: &SyncProfile) -> Result<Self, ProcessSpecError> {
-        if profile.mode() != SyncMode::OneWay {
+        if !matches!(profile.mode(), SyncMode::OneWay | SyncMode::Mirror) {
             return Err(ProcessSpecError::UnsupportedSyncMode);
         }
 
         let options = profile.options().validate()?;
+        if profile.mode() == SyncMode::Mirror
+            && (options.safe_delete() || options.destination_cleanup())
+        {
+            return Err(ProcessSpecError::InvalidOptionCombination {
+                reason: "Mirror cannot enable One-Way deletion options",
+            });
+        }
         let (source, destination) = match profile.source() {
             OneWaySource::PeerA => (profile.peer_a(), profile.peer_b()),
             OneWaySource::PeerB => (profile.peer_b(), profile.peer_a()),
@@ -289,6 +299,9 @@ impl ProcessSpecification {
             source_root: source.root().to_path_buf(),
             destination_root: destination.root().to_path_buf(),
             secret_bindings: Vec::new(),
+            mode: profile.mode(),
+            peer_a_root: profile.peer_a().root().to_path_buf(),
+            peer_b_root: profile.peer_b().root().to_path_buf(),
         })
     }
 
@@ -302,6 +315,10 @@ impl ProcessSpecification {
 
     pub const fn source(&self) -> OneWaySource {
         self.source
+    }
+
+    pub const fn mode(&self) -> SyncMode {
+        self.mode
     }
 
     pub fn exclusions(&self) -> impl Iterator<Item = &str> {
@@ -396,22 +413,30 @@ impl ProcessSpecification {
     }
 
     pub(crate) fn source_path(&self, action: &PlanAction) -> Result<PathBuf, ProcessSpecError> {
-        if action.source_side() != PeerSide::from(self.source) {
+        if self.mode == SyncMode::OneWay && action.source_side() != PeerSide::from(self.source) {
             return Err(ProcessSpecError::ActionSourceMismatch);
         }
         validate_relative_transfer_path(action.relative_path())?;
-        Ok(self.source_root.join(action.relative_path()))
+        let root = match action.source_side() {
+            PeerSide::PeerA => &self.peer_a_root,
+            PeerSide::PeerB => &self.peer_b_root,
+        };
+        Ok(root.join(action.relative_path()))
     }
 
     pub(crate) fn destination_path(
         &self,
         action: &PlanAction,
     ) -> Result<PathBuf, ProcessSpecError> {
-        if action.source_side() != PeerSide::from(self.source) {
+        if self.mode == SyncMode::OneWay && action.source_side() != PeerSide::from(self.source) {
             return Err(ProcessSpecError::ActionSourceMismatch);
         }
         validate_relative_transfer_path(action.relative_path())?;
-        Ok(self.destination_root.join(action.relative_path()))
+        let root = match action.source_side() {
+            PeerSide::PeerA => &self.peer_b_root,
+            PeerSide::PeerB => &self.peer_a_root,
+        };
+        Ok(root.join(action.relative_path()))
     }
 
     pub(crate) fn source_root(&self) -> &Path {

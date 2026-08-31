@@ -366,6 +366,7 @@ impl std::error::Error for PlanError {}
 pub struct OneWayPlan {
     specification: ProcessSpecification,
     source_inventory: SourceInventory,
+    destination_inventory: PeerInventory,
     approved_scope: ApprovedSyncScope,
     actions: Vec<PlanAction>,
     summary: PlanSummary,
@@ -386,6 +387,10 @@ impl OneWayPlan {
 
     pub fn inventory(&self) -> &SourceInventory {
         self.source_inventory()
+    }
+
+    pub fn destination_inventory(&self) -> &PeerInventory {
+        &self.destination_inventory
     }
 
     pub fn approved_scope(&self) -> &ApprovedSyncScope {
@@ -421,8 +426,15 @@ impl OneWayPlan {
 
     pub fn validate(&self) -> Result<(), PlanError> {
         for action in &self.actions {
-            if self
-                .source_inventory
+            let inventory = if self.specification.mode() == crate::SyncMode::Mirror {
+                match action.source_side() {
+                    PeerSide::PeerA => &self.source_inventory,
+                    PeerSide::PeerB => &self.destination_inventory,
+                }
+            } else {
+                &self.source_inventory
+            };
+            if inventory
                 .item(&action.relative_path)
                 .is_some_and(|item| !item.is_eligible())
             {
@@ -544,7 +556,11 @@ impl FreshAnalysis {
     pub fn analyze(profile: &SyncProfile) -> Result<Self, AnalysisError> {
         let specification = ProcessSpecification::from_profile(profile)
             .map_err(AnalysisError::ProcessSpecification)?;
-        let (source, destination) = selected_peers(profile);
+        let (source, destination) = if profile.mode() == crate::SyncMode::Mirror {
+            (profile.peer_a(), profile.peer_b())
+        } else {
+            selected_peers(profile)
+        };
         let exclusions: Vec<String> = specification
             .exclusions()
             .map(ToOwned::to_owned)
@@ -938,6 +954,55 @@ fn build_plan(
     let mut actions = Vec::new();
     let mut next_action_id: ActionId = 1;
 
+    if specification.mode() == crate::SyncMode::Mirror {
+        let all_paths: BTreeSet<PathBuf> = source_by_path
+            .keys()
+            .chain(destination_by_path.keys())
+            .cloned()
+            .collect();
+        for relative_path in all_paths {
+            let source_item = source_by_path.get(&relative_path).copied();
+            let destination_item = destination_by_path.get(&relative_path).copied();
+            match (source_item, destination_item) {
+                (Some(item), None) if item.is_eligible() => {
+                    actions.push(PlanAction {
+                        action_id: next_action_id,
+                        relative_path,
+                        kind: PlanActionKind::CopyToDestination,
+                        consequence: consequence_for(PlanActionKind::CopyToDestination),
+                        source_side: PeerSide::PeerA,
+                        size: data_size(item),
+                    });
+                    next_action_id += 1;
+                }
+                (None, Some(item)) if item.is_eligible() => {
+                    actions.push(PlanAction {
+                        action_id: next_action_id,
+                        relative_path,
+                        kind: PlanActionKind::CopyToDestination,
+                        consequence: consequence_for(PlanActionKind::CopyToDestination),
+                        source_side: PeerSide::PeerB,
+                        size: data_size(item),
+                    });
+                    next_action_id += 1;
+                }
+                _ => {}
+            }
+        }
+        let approved_scope = source.approved_scope.clone();
+        let summary = summary_for(&actions, &source);
+        let plan = OneWayPlan {
+            specification,
+            source_inventory: source,
+            destination_inventory: destination,
+            approved_scope,
+            actions,
+            summary,
+        };
+        plan.validate().map_err(AnalysisError::Plan)?;
+        return Ok(plan);
+    }
+
     for source_item in source.included_items() {
         let destination_item = destination_by_path
             .get(source_item.relative_path())
@@ -1008,6 +1073,7 @@ fn build_plan(
     let plan = OneWayPlan {
         specification,
         source_inventory: source,
+        destination_inventory: destination,
         approved_scope,
         actions,
         summary,

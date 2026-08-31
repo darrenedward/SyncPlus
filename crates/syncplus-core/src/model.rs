@@ -59,6 +59,7 @@ impl Peer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     OneWay,
+    Mirror,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,6 +295,11 @@ impl SyncProfile {
 
     pub const fn with_source(mut self, source: OneWaySource) -> Self {
         self.source = source;
+        self
+    }
+
+    pub const fn with_mode(mut self, mode: SyncMode) -> Self {
+        self.mode = mode;
         self
     }
 
