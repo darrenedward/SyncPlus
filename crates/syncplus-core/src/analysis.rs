@@ -597,6 +597,10 @@ impl FreshAnalysis {
         &self.specification
     }
 
+    pub fn profile(&self) -> &SyncProfile {
+        &self.profile
+    }
+
     pub fn source_inventory(&self) -> &SourceInventory {
         &self.source_inventory
     }
@@ -630,6 +634,65 @@ impl FreshAnalysis {
 
     pub fn revision(&self) -> AnalysisRevision {
         self.revision.clone()
+    }
+
+    /// Build the ordinary verified-transfer plan for the mutating subset of a
+    /// freshly revalidated Mirror resolution. Review-only choices are kept out
+    /// of this plan because they must not be represented as copy actions.
+    pub(crate) fn resolution_transfer_plan(
+        &self,
+        actions: &[crate::ConflictResolutionAction],
+    ) -> Result<OneWayPlan, AnalysisError> {
+        let mut plan_actions = Vec::new();
+        for (index, action) in actions.iter().enumerate() {
+            if action.operation() != crate::ResolutionOperation::CopyWholeFile {
+                continue;
+            }
+            let source_side = action
+                .source_side()
+                .ok_or_else(|| AnalysisError::Plan(PlanError::ActionNotInPlan {
+                    path: action.relative_path().to_path_buf(),
+                }))?;
+            let inventory = match source_side {
+                PeerSide::PeerA => &self.source_inventory,
+                PeerSide::PeerB => &self.destination_inventory,
+            };
+            let item = inventory.item(action.relative_path()).ok_or_else(|| {
+                AnalysisError::Plan(PlanError::ActionNotInPlan {
+                    path: action.relative_path().to_path_buf(),
+                })
+            })?;
+            if !item.is_eligible() {
+                return Err(AnalysisError::Plan(PlanError::ActionOutsideApprovedScope {
+                    path: action.relative_path().to_path_buf(),
+                }));
+            }
+            plan_actions.push(PlanAction {
+                action_id: (index + 1) as ActionId,
+                relative_path: action.relative_path().to_path_buf(),
+                kind: PlanActionKind::CopyToDestination,
+                consequence: mirror_consequence_for(PlanActionKind::CopyToDestination, source_side),
+                source_side,
+                size: data_size(item),
+            });
+        }
+
+        let approved_scope = mirror_approved_scope(&self.source_inventory, &self.destination_inventory);
+        let summary = mirror_summary_for(
+            &plan_actions,
+            &self.source_inventory,
+            &self.destination_inventory,
+        );
+        let plan = OneWayPlan {
+            specification: self.specification.clone(),
+            source_inventory: self.source_inventory.clone(),
+            destination_inventory: self.destination_inventory.clone(),
+            approved_scope,
+            actions: plan_actions,
+            summary,
+        };
+        plan.validate().map_err(AnalysisError::Plan)?;
+        Ok(plan)
     }
 
     pub fn confirm(&self, current_profile: &SyncProfile) -> Result<ConfirmedPlan, AnalysisError> {
@@ -679,7 +742,7 @@ impl AnalysisRevision {
         }
     }
 
-    fn changed_paths(&self, other: &Self) -> Vec<PathBuf> {
+    pub fn changed_paths(&self, other: &Self) -> Vec<PathBuf> {
         let mut paths = BTreeSet::new();
         if revision_map(&self.source) != revision_map(&other.source) {
             paths.extend(changed_paths_for(&self.source, &other.source));
