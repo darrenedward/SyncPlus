@@ -92,3 +92,5 @@ mod volume_tests;
 mod removal_tests;
 #[cfg(test)]
 mod restore_tests;
+#[cfg(test)]
+mod release_gate_tests;
