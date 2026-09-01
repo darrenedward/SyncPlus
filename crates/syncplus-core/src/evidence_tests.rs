@@ -8,8 +8,8 @@ use crate::{
     JournalEvent, OneWaySource, Peer, PeerSide, PlanActionKind, PlanRecord, PreActionState, RecoveryEvidence,
     PartialTransferPolicy, RecoveryResolution, RetryPolicy, RunEvidenceStore, RunExecutionResult,
     RunId, RunLifecycle, RunReportStatus, RunSnapshot, SyncOptions, SyncProfile, SyncRun,
-    ConflictResolution, MirrorResolutionOutcome, MirrorResolutionReportItem,
-    MirrorResolutionReviewState, ResolutionOperation, SyncMode,
+    ConflictResolution, MetadataRequirements, MirrorResolutionOutcome, MirrorResolutionReportItem,
+    MirrorResolutionReviewState, ResolutionOperation, SpecialistMetadataRequirements, SyncMode,
 };
 
 fn profile() -> SyncProfile {
@@ -88,6 +88,26 @@ fn persisted_snapshot_remains_unchanged_when_the_profile_is_edited() {
     assert_eq!(restored, original);
     assert_eq!(restored.profile().name(), "evidence profile");
     assert_eq!(restored.profile().exclusions(), &["*.tmp", "private/"]);
+}
+
+#[test]
+fn persisted_snapshot_round_trips_all_named_metadata_requirements_after_restart() {
+    let path = TestDatabase::new();
+    let metadata = MetadataRequirements::new(true, true, true, true)
+        .with_specialist_metadata(SpecialistMetadataRequirements::new(true, true, true));
+    let profile = profile().with_options(SyncOptions {
+        metadata,
+        ..SyncOptions::default()
+    });
+    let original = RunSnapshot::from_profile(RunId::new(2), &profile, AuthorizationSnapshot::default())
+        .expect("profile should produce a snapshot");
+    let mut store = RunEvidenceStore::open(path.path()).expect("open evidence store");
+    store.begin_run(&original).expect("persist snapshot");
+    drop(store);
+
+    let reopened = RunEvidenceStore::open(path.path()).expect("reopen evidence store");
+    let restored = reopened.load_snapshot(RunId::new(2)).expect("load snapshot");
+    assert_eq!(restored.profile().options().metadata, metadata);
 }
 
 #[test]

@@ -300,6 +300,9 @@ impl SshHostTrustController {
         if decision.host() != &SshHost::from_peer(peer) {
             return Err(HostTrustError::DecisionForDifferentHost);
         }
+        if matches!(decision, HostTrustDecision::ChangedFingerprint { .. }) {
+            return Err(HostTrustError::ChangedFingerprintRejected);
+        }
         let host = decision.host().to_owned();
         let observed = decision.observed().to_owned();
         self.store
