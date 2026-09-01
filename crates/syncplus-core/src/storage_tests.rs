@@ -139,9 +139,14 @@ fn duplicate_endpoint_pairs_are_rejected_independently_of_profile_name() {
 fn explicitly_created_authorizations_round_trip_separately_from_profile_fields() {
     let database = database();
     let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+    let profile = profile().with_options(crate::SyncOptions {
+        safe_delete: true,
+        deletion_method: Some(crate::DeletionMethod::PermanentRemoval),
+        ..crate::SyncOptions::default()
+    });
     let id = store
         .create_profile_with_authorizations(
-            &profile(),
+            &profile,
             AuthorizationSnapshot::new(true, true),
         )
         .expect("create profile")
@@ -154,6 +159,33 @@ fn explicitly_created_authorizations_round_trip_separately_from_profile_fields()
     assert!(loaded.authorizations().allow_unattended_destructive());
     assert!(loaded.authorizations().allow_unattended_permanent_removal());
     assert_eq!(loaded.profile().name(), "work files");
+}
+
+#[test]
+fn invalid_unattended_authorizations_are_rejected() {
+    let database = database();
+    let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+
+    assert!(matches!(
+        store.create_profile_with_authorizations(
+            &profile(),
+            AuthorizationSnapshot::new(true, false),
+        ),
+        Err(StorageError::InvalidAuthorization(_))
+    ));
+
+    let safe_delete_profile = profile().with_options(crate::SyncOptions {
+        safe_delete: true,
+        deletion_method: Some(crate::DeletionMethod::Trash),
+        ..crate::SyncOptions::default()
+    });
+    assert!(matches!(
+        store.create_profile_with_authorizations(
+            &safe_delete_profile,
+            AuthorizationSnapshot::new(false, true),
+        ),
+        Err(StorageError::InvalidAuthorization(_))
+    ));
 }
 
 #[test]

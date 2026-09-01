@@ -32,6 +32,7 @@ pub enum UiValidationError {
     InvalidSshPort,
     EmptySshRemotePath,
     MissingIdentity,
+    SshAuthenticationRequired,
     InvalidSavedSecretReference,
     SavedSecretUnavailable,
     InvalidRetryAttempts,
@@ -39,6 +40,8 @@ pub enum UiValidationError {
     CloneEndpointsUnchanged,
     DuplicateEndpointPair,
     CloneAuthorizationConfirmationRequired,
+    PermanentRemovalRequiresAdvanced,
+    PermanentRemovalAuthorizationRequired,
     PrecheckBlocked,
     ReviewNotReady,
     StrongerConfirmationRequired,
@@ -58,6 +61,9 @@ impl std::fmt::Display for UiValidationError {
             Self::InvalidSshPort => formatter.write_str("SSH port must be a number from 1 to 65535."),
             Self::EmptySshRemotePath => formatter.write_str("SSH remote folder is required."),
             Self::MissingIdentity => formatter.write_str("Key authentication requires an identity file."),
+            Self::SshAuthenticationRequired => {
+                formatter.write_str("Choose an SSH authentication method for this cloned endpoint before saving.")
+            }
             Self::InvalidSavedSecretReference => {
                 formatter.write_str("Saved password authentication requires a valid keyring reference.")
             }
@@ -78,6 +84,12 @@ impl std::fmt::Display for UiValidationError {
             }
             Self::CloneAuthorizationConfirmationRequired => formatter.write_str(
                 "Review and explicitly confirm the cloned profile's unattended authorization choice before saving.",
+            ),
+            Self::PermanentRemovalRequiresAdvanced => {
+                formatter.write_str("Permanent Removal is available only in Advanced Mode.")
+            }
+            Self::PermanentRemovalAuthorizationRequired => formatter.write_str(
+                "Permanent Removal requires its separate explicit unattended authorization before saving.",
             ),
             Self::PrecheckBlocked => {
                 formatter.write_str("The non-mutating precheck found blockers; execution is not available.")
@@ -120,6 +132,7 @@ enum AuthenticationForm {
     Agent,
     InteractivePassword,
     SavedPassword,
+    NeedsConfiguration,
 }
 
 impl Default for AuthenticationForm {
@@ -234,6 +247,9 @@ impl EndpointForm {
                             .map_err(|_| UiValidationError::InvalidSavedSecretReference)?;
                         SshAuthentication::SavedPassword(reference)
                     }
+                    AuthenticationForm::NeedsConfiguration => {
+                        return Err(UiValidationError::SshAuthenticationRequired)
+                    }
                 };
                 let identity = matches!(&authentication, SshAuthentication::Key)
                     .then_some(entered_identity)
@@ -254,8 +270,9 @@ impl EndpointForm {
 
     fn without_saved_credentials(mut self) -> Self {
         if matches!(self.authentication, AuthenticationForm::SavedPassword) {
-            self.authentication = AuthenticationForm::Agent;
+            self.authentication = AuthenticationForm::NeedsConfiguration;
             self.secret_reference.clear();
+            self.identity.clear();
         }
         self
     }
@@ -289,6 +306,7 @@ struct ProfileForm {
     clone_source: Option<SyncProfileId>,
     clone_source_endpoints: Option<(Peer, Peer)>,
     clone_source_authorizations: AuthorizationSnapshot,
+    profile_authorizations: AuthorizationSnapshot,
     clone_authorization_choice: CloneAuthorizationChoice,
     clone_authorization_confirmed: bool,
 }
@@ -316,6 +334,7 @@ impl Default for ProfileForm {
             clone_source: None,
             clone_source_endpoints: None,
             clone_source_authorizations: AuthorizationSnapshot::default(),
+            profile_authorizations: AuthorizationSnapshot::default(),
             clone_authorization_choice: CloneAuthorizationChoice::Reset,
             clone_authorization_confirmed: false,
         }
@@ -349,6 +368,7 @@ impl ProfileForm {
             clone_source: None,
             clone_source_endpoints: None,
             clone_source_authorizations: AuthorizationSnapshot::default(),
+            profile_authorizations: profile.authorizations(),
             clone_authorization_choice: CloneAuthorizationChoice::Reset,
             clone_authorization_confirmed: false,
         }
@@ -488,6 +508,7 @@ impl SyncPlusApp {
         form.clone_source = Some(id);
         form.clone_source_endpoints = Some((source.peer_a().clone(), source.peer_b().clone()));
         form.clone_source_authorizations = persisted.authorizations();
+        form.profile_authorizations = AuthorizationSnapshot::default();
         form.clone_authorization_choice = CloneAuthorizationChoice::Reset;
         form.clone_authorization_confirmed = !has_unattended_authorization;
         self.form = form;
@@ -523,15 +544,25 @@ impl SyncPlusApp {
 
     pub fn save_profile(&mut self) -> Result<SyncProfileId, UiValidationError> {
         let profile = self.validated_profile()?;
-        let clone_authorizations = self.validate_clone(&profile)?;
+        let authorizations = self.validate_clone(&profile)?;
+        if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
+            && self.settings.mode() != ApplicationMode::Advanced
+        {
+            return Err(UiValidationError::PermanentRemovalRequiresAdvanced);
+        }
+        if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
+            && !authorizations.allow_unattended_permanent_removal()
+        {
+            return Err(UiValidationError::PermanentRemovalAuthorizationRequired);
+        }
         let persisted = match self.form.id {
             Some(id) => self
                 .store
-                .update_profile(id, &profile)
+                .update_profile_with_authorizations(id, &profile, authorizations)
                 .map_err(map_storage_error)?,
             None => self
                 .store
-                .create_profile_with_authorizations(&profile, clone_authorizations)
+                .create_profile_with_authorizations(&profile, authorizations)
                 .map_err(map_storage_error)?,
         };
         let id = persisted.id();
@@ -550,7 +581,7 @@ impl SyncPlusApp {
         profile: &SyncProfile,
     ) -> Result<AuthorizationSnapshot, UiValidationError> {
         let Some(_source_id) = self.form.clone_source else {
-            return Ok(AuthorizationSnapshot::default());
+            return Ok(self.form.profile_authorizations);
         };
         let Some((source_a, source_b)) = &self.form.clone_source_endpoints else {
             return Err(UiValidationError::Core(
@@ -575,7 +606,7 @@ impl SyncPlusApp {
             == CloneAuthorizationChoice::CopyUnattendedDestructive;
         Ok(AuthorizationSnapshot::new(
             copy_destructive && source_authorizations.allow_unattended_destructive(),
-            false,
+            self.form.profile_authorizations.allow_unattended_permanent_removal(),
         ))
     }
 
@@ -849,6 +880,7 @@ impl SyncPlusApp {
         ui.heading("Sync Profile");
         ui.label("Define named endpoints and safety settings. SyncPlus never accepts arbitrary rsync arguments.");
         if let Some(source_id) = self.form.clone_source {
+            let clone_authorization_choice_before = self.form.clone_authorization_choice;
             ui.group(|ui| {
                 ui.heading("Clone Profile safeguards");
                 ui.label(format!(
@@ -885,6 +917,18 @@ impl SyncPlusApp {
                     );
                 }
             });
+            if self.form.clone_authorization_choice != clone_authorization_choice_before {
+                self.form.clone_authorization_confirmed = false;
+                self.form.profile_authorizations = AuthorizationSnapshot::new(
+                    self.form.clone_authorization_choice
+                        == CloneAuthorizationChoice::CopyUnattendedDestructive
+                        && self
+                            .form
+                            .clone_source_authorizations
+                            .allow_unattended_destructive(),
+                    self.form.profile_authorizations.allow_unattended_permanent_removal(),
+                );
+            }
         }
         ui.horizontal(|ui| {
             ui.label("Profile name");
@@ -934,6 +978,66 @@ impl SyncPlusApp {
                     );
                 }
                 ui.checkbox(&mut self.form.destination_cleanup, "Destination Cleanup");
+                ui.separator();
+                ui.label("Unattended authorization (explicit and profile-specific)");
+                let destructive_actions_enabled = self.form.safe_delete || self.form.destination_cleanup;
+                if self.form.clone_source.is_none() && destructive_actions_enabled {
+                    let mut allow_destructive = self
+                        .form
+                        .profile_authorizations
+                        .allow_unattended_destructive();
+                    ui.checkbox(
+                        &mut allow_destructive,
+                        "Authorize unattended Safe Delete or Destination Cleanup",
+                    );
+                    self.form.profile_authorizations = AuthorizationSnapshot::new(
+                        allow_destructive,
+                        self.form.profile_authorizations.allow_unattended_permanent_removal(),
+                    );
+                } else if !destructive_actions_enabled {
+                    self.form.profile_authorizations = AuthorizationSnapshot::new(
+                        false,
+                        self.form.profile_authorizations.allow_unattended_permanent_removal(),
+                    );
+                    ui.label("Enable Safe Delete or Destination Cleanup before authorizing unattended destructive actions.");
+                } else {
+                    ui.label(if self
+                        .form
+                        .profile_authorizations
+                        .allow_unattended_destructive()
+                    {
+                        "This clone explicitly authorizes unattended destructive actions."
+                    } else {
+                        "This clone does not authorize unattended destructive actions."
+                    });
+                }
+                if self.form.deletion_method == Some(DeletionMethod::PermanentRemoval) {
+                    let mut allow_permanent = self
+                        .form
+                        .profile_authorizations
+                        .allow_unattended_permanent_removal();
+                    ui.checkbox(
+                        &mut allow_permanent,
+                        "Authorize unattended Permanent Removal (irreversible; Advanced only)",
+                    );
+                    self.form.profile_authorizations = AuthorizationSnapshot::new(
+                        self.form.profile_authorizations.allow_unattended_destructive(),
+                        allow_permanent,
+                    );
+                    ui.label("Permanent Removal requires this separate authorization before saving.");
+                } else {
+                    if self
+                        .form
+                        .profile_authorizations
+                        .allow_unattended_permanent_removal()
+                    {
+                        self.form.profile_authorizations = AuthorizationSnapshot::new(
+                            self.form.profile_authorizations.allow_unattended_destructive(),
+                            false,
+                        );
+                    }
+                    ui.label("Unattended Permanent Removal remains disabled unless Permanent Removal is selected.");
+                }
                 ui.separator();
                 ui.label("Metadata preservation (validated named options)");
                 ui.checkbox(&mut self.form.timestamps, "Preserve and verify timestamps");
@@ -1427,6 +1531,9 @@ fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
                         ui.label("Only the nonsecret reference is saved. Passwords and passphrases stay in the desktop keyring.");
                     }
                     AuthenticationForm::Agent | AuthenticationForm::InteractivePassword => {}
+                    AuthenticationForm::NeedsConfiguration => {
+                        ui.label("Authentication was cleared from this clone. Choose an approved method before saving.");
+                    }
                 }
             }
         }
@@ -1573,13 +1680,18 @@ mod tests {
         app.clone_profile(source_id).expect("clone profile");
         assert_eq!(app.form.id, None);
         assert_eq!(app.form.peer_b.secret_reference, "");
-        assert_eq!(app.form.peer_b.authentication, AuthenticationForm::Agent);
+        assert_eq!(app.form.peer_b.authentication, AuthenticationForm::NeedsConfiguration);
         app.form.peer_b.name = "renamed destination label".to_owned();
+        assert_eq!(
+            app.save_profile(),
+            Err(UiValidationError::SshAuthenticationRequired)
+        );
+
+        app.form.peer_b.authentication = AuthenticationForm::Agent;
         assert_eq!(
             app.save_profile(),
             Err(UiValidationError::CloneEndpointsUnchanged)
         );
-
         app.form.peer_b.remote_path = "/srv/backup-copy".to_owned();
         let clone_id = app.save_profile().expect("changed endpoint clone");
         let clone = app
@@ -1631,7 +1743,10 @@ mod tests {
     #[test]
     fn clone_copy_authorization_is_explicit_advanced_only_and_excludes_permanent_removal() {
         let mut store = RunEvidenceStore::open_in_memory().expect("database");
-        let source = valid_form().build().expect("source profile");
+        let mut source_form = valid_form();
+        source_form.safe_delete = true;
+        source_form.deletion_method = Some(DeletionMethod::PermanentRemoval);
+        let source = source_form.build().expect("source profile");
         let source_id = store
             .create_profile_with_authorizations(
                 &source,
