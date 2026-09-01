@@ -3,14 +3,15 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use eframe::egui;
 use syncplus_core::{
     ActionOutcome, AnalysisOutcome, ApplicationMode, ApplicationSettings, AuthorizationSnapshot,
+    BackgroundScheduler,
     ConflictDecision,
     ConflictEntry, ConflictEntryKey, ConflictResolution, ConflictReview, DeletionMethod,
     FreshAnalysis, LocalPrecheckProbe, MetadataRequirements, OneWaySource, PartialTransferPolicy,
     Peer, PeerEndpoint, PersistedSyncProfile, PrecheckErrorKind, PrecheckResult,
     RemotePrecheckRequest, ResolutionRun, RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId,
-    RunLifecycle, RunPrecheck, RunReport, RunReportStatus, SavedSecretReference, SecretStore,
+    RecoveryMethod, RunLifecycle, RunPrecheck, RunReport, RunReportStatus, SavedSecretReference, SecretStore,
     SecretStoreError,
-    SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
+    ScheduleDefinition, SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
     SyncProfileId, ThemePreference,
 };
 
@@ -41,6 +42,8 @@ pub enum UiValidationError {
     SavedSecretUnavailable,
     InvalidRetryAttempts,
     InvalidRetryDelay,
+    InvalidScheduleInterval,
+    InvalidScheduleTimezone,
     CloneEndpointsUnchanged,
     DuplicateEndpointPair,
     CloneAuthorizationConfirmationRequired,
@@ -83,6 +86,12 @@ impl std::fmt::Display for UiValidationError {
             }
             Self::InvalidRetryDelay => {
                 formatter.write_str("Retry delay must be between 0 and 3,600,000 milliseconds.")
+            }
+            Self::InvalidScheduleInterval => {
+                formatter.write_str("Schedule interval must be a whole number from 1 minute to 7 days.")
+            }
+            Self::InvalidScheduleTimezone => {
+                formatter.write_str("Schedule timezone must be a nonempty value of at most 128 characters.")
             }
             Self::CloneEndpointsUnchanged => {
                 formatter.write_str("A cloned profile must change at least one endpoint before it can be saved.")
@@ -129,6 +138,49 @@ impl std::fmt::Display for UiValidationError {
 }
 
 impl std::error::Error for UiValidationError {}
+
+/// Run one due scheduler poll as the invoking OS user. This is the fixed
+/// command surface intended for a user-level scheduler registration; it has
+/// no shell, root-service, or interactive credential fallback.
+pub fn run_background_scheduler_once() -> Result<usize, String> {
+    let database_path = RunEvidenceStore::canonical_path().map_err(|error| error.to_string())?;
+    let data_home = database_path
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or_else(|| "canonical database has no XDG data parent".to_owned())?
+        .to_path_buf();
+    let mut store = RunEvidenceStore::open_canonical().map_err(|error| error.to_string())?;
+    let scheduler = BackgroundScheduler::new();
+    let due_runs = scheduler
+        .poll_due(&mut store)
+        .map_err(|error| error.to_string())?;
+    let mut launched = 0;
+    let mut failures = Vec::new();
+    for scheduled_run in due_runs {
+        let recovery_method = if scheduled_run.snapshot().profile().options().deletion_method
+            == Some(DeletionMethod::PermanentRemoval)
+        {
+            RecoveryMethod::permanent_removal()
+        } else {
+            RecoveryMethod::native_trash(data_home.clone())
+        };
+        let workflow = syncplus_core::RunWorkflow::new(recovery_method);
+        match scheduled_run.execute(
+            &workflow,
+            &LocalPrecheckProbe::default(),
+            &mut store,
+            || false,
+        ) {
+            Ok(_) => launched += 1,
+            Err(error) => failures.push(format!("Sync Run {}: {error}", scheduled_run.run_id().value())),
+        }
+    }
+    if failures.is_empty() {
+        Ok(launched)
+    } else {
+        Err(failures.join("; "))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EndpointForm {
@@ -322,6 +374,9 @@ struct ProfileForm {
     partial_transfer_policy: PartialTransferPolicy,
     retry_attempts: String,
     retry_delay_millis: String,
+    schedule_enabled: bool,
+    schedule_interval_minutes: String,
+    schedule_timezone: String,
     clone_source: Option<SyncProfileId>,
     clone_source_endpoints: Option<(Peer, Peer)>,
     clone_source_authorizations: AuthorizationSnapshot,
@@ -351,6 +406,9 @@ impl Default for ProfileForm {
             partial_transfer_policy: PartialTransferPolicy::Cleanup,
             retry_attempts: RetryPolicy::default().max_attempts().to_string(),
             retry_delay_millis: RetryPolicy::default().initial_delay().as_millis().to_string(),
+            schedule_enabled: false,
+            schedule_interval_minutes: "60".to_owned(),
+            schedule_timezone: "UTC".to_owned(),
             clone_source: None,
             clone_source_endpoints: None,
             clone_source_authorizations: AuthorizationSnapshot::default(),
@@ -386,6 +444,15 @@ impl ProfileForm {
             partial_transfer_policy: options.partial_transfer_policy,
             retry_attempts: options.retry_policy.max_attempts().to_string(),
             retry_delay_millis: options.retry_policy.initial_delay().as_millis().to_string(),
+            schedule_enabled: profile.schedule_enabled(),
+            schedule_interval_minutes: profile
+                .schedule()
+                .map(|schedule| schedule.interval_minutes().to_string())
+                .unwrap_or_else(|| "60".to_owned()),
+            schedule_timezone: profile
+                .schedule()
+                .map(|schedule| schedule.timezone().to_owned())
+                .unwrap_or_else(|| "UTC".to_owned()),
             clone_source: None,
             clone_source_endpoints: None,
             clone_source_authorizations: AuthorizationSnapshot::default(),
@@ -439,6 +506,22 @@ impl ProfileForm {
             .with_source(self.source)
             .with_options(options)
             .with_exclusions(exclusions))
+    }
+
+    fn build_schedule(&self) -> Result<ScheduleDefinition, UiValidationError> {
+        let interval_minutes = self
+            .schedule_interval_minutes
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|interval| (1..=10_080).contains(interval))
+            .ok_or(UiValidationError::InvalidScheduleInterval)?;
+        let timezone = self.schedule_timezone.trim();
+        if timezone.is_empty() || timezone.len() > 128 || timezone.contains('\0') {
+            return Err(UiValidationError::InvalidScheduleTimezone);
+        }
+        ScheduleDefinition::new(interval_minutes, timezone, self.schedule_enabled)
+            .map_err(|error| UiValidationError::Core(error.to_string()))
     }
 }
 
@@ -1237,6 +1320,9 @@ impl SyncPlusApp {
     pub fn save_profile(&mut self) -> Result<SyncProfileId, UiValidationError> {
         let profile = self.validated_profile()?;
         let authorizations = self.validate_clone(&profile)?;
+        let schedule = (self.settings.mode() == ApplicationMode::Advanced)
+            .then(|| self.form.build_schedule())
+            .transpose()?;
         if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
             && self.settings.mode() != ApplicationMode::Advanced
         {
@@ -1267,6 +1353,13 @@ impl SyncPlusApp {
                 .map_err(map_storage_error)?,
         };
         let id = persisted.id();
+        let persisted = if let Some(schedule) = schedule {
+            self.store
+                .update_schedule(id, Some(schedule), self.settings.mode())
+                .map_err(map_storage_error)?
+        } else {
+            persisted
+        };
         self.form = ProfileForm::from_persisted(&persisted);
         self.review = None;
         self.profiles = self
@@ -2033,6 +2126,26 @@ impl SyncPlusApp {
                     ui.label("Initial delay (ms)");
                     ui.add(egui::TextEdit::singleline(&mut self.form.retry_delay_millis).desired_width(75.0));
                 });
+                ui.separator();
+                ui.label("Background Scheduler (Advanced Mode only)");
+                ui.checkbox(
+                    &mut self.form.schedule_enabled,
+                    "Enable recurring Unattended Run for this Sync Profile",
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Every (minutes)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.schedule_interval_minutes)
+                            .desired_width(70.0),
+                    );
+                    ui.label("Timezone");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.schedule_timezone)
+                            .desired_width(150.0),
+                    );
+                });
+                ui.label("Scheduled launches run as this OS user through the same safety workflow; no root service or hidden credential prompt is used.");
+                ui.label("The next run is persisted by the Background Scheduler. Editing or disabling this schedule never changes an active Run's frozen Profile Snapshot.");
                 ui.label("Transport is selected through the typed Local or SSH endpoint fields. Command editing is not available.");
                 ui.label("These options remain subject to Fresh Analysis, verification, and explicit Execution Confirmation.");
             });
@@ -3514,6 +3627,43 @@ mod tests {
         assert!(!profile.options().safe_delete);
         assert!(!profile.options().destination_cleanup);
         assert_eq!(profile.options().deletion_method, None);
+    }
+
+    #[test]
+    fn scheduling_is_advanced_only_persisted_and_keeps_snapshot_boundaries() {
+        let mut app = app();
+        app.set_mode(ApplicationMode::Advanced);
+        app.form = valid_form();
+        app.form.schedule_enabled = true;
+        app.form.schedule_interval_minutes = "15".to_owned();
+        app.form.schedule_timezone = "Pacific/Auckland".to_owned();
+        let id = app.save_profile().expect("save scheduled profile");
+        let schedule = app.profiles()[0].schedule().expect("schedule");
+        assert_eq!(schedule.interval_minutes(), 15);
+        assert_eq!(schedule.timezone(), "Pacific/Auckland");
+        assert!(schedule.next_run_at_unix_seconds().is_some());
+        assert!(app.profiles()[0].schedule_enabled());
+
+        app.set_mode(ApplicationMode::Simple);
+        app.form.name = "edited later".to_owned();
+        app.save_profile().expect("edit profile in Simple Mode");
+        let persisted = app
+            .profiles()
+            .iter()
+            .find(|profile| profile.id() == id)
+            .expect("profile");
+        assert!(persisted.schedule_enabled());
+        assert_eq!(persisted.schedule().expect("schedule").interval_minutes(), 15);
+    }
+
+    #[test]
+    fn invalid_schedule_fields_are_rejected_before_profile_save() {
+        let mut app = app();
+        app.set_mode(ApplicationMode::Advanced);
+        app.form = valid_form();
+        app.form.schedule_interval_minutes = "0".to_owned();
+        assert_eq!(app.save_profile(), Err(UiValidationError::InvalidScheduleInterval));
+        assert!(app.profiles().is_empty());
     }
 
     #[test]

@@ -205,6 +205,7 @@ fn recurring_schedule_round_trips_and_requires_advanced_mode_to_enable() {
         .update_schedule(id, Some(disabled.clone()), ApplicationMode::Simple)
         .expect("save disabled schedule");
     assert_eq!(persisted.schedule(), Some(&disabled));
+    assert_eq!(persisted.schedule().and_then(|schedule| schedule.next_run_at_unix_seconds()), None);
     assert!(!persisted.schedule_enabled());
 
     let enabled = disabled.with_enabled(true);
@@ -215,7 +216,9 @@ fn recurring_schedule_round_trips_and_requires_advanced_mode_to_enable() {
     let persisted = store
         .update_schedule(id, Some(enabled.clone()), ApplicationMode::Advanced)
         .expect("enable schedule in Advanced Mode");
-    assert_eq!(persisted.schedule(), Some(&enabled));
+    assert_eq!(persisted.schedule().map(|schedule| schedule.interval_minutes()), Some(60));
+    assert_eq!(persisted.schedule().map(|schedule| schedule.timezone()), Some("Pacific/Auckland"));
+    assert!(persisted.schedule().is_some_and(|schedule| schedule.next_run_at_unix_seconds().is_some()));
     assert!(persisted.schedule_enabled());
 
     drop(store);
@@ -224,7 +227,49 @@ fn recurring_schedule_round_trips_and_requires_advanced_mode_to_enable() {
         .load_profile(id)
         .expect("load profile")
         .expect("profile exists");
-    assert_eq!(loaded.schedule(), Some(&enabled));
+    assert_eq!(loaded.schedule().map(|schedule| schedule.interval_minutes()), Some(60));
+    assert_eq!(loaded.schedule().map(|schedule| schedule.timezone()), Some("Pacific/Auckland"));
+    assert!(loaded.schedule().is_some_and(|schedule| schedule.next_run_at_unix_seconds().is_some()));
+}
+
+#[test]
+fn due_schedule_claim_is_atomic_advances_next_run_and_freezes_snapshot() {
+    let database = database();
+    let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+    let persisted = store.create_profile(&profile()).expect("create profile");
+    let schedule = ScheduleDefinition::new_with_next_run_at(1, "UTC", true, Some(600))
+        .expect("schedule");
+    store
+        .update_schedule_at(
+            persisted.id(),
+            Some(schedule),
+            ApplicationMode::Advanced,
+            600,
+        )
+        .expect("save schedule");
+
+    let claim = store
+        .claim_due_schedule(persisted.id(), 601)
+        .expect("claim due schedule")
+        .expect("schedule should be due");
+    assert_eq!(claim.scheduled_at_unix_seconds(), 600);
+    assert_eq!(claim.snapshot().run_id(), claim.run_id());
+    assert_eq!(claim.snapshot().profile(), persisted.profile());
+    let loaded = store
+        .load_profile(persisted.id())
+        .expect("load profile")
+        .expect("profile exists");
+    assert_eq!(loaded.schedule().and_then(|s| s.next_run_at_unix_seconds()), Some(660));
+    assert!(store
+        .claim_due_schedule(persisted.id(), 601)
+        .expect("second claim")
+        .is_none());
+
+    let edited = persisted.profile().clone().with_mode(SyncMode::Mirror);
+    store
+        .update_profile(persisted.id(), &edited)
+        .expect("edit profile");
+    assert_eq!(claim.snapshot().profile().mode(), SyncMode::OneWay);
 }
 
 #[test]

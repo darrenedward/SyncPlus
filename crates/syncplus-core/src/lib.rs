@@ -26,6 +26,7 @@ mod ssh;
 mod ssh_workflow;
 mod storage;
 mod config_transfer;
+mod scheduler;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
@@ -115,6 +116,9 @@ pub use restore::{
     RestoreJournalEvent, RestoreOutcome,
 };
 pub use workflow::{RunWorkflow, WorkflowError};
+pub use scheduler::{
+    BackgroundScheduler, ScheduledRun, SchedulerClock, SchedulerError, SystemSchedulerClock,
+};
 pub use ssh_workflow::{
     SshMetadataProof, SshRecoveryBoundary, SshRunBackend, SshRunError, SshTransferBoundary,
     SshTransferEvidence, SshTransferRequest,

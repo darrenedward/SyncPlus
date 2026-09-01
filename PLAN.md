@@ -223,6 +223,12 @@ V1 supports one local peer and one SSH peer in either direction. SSH-to-SSH is n
 
 Scheduling is Advanced Mode only and disabled by default. A per-OS-user Background Scheduler can start profiles while the window is closed and uses the same core run workflow, normal permissions, credentials, prechecks, verification, and reports. It never installs a root service.
 
+The current core scheduler persists a validated interval, timezone, enabled
+state, and next-run timestamp. It claims due occurrences atomically with the
+frozen Run Snapshot, and the desktop's fixed `--background-scheduler` command
+provides the user-level launch point while leaving registration to the native
+packaging integration.
+
 Automatic schedules:
 
 - are Unattended;
