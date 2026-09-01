@@ -614,15 +614,23 @@ impl SyncPlusApp {
             .as_mut()
             .and_then(|review| review.conflicts.as_mut())
             .ok_or(UiValidationError::ConflictReviewNotReady)?;
-        if !conflicts
+        let kind = conflicts
             .review
             .entries()
             .iter()
-            .any(|entry| entry.relative_path() == relative_path)
-        {
+            .find(|entry| entry.relative_path() == relative_path)
+            .map(ConflictEntry::kind)
+            .ok_or_else(|| {
+                UiValidationError::Resolution(format!(
+                    "no reviewed conflict exists for {}",
+                    relative_path.display()
+                ))
+            })?;
+        if !resolution_options(kind).contains(&resolution) {
             return Err(UiValidationError::Resolution(format!(
-                "no reviewed conflict exists for {}",
-                relative_path.display()
+                "{} is not a safe decision for a {} conflict; preserve or defer it for review",
+                resolution_label(resolution),
+                conflict_kind_label(kind)
             )));
         }
         conflicts.decisions.insert(relative_path.clone(), resolution);
@@ -652,7 +660,7 @@ impl SyncPlusApp {
             self.status = "Fresh precheck found blockers; Resolution Run remains unavailable.".to_owned();
             return Err(UiValidationError::PrecheckBlocked);
         }
-        let (reviewed_profile, decisions) = {
+        let (reviewed_profile, reviewed_analysis, decisions) = {
             let review = self
                 .review
                 .as_ref()
@@ -683,10 +691,35 @@ impl SyncPlusApp {
                     )
                 })
                 .collect::<Vec<_>>();
-            (review.profile.clone(), decisions)
+            let reviewed_analysis = review
+                .analysis
+                .clone()
+                .ok_or(UiValidationError::ConflictReviewNotReady)?;
+            (review.profile.clone(), reviewed_analysis, decisions)
         };
 
-        let resolution_run = ResolutionRun::start(&reviewed_profile, decisions, None)
+        let fresh_analysis = FreshAnalysis::analyze(&reviewed_profile)
+            .map_err(|error| UiValidationError::Resolution(error.to_string()))?;
+        let changed_paths = reviewed_analysis
+            .revision()
+            .changed_paths(&fresh_analysis.revision());
+        if !changed_paths.is_empty() {
+            let message = format!(
+                "the reviewed conflict state changed for {changed_paths:?}; run Fresh Analysis again"
+            );
+            if let Some(review) = self.review.as_mut() {
+                if let Some(conflicts) = review.conflicts.as_mut() {
+                    conflicts.confirmed = false;
+                    conflicts.error = Some(message.clone());
+                }
+            }
+            self.status = format!("Resolution Run was not started: {message}");
+            return Err(UiValidationError::Resolution(message));
+        }
+        let plan = fresh_analysis
+            .resolve_conflicts(decisions)
+            .map_err(|error| UiValidationError::Resolution(error.to_string()))?;
+        let resolution_run = ResolutionRun::from_analysis(&fresh_analysis, plan, None)
             .map_err(|error| UiValidationError::Resolution(error.to_string()))?;
         if let Some(review) = self.review.as_mut() {
             if let Some(conflicts) = review.conflicts.as_mut() {
@@ -1223,7 +1256,7 @@ fn draw_conflict_review(ui: &mut egui::Ui, review: &mut PlanReviewState) -> Conf
                 ui.label(conflict_next_action(entry.kind()));
                 let previous = conflicts.decisions.get(&path).copied();
                 let mut selected = previous;
-                for resolution in ConflictResolution::all().iter().copied() {
+                for resolution in resolution_options(entry.kind()).iter().copied() {
                     ui.radio_value(
                         &mut selected,
                         Some(resolution),
@@ -1324,13 +1357,7 @@ fn draw_conflict_evidence(ui: &mut egui::Ui, evidence: &syncplus_core::ConflictE
         } else {
             ui.label("SHA-256 evidence: unavailable; do not assume the contents match.");
         }
-        if let Some(preview) = evidence.text_preview() {
-            let mut preview = preview.to_owned();
-            ui.label("Bounded text preview (read-only):");
-            ui.add(egui::TextEdit::multiline(&mut preview).desired_rows(4).interactive(false));
-        } else {
-            ui.label("No editable content is available in Conflict Review.");
-        }
+        ui.label("File contents are not shown. Conflict Review uses safe classification, metadata, and hash evidence only.");
     });
 }
 
@@ -1375,6 +1402,20 @@ fn resolution_label(resolution: ConflictResolution) -> &'static str {
         ConflictResolution::PreserveBoth => "Preserve both files",
         ConflictResolution::RenamePreserveForReview => "Rename/preserve for review",
         ConflictResolution::Defer => "Defer for later review",
+    }
+}
+
+const PRESERVATION_RESOLUTIONS: [ConflictResolution; 3] = [
+    ConflictResolution::PreserveBoth,
+    ConflictResolution::RenamePreserveForReview,
+    ConflictResolution::Defer,
+];
+
+fn resolution_options(kind: syncplus_core::ConflictKind) -> &'static [ConflictResolution] {
+    match kind {
+        syncplus_core::ConflictKind::SamePath => ConflictResolution::all(),
+        syncplus_core::ConflictKind::PossibleDuplicateOrRename
+        | syncplus_core::ConflictKind::DestinationCompatibility => &PRESERVATION_RESOLUTIONS,
     }
 }
 
@@ -1954,6 +1995,12 @@ mod tests {
 
         app.set_conflict_resolution("keep.txt", ConflictResolution::KeepPeerA)
             .expect("whole-file decision");
+        fs::write(source.join("keep.txt"), b"changed before resolution start").expect("change source");
+        assert!(app.start_resolution_run().is_err(), "stale resolution must block before start");
+
+        app.analyze_profile().expect("fresh mirror analysis should pass");
+        app.set_conflict_resolution("keep.txt", ConflictResolution::KeepPeerA)
+            .expect("whole-file decision after fresh analysis");
         app.start_resolution_run()
             .expect("selected decision starts a fresh Resolution Run");
         assert!(!app.resolution_is_confirmed());
