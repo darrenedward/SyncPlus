@@ -449,6 +449,10 @@ Clone Profile surfaces select their corresponding topic. Structured precheck
 diagnostics include the profile, peer, remote account when applicable, scope,
 reason, requirement, and next safe action without carrying secrets or file
 contents. Help and diagnostics describe safety gates; they never bypass them.
+Execution failures route to failure/recovery guidance rather than precheck
+guidance, and an SSH boundary without a remote probe result is reported as an
+unproven requirement with the affected account and scope; it cannot be
+confirmed or treated as complete.
 
 Examples of required messages:
 

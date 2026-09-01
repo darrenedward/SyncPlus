@@ -6,9 +6,10 @@ use syncplus_core::{
     ConflictDecision,
     ConflictEntry, ConflictEntryKey, ConflictResolution, ConflictReview, DeletionMethod,
     FreshAnalysis, LocalPrecheckProbe, MetadataRequirements, OneWaySource, PartialTransferPolicy,
-    Peer, PeerEndpoint, PersistedSyncProfile, PrecheckErrorKind, PrecheckResult, ResolutionRun,
-    RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle, RunPrecheck, RunReport,
-    RunReportStatus, SavedSecretReference, SecretStore, SecretStoreError,
+    Peer, PeerEndpoint, PersistedSyncProfile, PrecheckErrorKind, PrecheckResult,
+    RemotePrecheckRequest, ResolutionRun, RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId,
+    RunLifecycle, RunPrecheck, RunReport, RunReportStatus, SavedSecretReference, SecretStore,
+    SecretStoreError,
     SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
     SyncProfileId, ThemePreference,
 };
@@ -503,6 +504,7 @@ pub enum HelpTopic {
     ProgressAndCancellation,
     Diagnostics,
     PrecheckBlockers,
+    ExecutionFailures,
     CloneProfile,
 }
 
@@ -540,6 +542,7 @@ const HELP_TOPICS: &[HelpTopic] = &[
     HelpTopic::ProgressAndCancellation,
     HelpTopic::Diagnostics,
     HelpTopic::PrecheckBlockers,
+    HelpTopic::ExecutionFailures,
     HelpTopic::CloneProfile,
 ];
 
@@ -628,14 +631,14 @@ pub fn help_entry(topic: HelpTopic) -> HelpEntry {
         },
         HelpTopic::Recovery => HelpEntry {
             topic,
-            title: "Recovery and Restore",
-            what: "Recovery preserves source or destination state after interruption, failed verification, disconnect, crash, or an ambiguous filesystem boundary.",
+            title: "Recovery Review",
+            what: "Recovery Review preserves source or destination state after interruption, failed verification, disconnect, crash, or an ambiguous filesystem boundary.",
             why: "SQLite records evidence but cannot make a database commit and filesystem mutation one atomic transaction.",
             how: "Open the Run Report, perform Fresh Analysis where the workflow provides it, and inspect Recovery Review and provenance before taking any explicit metadata action.",
             when: "Use it whenever a run is Interrupted, Recovery Review, pending review, or a recovery item needs restoration.",
-            consequences: "Uncertainty keeps the run open and preserves user files; Restore refuses to overwrite newer or different destination content automatically.",
-            limitations: "Recovery evidence may prove only what was observed. SyncPlus never guesses completion or repeats uncertain deletion.",
-            next_action: "Read the preserved-state evidence, keep unresolved metadata available for review, and do not treat an interruption as completion.",
+            consequences: "Uncertainty keeps the run open and preserves user files; no uncertain deletion or replacement is treated as complete.",
+            limitations: "Recovery evidence may prove only what was observed. SyncPlus never guesses completion or repeats uncertain deletion, and this surface does not provide an automatic recovery action.",
+            next_action: "Read the preserved-state evidence, keep unresolved metadata available for review, and use only the explicit metadata action currently shown when appropriate.",
         },
         HelpTopic::RunReports => HelpEntry {
             topic,
@@ -679,7 +682,7 @@ pub fn help_entry(topic: HelpTopic) -> HelpEntry {
             when: "Use it during a long run or whenever a disconnect, drive removal, process stop, or cancellation occurs.",
             consequences: "Cancellation preserves the source and records a Cancelled Action; an unsettled boundary may require Recovery Review.",
             limitations: "Progress counts are not proof of completion. Only verified journal evidence and Completion Reconciliation can settle a run.",
-            next_action: "Read the latest durable phase and follow the report's resume or Recovery Review action instead of retrying blindly.",
+            next_action: "Read the latest durable phase and open Recovery Review instead of retrying an uncertain action blindly.",
         },
         HelpTopic::Diagnostics => HelpEntry {
             topic,
@@ -702,6 +705,17 @@ pub fn help_entry(topic: HelpTopic) -> HelpEntry {
             consequences: "Confirmation remains unavailable and affected source data stays preserved until the blocker or review item is resolved.",
             limitations: "A blocker is not permission to bypass verification, host-identity review, confirmation, or Recovery Review. Progress or transfer counts do not override it.",
             next_action: "Follow the displayed remediation, re-run the fresh precheck and analysis, or leave the run open for Recovery Review when the state is uncertain.",
+        },
+        HelpTopic::ExecutionFailures => HelpEntry {
+            topic,
+            title: "Execution failures and verification review",
+            what: "An execution failure records the action boundary, reason, and preserved state when a transfer, replacement, verification, process, or recovery step does not settle safely.",
+            why: "A failed action must remain distinguishable from a completed action so SyncPlus never claims that an unverified destination or removal is safe.",
+            how: "Inspect the Run Report, the affected peer and scope, the durable phase, and any reconciliation or recovery evidence before deciding what to do next.",
+            when: "Use this guidance for failed transfers, verification mismatches, disconnects, unavailable peers, process errors, and actions that remain unresolved after cancellation.",
+            consequences: "The affected source is preserved whenever proof is incomplete, and the run remains open for review rather than being silently retried or cleared.",
+            limitations: "Progress, rsync exit status, transfer counts, size, mtime, or a single hash do not prove Safe Delete or completion. Uncertain filesystem boundaries require Recovery Review.",
+            next_action: "Keep the affected item preserved, inspect its evidence and exact scope, then perform Fresh Analysis or the explicit review action supported by the report.",
         },
         HelpTopic::CloneProfile => HelpEntry {
             topic,
@@ -743,7 +757,8 @@ fn help_topic_for_surface(surface: HelpSurface) -> HelpTopic {
 fn help_topic_for_report_status(status: RunReportStatus) -> HelpTopic {
     match status {
         RunReportStatus::InProgress => HelpTopic::ProgressAndCancellation,
-        RunReportStatus::Failed | RunReportStatus::Blocked => HelpTopic::PrecheckBlockers,
+        RunReportStatus::Failed => HelpTopic::ExecutionFailures,
+        RunReportStatus::Blocked => HelpTopic::PrecheckBlockers,
         RunReportStatus::Cancelled
         | RunReportStatus::Interrupted
         | RunReportStatus::RecoveryReview
@@ -751,6 +766,42 @@ fn help_topic_for_report_status(status: RunReportStatus) -> HelpTopic {
         RunReportStatus::Completed | RunReportStatus::ReviewCleared => {
             help_topic_for_surface(HelpSurface::Report)
         }
+    }
+}
+
+fn help_topic_for_error(error: &str) -> HelpTopic {
+    let error = error.to_ascii_lowercase();
+    if error.contains("ssh") {
+        HelpTopic::SshAuthentication
+    } else if error.contains("resolution") || error.contains("conflict") {
+        HelpTopic::ConflictReview
+    } else if error.contains("stale") || error.contains("changed") || error.contains("analysis") {
+        HelpTopic::PlanAndConfirmation
+    } else if error.contains("precheck") || error.contains("blocker") {
+        HelpTopic::PrecheckBlockers
+    } else {
+        HelpTopic::Diagnostics
+    }
+}
+
+fn next_action_for_help_topic(topic: HelpTopic) -> &'static str {
+    match topic {
+        HelpTopic::ConflictReview => {
+            "Review every whole-file conflict decision and start a fresh Resolution Run."
+        }
+        HelpTopic::PlanAndConfirmation => {
+            "Run Fresh Analysis again, inspect the exact scope, and confirm only after it is current."
+        }
+        HelpTopic::SshAuthentication => {
+            "Review the selected SSH method, host identity, account, and remote capabilities before confirmation."
+        }
+        HelpTopic::PrecheckBlockers => {
+            "Follow the displayed remediation and run the fresh precheck again; do not bypass the blocker."
+        }
+        HelpTopic::ExecutionFailures | HelpTopic::Recovery => {
+            "Keep the affected state preserved and inspect the Run Report and Recovery Review evidence."
+        }
+        _ => "Read the linked Help guidance and follow its safe next action.",
     }
 }
 
@@ -781,20 +832,131 @@ fn peer_diagnostic_label(peer: &Peer) -> String {
     }
 }
 
-fn format_precheck_diagnostic(profile: &SyncProfile, blocker: &syncplus_core::PrecheckBlocker) -> String {
-    let peer = peer_for_path(profile, blocker.path());
+fn diagnostic_peer<'a>(profile: &'a SyncProfile, path: Option<&std::path::Path>) -> &'a Peer {
+    if let Some(path) = path {
+        return peer_for_path(profile, path);
+    }
+    [profile.peer_a(), profile.peer_b()]
+        .into_iter()
+        .find(|peer| peer.is_ssh())
+        .unwrap_or_else(|| mapped_peers(profile).0)
+}
+
+fn profile_scope(profile: &SyncProfile) -> String {
+    let (source, destination) = mapped_peers(profile);
+    if profile.mode() == SyncMode::OneWay {
+        format!(
+            "{} -> {}",
+            source.root().display(),
+            destination.root().display()
+        )
+    } else {
+        format!(
+            "Peer A {} <-> Peer B {}",
+            profile.peer_a().root().display(),
+            profile.peer_b().root().display()
+        )
+    }
+}
+
+fn format_profile_diagnostic(
+    profile: &SyncProfile,
+    path: Option<&std::path::Path>,
+    reason: impl AsRef<str>,
+    next_action: impl AsRef<str>,
+) -> String {
+    let peer = diagnostic_peer(profile, path);
     let account = peer
         .ssh_peer()
         .map(|ssh| single_line(ssh.username()))
         .unwrap_or_else(|| "not applicable (local peer)".to_owned());
+    let scope = path.map_or_else(|| profile_scope(profile), |path| path.display().to_string());
     format!(
         "Profile: {} | Peer: {} | Account: {} | Scope: {} | Reason: {} | Next action: {}",
         single_line(profile.name()),
         peer_diagnostic_label(peer),
         account,
-        single_line(blocker.path().display().to_string()),
-        single_line(blocker.reason()),
-        single_line(blocker.remediation())
+        single_line(scope),
+        single_line(reason),
+        single_line(next_action)
+    )
+}
+
+fn format_precheck_diagnostic(profile: &SyncProfile, blocker: &syncplus_core::PrecheckBlocker) -> String {
+    format_profile_diagnostic(
+        profile,
+        Some(blocker.path()),
+        format!(
+            "{} (requirement: {})",
+            blocker.reason(),
+            blocker.requirement()
+        ),
+        blocker.remediation(),
+    )
+}
+
+fn format_precheck_error(profile: &SyncProfile, error: &PrecheckErrorKind) -> String {
+    match error {
+        PrecheckErrorKind::InvalidSpecification(error) => format_profile_diagnostic(
+            profile,
+            None,
+            format!("invalid profile: {error}"),
+            "Correct the typed profile fields and run Fresh Analysis again.",
+        ),
+        PrecheckErrorKind::Probe(error) => format_profile_diagnostic(
+            profile,
+            Some(error.path()),
+            format!("{}: {}", error.operation(), error.detail()),
+            "Correct the named precheck requirement and run Fresh Analysis again.",
+        ),
+    }
+}
+
+fn format_ssh_precheck_boundary_diagnostic(profile: &SyncProfile) -> String {
+    let (remote, request) = match RemotePrecheckRequest::from_profile(profile) {
+        Ok(value) => value,
+        Err(error) => {
+            return format_profile_diagnostic(
+                profile,
+                None,
+                format!("SSH precheck profile could not be derived: {error}"),
+                "Correct the typed SSH profile fields and run Fresh Analysis again.",
+            )
+        }
+    };
+    let access = request.access();
+    format_profile_diagnostic(
+        profile,
+        Some(remote.remote_path()),
+        format!(
+            "SSH remote precheck is not available at this desktop workflow boundary; host identity, the selected credential, account access, remote rsync, SHA-256, and recovery capability are not proven (requested read={}, write={}, remove={}, recovery={})",
+            access.read(),
+            access.write(),
+            access.remove(),
+            request.require_recovery()
+        ),
+        "Keep execution blocked and source data preserved until the typed SSH remote precheck returns a reviewed result for this peer.",
+    )
+}
+
+fn format_warning_diagnostic(profile: &SyncProfile, warning: &syncplus_core::PathRiskWarning) -> String {
+    format_profile_diagnostic(
+        profile,
+        Some(warning.source()),
+        warning.explanation(),
+        "Type the exact displayed source path as stronger confirmation, or disable Safe Delete.",
+    )
+}
+
+fn format_naming_conflict_diagnostic(
+    profile: &SyncProfile,
+    conflict: &syncplus_core::NamingConflict,
+) -> String {
+    format_profile_diagnostic(
+        profile,
+        Some(conflict.destination_path()),
+        format!("destination naming rule {:?} prevents a safe mapping", conflict.rule()),
+        "Rename or exclude the item, or choose compatible destination storage, then run Fresh Analysis again.",
     )
 }
 
@@ -1510,24 +1672,10 @@ impl SyncPlusApp {
 
     fn fresh_local_precheck(profile: &SyncProfile) -> Result<PrecheckResult, String> {
         if profile.peer_a().is_ssh() || profile.peer_b().is_ssh() {
-            let peer = [profile.peer_a(), profile.peer_b()]
-                .into_iter()
-                .find(|peer| peer.is_ssh())
-                .unwrap_or_else(|| profile.peer_a());
-            let account = peer
-                .ssh_peer()
-                .map(|ssh| single_line(ssh.username()))
-                .unwrap_or_else(|| "not available".to_owned());
-            return Err(format!(
-                "Profile: {} | Peer: {} | Account: {} | Scope: {} | Reason: typed SSH host-identity, credential, remote capability, and recovery precheck is required | Next action: run the SSH workflow precheck and review its result before confirmation.",
-                single_line(profile.name()),
-                peer_diagnostic_label(peer),
-                account,
-                single_line(peer.root().display().to_string())
-            ));
+            return Err(format_ssh_precheck_boundary_diagnostic(profile));
         }
         RunPrecheck::check(profile, &LocalPrecheckProbe::default())
-            .map_err(|error| format_precheck_error(&error))
+            .map_err(|error| format_precheck_error(profile, &error))
     }
 
     fn store_review_failure(
@@ -1904,13 +2052,19 @@ impl SyncPlusApp {
             if let Some(error) = &review.error {
                 ui.group(|ui| {
                     ui.label("Review status: not ready");
+                    let topic = help_topic_for_error(error);
                     draw_contextual_help_link(
                         ui,
                         "Blocked-state guidance",
-                        HelpTopic::PrecheckBlockers,
+                        topic,
                         &mut self.help_topic,
                     );
-                    ui.label(error);
+                    ui.label(format_profile_diagnostic(
+                        &review.profile,
+                        None,
+                        error,
+                        next_action_for_help_topic(topic),
+                    ));
                 });
             }
 
@@ -1933,12 +2087,15 @@ impl SyncPlusApp {
                         ui.label(format!("Requirement: {}", blocker.requirement()));
                     }
                     for warning in precheck.warnings() {
-                        ui.label(format!("WARNING: {}", warning.explanation()));
+                        ui.label(format!(
+                            "WARNING: {}",
+                            format_warning_diagnostic(&review.profile, warning)
+                        ));
                     }
                     if precheck.blockers().is_empty() && precheck.warnings().is_empty() {
                         ui.label("No precheck warnings or blockers were reported.");
                     }
-                    draw_compatibility_review(ui, precheck);
+                    draw_compatibility_review(ui, &review.profile, precheck);
                 });
             }
 
@@ -2253,7 +2410,21 @@ fn draw_conflict_review(
             .as_ref()
             .is_some_and(PrecheckResult::can_execute);
         if let Some(error) = &conflicts.error {
-            ui.label(format!("Resolution status: blocked — {error}"));
+            draw_contextual_help_link(
+                ui,
+                "Resolution failure guidance",
+                HelpTopic::ConflictReview,
+                help_topic,
+            );
+            ui.label(format!(
+                "Resolution status: blocked — {}",
+                format_profile_diagnostic(
+                    &review.profile,
+                    None,
+                    error,
+                    "Review the whole-file conflict decisions, run Fresh Analysis again, and start a fresh Resolution Run.",
+                )
+            ));
         }
         if let Some(resolution_run) = &conflicts.resolution_run {
             ui.separator();
@@ -2321,7 +2492,11 @@ fn draw_conflict_evidence(ui: &mut egui::Ui, evidence: &syncplus_core::ConflictE
     });
 }
 
-fn draw_compatibility_review(ui: &mut egui::Ui, precheck: &PrecheckResult) {
+fn draw_compatibility_review(
+    ui: &mut egui::Ui,
+    profile: &SyncProfile,
+    precheck: &PrecheckResult,
+) {
     if precheck.naming_conflicts().is_empty() {
         return;
     }
@@ -2337,10 +2512,7 @@ fn draw_compatibility_review(ui: &mut egui::Ui, precheck: &PrecheckResult) {
             if let Some(related_path) = conflict.related_path() {
                 ui.label(format!("Conflicting destination path: {}", related_path.display()));
             }
-            ui.label(format!(
-                "Rule: {:?}. Next action: rename or exclude the item, or choose compatible destination storage; retry Fresh Analysis afterward.",
-                conflict.rule()
-            ));
+            ui.label(format_naming_conflict_diagnostic(profile, conflict));
         }
     });
 }
@@ -2653,13 +2825,6 @@ fn map_storage_error(error: syncplus_core::StorageError) -> UiValidationError {
     }
 }
 
-fn format_precheck_error(error: &PrecheckErrorKind) -> String {
-    match error {
-        PrecheckErrorKind::InvalidSpecification(error) => format!("invalid profile: {error}"),
-        PrecheckErrorKind::Probe(error) => format!("precheck probe failed: {error}"),
-    }
-}
-
 impl eframe::App for SyncPlusApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.apply_theme(ui.ctx());
@@ -2754,7 +2919,16 @@ fn draw_run_report_detail(
             );
             ui.label(run_recovery_message(report.status()));
             if let Some(reason) = report.blocked_reason() {
-                ui.label(format!("Blocker: {reason}"));
+                let topic = help_topic_for_report_status(report.status());
+                ui.label(format!(
+                    "Blocker: {}",
+                    format_profile_diagnostic(
+                        report.snapshot().profile(),
+                        None,
+                        reason,
+                        next_action_for_help_topic(topic),
+                    )
+                ));
             }
             if let Some(reconciliation) = report.reconciliation() {
                 if reconciliation.findings().is_empty() {
@@ -2762,9 +2936,17 @@ fn draw_run_report_detail(
                 } else {
                     for finding in reconciliation.findings() {
                         ui.label(format!(
-                            "Reconciliation finding: {} — {}",
-                            finding.relative_path().display(),
-                            finding.reason()
+                            "Reconciliation finding: {}",
+                            format_profile_diagnostic(
+                                report.snapshot().profile(),
+                                None,
+                                format!(
+                                    "{}: {}",
+                                    finding.relative_path().display(),
+                                    finding.reason()
+                                ),
+                                "Keep the report open, inspect the current peer state, and run Fresh Analysis before any explicit review action.",
+                            )
                         ));
                     }
                 }
@@ -2774,9 +2956,17 @@ fn draw_run_report_detail(
                     || item.journal().recovery_evidence().is_some()
             }) {
                 ui.label(format!(
-                    "Review item: {} — {}",
-                    item.relative_path().display(),
-                    action_outcome_label(item.outcome())
+                    "Review item: {}",
+                    format_profile_diagnostic(
+                        report.snapshot().profile(),
+                        Some(item.source_path()),
+                        format!(
+                            "{}: {}",
+                            item.relative_path().display(),
+                            action_outcome_label(item.outcome())
+                        ),
+                        "Inspect the durable action and preserved-state evidence before taking an explicit review action.",
+                    )
                 ));
                 if let Some(evidence) = item.journal().recovery_evidence() {
                     ui.label(format!(
@@ -2915,11 +3105,11 @@ fn action_outcome_label(outcome: &ActionOutcome) -> String {
 
 fn run_recovery_message(status: RunReportStatus) -> &'static str {
     match status {
-        RunReportStatus::Cancelled => "Cancellation was recorded. Unfinished work remains open; affected source items remain preserved when safety cannot prove removal. Inspect the durable action evidence before resuming or discarding it.",
+        RunReportStatus::Cancelled => "Cancellation was recorded. Unfinished work remains open; affected source items remain preserved when safety cannot prove removal. Inspect the durable action evidence before taking an explicit review action.",
         RunReportStatus::Interrupted => "The run was interrupted by a crash, disconnect, or process stop. The last durable boundary is shown below and unresolved work requires Recovery Review.",
         RunReportStatus::RecoveryReview => "Filesystem state crossed an uncertain boundary. The recorded source, destination, and recovery observations must be reviewed before this run can be cleared.",
         RunReportStatus::CompletedWithReviewRequired => "Actions settled, but completion is withheld because unexplained, failed, unavailable, or otherwise unverified items remain.",
-        RunReportStatus::Failed => "At least one action failed. The report remains open so the failure and preserved state can be reviewed.",
+        RunReportStatus::Failed => "At least one action failed. The report remains open so the failure, verification state, and preserved data can be reviewed.",
         RunReportStatus::Blocked => "The run did not start because a safety precheck or scope blocker prevented mutation.",
         _ => "This run requires review before it can be treated as cleared.",
     }
@@ -3609,6 +3799,7 @@ mod tests {
             HelpTopic::Recovery,
             HelpTopic::RunReports,
             HelpTopic::DestructiveActions,
+            HelpTopic::ExecutionFailures,
         ];
 
         for topic in required_topics {
@@ -3638,6 +3829,30 @@ mod tests {
         }
 
         assert!(help_topics().len() >= required_topics.len());
+    }
+
+    #[test]
+    fn report_statuses_select_the_matching_help_guidance() {
+        assert_eq!(
+            help_topic_for_report_status(RunReportStatus::InProgress),
+            HelpTopic::ProgressAndCancellation
+        );
+        assert_eq!(
+            help_topic_for_report_status(RunReportStatus::Blocked),
+            HelpTopic::PrecheckBlockers
+        );
+        assert_eq!(
+            help_topic_for_report_status(RunReportStatus::Failed),
+            HelpTopic::ExecutionFailures
+        );
+        assert_eq!(
+            help_topic_for_report_status(RunReportStatus::RecoveryReview),
+            HelpTopic::Recovery
+        );
+        assert_eq!(
+            help_topic_for_report_status(RunReportStatus::Completed),
+            HelpTopic::RunReports
+        );
     }
 
     #[test]

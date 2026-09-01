@@ -249,6 +249,9 @@ the Sync Profile, peer, remote account when applicable, exact scope, safety
 requirement, reason, and remediation. These links and diagnostics explain a
 blocked or review-required state; they never authorize bypassing prechecks,
 verification, host-identity review, confirmation, or Recovery Review.
+When a configured SSH peer reaches a desktop boundary without a remote probe
+result, the diagnostic says that the required host, credential, account,
+capability, and recovery evidence is not proven and keeps execution blocked.
 
 **Simple Mode**:
 The default SyncPlus experience showing the common source, destination, mode, exclusions, safety options, and run actions without exposing specialist filesystem or transport controls.
