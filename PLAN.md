@@ -313,9 +313,10 @@ SyncPlus/
 
 The core must not depend on egui. The UI and Background Scheduler both call the same core run workflow. All process execution uses `std::process::Command` with typed argument vectors and controlled environment variables; user input is never concatenated into a shell command. The command preview is generated from the same validated Process Specification used for execution.
 
-The initial native desktop shell and typed Sync Profile editor are implemented in
-`crates/syncplus`; the remaining plan, conflict review, reporting, recovery, and
-scheduler panels are delivered by their respective child issues.
+The initial native desktop shell, typed Sync Profile editor, and the read-only
+Fresh Analysis/precheck/Execution Confirmation review boundary are implemented
+in `crates/syncplus`; conflict review, reporting, recovery, and scheduler panels
+are delivered by their respective child issues.
 
 Use SQLite through a synchronous Rust driver such as `rusqlite`; asynchronous runtime infrastructure is not required for the two-pipe rsync workflow. Use transactions, schema migrations, foreign keys, integrity checks, and crash-safe journal boundaries. Database transactions do not make filesystem operations atomic, so Recovery Review remains mandatory.
 

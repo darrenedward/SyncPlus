@@ -1,10 +1,13 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use eframe::egui;
 use syncplus_core::{
-    ApplicationMode, ApplicationSettings, DeletionMethod, OneWaySource, Peer, PeerEndpoint,
-    PersistedSyncProfile, RunEvidenceStore, SavedSecretReference, SshAuthentication, SyncMode,
-    SecretStore, SecretStoreError, SyncOptions, SyncProfile, SyncProfileId, ThemePreference,
+    AnalysisOutcome, ApplicationMode, ApplicationSettings, DeletionMethod,
+    FreshAnalysis, LocalPrecheckProbe, MetadataRequirements, OneWaySource, PartialTransferPolicy,
+    Peer, PeerEndpoint, PersistedSyncProfile,
+    PrecheckErrorKind, PrecheckResult, RetryPolicy, RunEvidenceStore, SavedSecretReference,
+    SpecialistMetadataRequirements, SshAuthentication, SyncMode, SecretStore, SecretStoreError,
+    SyncOptions, SyncProfile, SyncProfileId, ThemePreference, RunPrecheck,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +34,13 @@ pub enum UiValidationError {
     MissingIdentity,
     InvalidSavedSecretReference,
     SavedSecretUnavailable,
+    InvalidRetryAttempts,
+    InvalidRetryDelay,
+    PrecheckBlocked,
+    ReviewNotReady,
+    StrongerConfirmationRequired,
+    UnresolvedItems,
+    Analysis(String),
     Core(String),
 }
 
@@ -51,6 +61,25 @@ impl std::fmt::Display for UiValidationError {
             Self::SavedSecretUnavailable => {
                 formatter.write_str("The saved SSH credential is unavailable in the desktop keyring.")
             }
+            Self::InvalidRetryAttempts => {
+                formatter.write_str("Retry attempts must be a whole number from 1 to 10.")
+            }
+            Self::InvalidRetryDelay => {
+                formatter.write_str("Retry delay must be between 0 and 3,600,000 milliseconds.")
+            }
+            Self::PrecheckBlocked => {
+                formatter.write_str("The non-mutating precheck found blockers; execution is not available.")
+            }
+            Self::ReviewNotReady => {
+                formatter.write_str("Run Fresh Analysis before requesting Execution Confirmation.")
+            }
+            Self::StrongerConfirmationRequired => {
+                formatter.write_str("Type the exact high-risk source path before confirming this review.")
+            }
+            Self::UnresolvedItems => {
+                formatter.write_str("Unresolved or unsupported items must be resolved before confirmation.")
+            }
+            Self::Analysis(message) => write!(formatter, "Fresh Analysis could not be completed: {message}"),
             Self::Core(message) => formatter.write_str(message),
         }
     }
@@ -58,7 +87,7 @@ impl std::fmt::Display for UiValidationError {
 
 impl std::error::Error for UiValidationError {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct EndpointForm {
     name: String,
     kind: EndpointKind,
@@ -211,7 +240,7 @@ impl EndpointForm {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ProfileForm {
     id: Option<SyncProfileId>,
     name: String,
@@ -222,6 +251,13 @@ struct ProfileForm {
     safe_delete: bool,
     destination_cleanup: bool,
     exclusions: String,
+    timestamps: bool,
+    ownership: bool,
+    access_control_lists: bool,
+    extended_attributes: bool,
+    partial_transfer_policy: PartialTransferPolicy,
+    retry_attempts: String,
+    retry_delay_millis: String,
 }
 
 impl Default for ProfileForm {
@@ -236,6 +272,13 @@ impl Default for ProfileForm {
             safe_delete: false,
             destination_cleanup: false,
             exclusions: String::new(),
+            timestamps: false,
+            ownership: false,
+            access_control_lists: false,
+            extended_attributes: false,
+            partial_transfer_policy: PartialTransferPolicy::Cleanup,
+            retry_attempts: RetryPolicy::default().max_attempts().to_string(),
+            retry_delay_millis: RetryPolicy::default().initial_delay().as_millis().to_string(),
         }
     }
 }
@@ -243,6 +286,9 @@ impl Default for ProfileForm {
 impl ProfileForm {
     fn from_persisted(profile: &PersistedSyncProfile) -> Self {
         let value = profile.profile();
+        let options = value.options();
+        let metadata = options.metadata;
+        let specialist = metadata.specialist_metadata();
         Self {
             id: Some(profile.id()),
             name: value.name().to_owned(),
@@ -250,9 +296,16 @@ impl ProfileForm {
             peer_b: EndpointForm::from_peer(value.peer_b()),
             mode: value.mode(),
             source: value.source(),
-            safe_delete: value.options().safe_delete,
-            destination_cleanup: value.options().destination_cleanup,
+            safe_delete: options.safe_delete,
+            destination_cleanup: options.destination_cleanup,
             exclusions: value.exclusions().join("\n"),
+            timestamps: metadata.timestamps(),
+            ownership: specialist.ownership(),
+            access_control_lists: specialist.access_control_lists(),
+            extended_attributes: specialist.extended_attributes(),
+            partial_transfer_policy: options.partial_transfer_policy,
+            retry_attempts: options.retry_policy.max_attempts().to_string(),
+            retry_delay_millis: options.retry_policy.initial_delay().as_millis().to_string(),
         }
     }
 
@@ -262,10 +315,32 @@ impl ProfileForm {
         }
         let peer_a = self.peer_a.build("Source")?;
         let peer_b = self.peer_b.build("Destination")?;
+        let retry_attempts = self
+            .retry_attempts
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|attempts| (1..=10).contains(attempts))
+            .ok_or(UiValidationError::InvalidRetryAttempts)?;
+        let retry_delay_millis = self
+            .retry_delay_millis
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|delay| *delay <= 3_600_000)
+            .ok_or(UiValidationError::InvalidRetryDelay)?;
         let mut options = SyncOptions::default();
         options.safe_delete = self.safe_delete;
         options.destination_cleanup = self.destination_cleanup;
         options.deletion_method = self.safe_delete.then_some(DeletionMethod::Trash);
+        options.metadata = MetadataRequirements::new(true, true, true, self.timestamps)
+            .with_specialist_metadata(SpecialistMetadataRequirements::new(
+                self.ownership,
+                self.access_control_lists,
+                self.extended_attributes,
+            ));
+        options.partial_transfer_policy = self.partial_transfer_policy;
+        options.retry_policy = RetryPolicy::new(retry_attempts, Duration::from_millis(retry_delay_millis));
         let exclusions = self
             .exclusions
             .lines()
@@ -281,6 +356,16 @@ impl ProfileForm {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PlanReviewState {
+    profile: SyncProfile,
+    precheck: Option<PrecheckResult>,
+    analysis: Option<FreshAnalysis>,
+    error: Option<String>,
+    stronger_confirmation_path: String,
+    confirmed: bool,
+}
+
 pub struct SyncPlusApp {
     store: RunEvidenceStore,
     secret_store: Box<dyn SecretStore>,
@@ -288,6 +373,7 @@ pub struct SyncPlusApp {
     profiles: Vec<PersistedSyncProfile>,
     form: ProfileForm,
     status: String,
+    review: Option<PlanReviewState>,
 }
 
 impl SyncPlusApp {
@@ -312,6 +398,7 @@ impl SyncPlusApp {
             profiles,
             form: ProfileForm::default(),
             status: "Ready. Create a Sync Profile to begin.".to_owned(),
+            review: None,
         })
     }
 
@@ -333,6 +420,7 @@ impl SyncPlusApp {
 
     pub fn start_new_profile(&mut self) {
         self.form = ProfileForm::default();
+        self.review = None;
         self.status = "New profile: One-Way Sync is selected and destructive actions are off.".to_owned();
     }
 
@@ -372,6 +460,7 @@ impl SyncPlusApp {
         };
         let id = persisted.id();
         self.form = ProfileForm::from_persisted(&persisted);
+        self.review = None;
         self.profiles = self
             .store
             .list_profiles()
@@ -401,9 +490,161 @@ impl SyncPlusApp {
         Ok(profile)
     }
 
+    pub fn analyze_profile(&mut self) -> Result<(), UiValidationError> {
+        let profile = self.validated_profile()?;
+        let precheck = match Self::fresh_local_precheck(&profile) {
+            Ok(result) => result,
+            Err(message) => {
+                self.store_review_failure(profile, None, message.clone());
+                self.status = format!("Fresh precheck could not complete: {message}");
+                return Err(UiValidationError::Core(message));
+            }
+        };
+
+        if !precheck.can_execute() {
+            self.review = Some(PlanReviewState {
+                profile,
+                precheck: Some(precheck),
+                analysis: None,
+                error: None,
+                stronger_confirmation_path: String::new(),
+                confirmed: false,
+            });
+            self.status = "Fresh precheck found blockers; execution is not available.".to_owned();
+            return Err(UiValidationError::PrecheckBlocked);
+        }
+
+        let analysis = match FreshAnalysis::analyze(&profile) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                let message = error.to_string();
+                self.store_review_failure(profile, Some(precheck), message.clone());
+                self.status = format!("Fresh Analysis could not complete: {message}");
+                return Err(UiValidationError::Analysis(message));
+            }
+        };
+
+        self.review = Some(PlanReviewState {
+            profile,
+            precheck: Some(precheck),
+            analysis: Some(analysis),
+            error: None,
+            stronger_confirmation_path: String::new(),
+            confirmed: false,
+        });
+        self.status = "Fresh Analysis ready. Review the plan and consequences before confirmation.".to_owned();
+        Ok(())
+    }
+
+    pub fn confirm_review(&mut self) -> Result<(), UiValidationError> {
+        if self.review.is_none() {
+            return Err(UiValidationError::ReviewNotReady);
+        }
+
+        let current_profile = self.validated_profile()?;
+        let precheck = match Self::fresh_local_precheck(&current_profile) {
+            Ok(result) => result,
+            Err(message) => {
+                if let Some(review) = self.review.as_mut() {
+                    review.precheck = None;
+                    review.confirmed = false;
+                    review.error = Some(message.clone());
+                }
+                self.status = format!("Fresh precheck could not complete: {message}");
+                return Err(UiValidationError::Core(message));
+            }
+        };
+
+        if let Some(review) = self.review.as_mut() {
+            review.precheck = Some(precheck.clone());
+            review.confirmed = false;
+            review.error = None;
+        }
+        if !precheck.can_execute() {
+            self.status = "Fresh precheck found blockers; execution remains unavailable.".to_owned();
+            return Err(UiValidationError::PrecheckBlocked);
+        }
+
+        let unresolved = self
+            .review
+            .as_ref()
+            .and_then(|review| review.analysis.as_ref())
+            .is_some_and(analysis_has_unresolved_items);
+        if unresolved {
+            self.status = "Unresolved or unsupported items remain; execution is unavailable.".to_owned();
+            return Err(UiValidationError::UnresolvedItems);
+        }
+
+        let stronger_confirmation = self
+            .review
+            .as_ref()
+            .is_some_and(|review| stronger_confirmation_satisfied(review, &precheck));
+        if !precheck.is_confirmation_sufficient(stronger_confirmation) {
+            self.status = "The high-risk precheck warning requires the exact source path before confirmation.".to_owned();
+            return Err(UiValidationError::StrongerConfirmationRequired);
+        }
+
+        let confirmation = self
+            .review
+            .as_ref()
+            .and_then(|review| review.analysis.as_ref())
+            .ok_or(UiValidationError::ReviewNotReady)
+            .and_then(|analysis| {
+                analysis
+                    .confirm(&current_profile)
+                    .map(|_| ())
+                    .map_err(|error| UiValidationError::Analysis(error.to_string()))
+            });
+        if let Err(error) = confirmation {
+            if let Some(review) = self.review.as_mut() {
+                review.confirmed = false;
+                review.error = Some(error.to_string());
+            }
+            self.status = format!("Execution Confirmation is no longer valid: {error}");
+            return Err(error);
+        }
+
+        if let Some(review) = self.review.as_mut() {
+            review.confirmed = true;
+        }
+        self.status = "Execution Confirmation recorded for this reviewed scope; no filesystem mutation has started.".to_owned();
+        Ok(())
+    }
+
+    fn fresh_local_precheck(profile: &SyncProfile) -> Result<PrecheckResult, String> {
+        if profile.peer_a().is_ssh() || profile.peer_b().is_ssh() {
+            return Err(
+                "SSH review is blocked until the typed SSH host-identity, credential, remote capability, and recovery precheck is supplied by the SSH workflow.".to_owned(),
+            );
+        }
+        RunPrecheck::check(profile, &LocalPrecheckProbe::default())
+            .map_err(|error| format_precheck_error(&error))
+    }
+
+    fn store_review_failure(
+        &mut self,
+        profile: SyncProfile,
+        precheck: Option<PrecheckResult>,
+        message: String,
+    ) {
+        self.review = Some(PlanReviewState {
+            profile,
+            precheck,
+            analysis: None,
+            error: Some(message),
+            stronger_confirmation_path: String::new(),
+            confirmed: false,
+        });
+    }
+
+    fn clear_review(&mut self) {
+        self.review = None;
+    }
+
     fn select_profile(&mut self, id: SyncProfileId) {
         if let Some(profile) = self.profiles.iter().find(|profile| profile.id() == id) {
             self.form = ProfileForm::from_persisted(profile);
+            self.review = None;
             self.status = format!("Editing {}. Changes apply to future runs.", profile.profile().name());
         }
     }
@@ -471,6 +712,7 @@ impl SyncPlusApp {
     }
 
     fn draw_profile_form(&mut self, ui: &mut egui::Ui) {
+        let form_before_draw = self.form.clone();
         ui.heading("Sync Profile");
         ui.label("Define named endpoints and safety settings. SyncPlus never accepts arbitrary rsync arguments.");
         ui.horizontal(|ui| {
@@ -501,6 +743,34 @@ impl SyncPlusApp {
             ui.collapsing("Advanced safety options", |ui| {
                 ui.checkbox(&mut self.form.safe_delete, "One-Way Safe-Delete Sync");
                 ui.checkbox(&mut self.form.destination_cleanup, "Destination Cleanup");
+                ui.separator();
+                ui.label("Metadata preservation (validated named options)");
+                ui.checkbox(&mut self.form.timestamps, "Preserve and verify timestamps");
+                ui.checkbox(&mut self.form.ownership, "Preserve ownership");
+                ui.checkbox(&mut self.form.access_control_lists, "Preserve access-control lists");
+                ui.checkbox(&mut self.form.extended_attributes, "Preserve extended attributes");
+                ui.separator();
+                ui.label("Transfer resilience");
+                ui.horizontal(|ui| {
+                    ui.label("Partial transfer");
+                    ui.radio_value(
+                        &mut self.form.partial_transfer_policy,
+                        PartialTransferPolicy::Cleanup,
+                        "Clean up failed partial files",
+                    );
+                    ui.radio_value(
+                        &mut self.form.partial_transfer_policy,
+                        PartialTransferPolicy::KeepPartialForResume,
+                        "Keep for reviewed resume",
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Retry attempts");
+                    ui.add(egui::TextEdit::singleline(&mut self.form.retry_attempts).desired_width(55.0));
+                    ui.label("Initial delay (ms)");
+                    ui.add(egui::TextEdit::singleline(&mut self.form.retry_delay_millis).desired_width(75.0));
+                });
+                ui.label("Transport is selected through the typed Local or SSH endpoint fields. Command editing is not available.");
                 ui.label("These options remain subject to Fresh Analysis, verification, and explicit Execution Confirmation.");
             });
         } else {
@@ -514,6 +784,11 @@ impl SyncPlusApp {
             ui.label("Limits: Mirror Sync has no implicit winner; excluded, unavailable, changed, or ambiguous items remain visible for review. Passwords stay in the desktop keyring and only an opaque reference is kept in the profile.");
         });
         ui.horizontal(|ui| {
+            if ui.button("Analyze current state").clicked() {
+                if let Err(error) = self.analyze_profile() {
+                    self.status = format!("Plan review is not ready: {error}");
+                }
+            }
             if ui.button("Validate").clicked() {
                 if let Err(error) = self.validate_profile() {
                     self.status = format!("Profile is not valid: {error}");
@@ -525,6 +800,355 @@ impl SyncPlusApp {
                 }
             }
         });
+        if self.form != form_before_draw {
+            self.clear_review();
+            self.status = "Profile changed. Fresh Analysis and confirmation are required again.".to_owned();
+        }
+    }
+
+    fn draw_review(&mut self, ui: &mut egui::Ui) {
+        let mut request_confirmation = false;
+        ui.separator();
+        ui.heading("Plan review and Execution Confirmation");
+
+        if let Some(review) = self.review.as_mut() {
+            ui.label("This is a read-only review of the current profile. No filesystem mutation starts from this view.");
+            ui.group(|ui| {
+                ui.label("Folder mapping");
+                let (source_peer, destination_peer) = mapped_peers(&review.profile);
+                let source = source_peer.root().display().to_string();
+                let destination = destination_peer.root().display().to_string();
+                if review.profile.mode() == SyncMode::OneWay {
+                    ui.label(format!("Selected source folder: {source}"));
+                    ui.label(format!("Selected destination folder: {destination}"));
+                    ui.label("One-Way Sync copies the selected source folder's contents into the selected destination folder.");
+                } else {
+                    ui.label(format!("Peer A folder: {}", review.profile.peer_a().root().display()));
+                    ui.label(format!("Peer B folder: {}", review.profile.peer_b().root().display()));
+                    ui.label("Mirror Sync reviews both folder directions independently; neither folder is an implicit winner.");
+                }
+                ui.label("A trailing separator marks the selected path as a folder; it does not select a parent folder or widen the reviewed root. Actions below are relative to these exact selected roots.");
+                ui.label("The reviewed typed Process Specification below is authoritative for execution.");
+            });
+
+            if let Some(error) = &review.error {
+                ui.group(|ui| {
+                    ui.label("Review status: not ready");
+                    ui.label(error);
+                });
+            }
+
+            if let Some(precheck) = &review.precheck {
+                ui.group(|ui| {
+                    ui.label(if precheck.can_execute() {
+                        "Fresh precheck: passed (no blockers)"
+                    } else {
+                        "Fresh precheck: blocked"
+                    });
+                    for blocker in precheck.blockers() {
+                        ui.label(format!(
+                            "BLOCKER [{:?}] {} — {}. Remediation: {}",
+                            blocker.kind(),
+                            blocker.path().display(),
+                            blocker.reason(),
+                            blocker.remediation()
+                        ));
+                        ui.label(format!("Requirement: {}", blocker.requirement()));
+                    }
+                    for warning in precheck.warnings() {
+                        ui.label(format!("WARNING: {}", warning.explanation()));
+                    }
+                    if precheck.blockers().is_empty() && precheck.warnings().is_empty() {
+                        ui.label("No precheck warnings or blockers were reported.");
+                    }
+                });
+            }
+
+            if let Some(analysis) = review.analysis.clone() {
+                draw_analysis_review(ui, review, &analysis);
+                let unresolved = analysis_has_unresolved_items(&analysis);
+                let precheck_ready = review
+                    .precheck
+                    .as_ref()
+                    .is_some_and(PrecheckResult::can_execute);
+                let stronger_required = review
+                    .precheck
+                    .as_ref()
+                    .is_some_and(PrecheckResult::requires_stronger_confirmation);
+                let stronger_confirmation = review
+                    .precheck
+                    .as_ref()
+                    .is_some_and(|precheck| stronger_confirmation_satisfied(review, precheck));
+                let can_confirm = precheck_ready
+                    && !unresolved
+                    && (!stronger_required || stronger_confirmation);
+                ui.group(|ui| {
+                    ui.label("Final Execution Confirmation");
+                    draw_confirmation_summary(ui, review, &analysis);
+                    if stronger_required {
+                        ui.label("This high-risk source scope requires stronger confirmation. Type the exact source path shown in the mapping above:");
+                        ui.text_edit_singleline(&mut review.stronger_confirmation_path);
+                    }
+                    if review.confirmed {
+                        ui.label("Execution Confirmation recorded. No filesystem mutation has started.");
+                    } else if ui
+                        .add_enabled(
+                            can_confirm,
+                            egui::Button::new("Confirm this exact reviewed scope"),
+                        )
+                        .clicked()
+                    {
+                        request_confirmation = true;
+                    }
+                    if unresolved && !review.confirmed {
+                        ui.label("Confirmation is unavailable while unresolved or unsupported items remain.");
+                    } else if stronger_required && !stronger_confirmation && !review.confirmed {
+                        ui.label("Confirmation is unavailable until the exact high-risk source path is entered.");
+                    } else if !can_confirm && !review.confirmed {
+                        ui.label("Confirmation is unavailable until Fresh Analysis and the fresh precheck are complete.");
+                    }
+                });
+            } else {
+                ui.label("No explainable plan is available until the precheck and Fresh Analysis pass.");
+            }
+        } else {
+            ui.label("No plan has been analyzed. Select Analyze current state to review the intended work.");
+        }
+
+        if request_confirmation {
+            if let Err(error) = self.confirm_review() {
+                self.status = format!("Execution Confirmation was not recorded: {error}");
+            }
+        }
+    }
+}
+
+fn draw_analysis_review(ui: &mut egui::Ui, review: &PlanReviewState, analysis: &FreshAnalysis) {
+    let summary = analysis.plan().summary();
+    let unsupported_count = analysis
+        .source_inventory()
+        .items()
+        .iter()
+        .chain(analysis.destination_inventory().items())
+        .filter(|item| item.outcome() == AnalysisOutcome::Unsupported)
+        .count();
+    let excluded_count = analysis
+        .source_inventory()
+        .excluded_items()
+        .count()
+        + analysis.destination_inventory().excluded_items().count();
+
+    ui.group(|ui| {
+        ui.label("Fresh Analysis: Explainable Actions");
+        ui.label(format!(
+            "Considered: {} | Included: {} | Excluded: {} | Unresolved or unsupported: {}",
+            summary.considered_count(),
+            summary.included_count(),
+            summary.excluded_count(),
+            unsupported_count
+        ));
+        ui.label(format!(
+            "Copies: {} ({}) | Overwrites: {} ({}) | Destination removals: {} ({}) | Source removals: {} ({})",
+            summary.copy_count(),
+            format_bytes(summary.copy_bytes()),
+            summary.overwrite_count(),
+            format_bytes(summary.overwrite_bytes()),
+            summary.destination_removal_count(),
+            format_bytes(summary.destination_removal_bytes()),
+            summary.source_removal_count(),
+            format_bytes(summary.source_removal_bytes())
+        ));
+        ui.label(format!("Transfer data: {}", format_bytes(summary.total_bytes())));
+    });
+
+    ui.collapsing(format!("Explainable Actions ({})", analysis.plan().action_count()), |ui| {
+        if analysis.plan().actions().is_empty() {
+            ui.label("No file actions are planned for this current state.");
+        }
+        for action in analysis.plan().actions() {
+            ui.label(format!(
+                "{:?}: {}{} — {}",
+                action.kind(),
+                action.relative_path().display(),
+                action
+                    .size()
+                    .map(|size| format!(" ({})", format_bytes(size)))
+                    .unwrap_or_default(),
+                action.consequence()
+            ));
+        }
+    });
+
+    ui.collapsing(
+        format!("Exclusion Rules ({})", review.profile.exclusions().len()),
+        |ui| {
+            if review.profile.exclusions().is_empty() {
+                ui.label("No exclusion rules are configured.");
+            } else {
+                ui.label(format!("Excluded inventory items matched: {excluded_count}"));
+                for rule in review.profile.exclusions() {
+                    ui.label(format!("Validated rule: {rule}"));
+                }
+                for item in analysis
+                    .source_inventory()
+                    .excluded_items()
+                    .chain(analysis.destination_inventory().excluded_items())
+                {
+                    ui.label(format!("Excluded item: {}", item.relative_path().display()));
+                }
+                ui.label("Excluded items remain outside the Approved Sync Scope and are never silently synchronized or deleted.");
+            }
+        },
+    );
+
+    ui.collapsing("Approved Sync Scope", |ui| {
+        ui.label(format!(
+            "Included items: {} | Explicitly excluded items: {}",
+            analysis.plan().approved_scope().included_count(),
+            analysis.plan().approved_scope().excluded_count()
+        ));
+    });
+
+    let unresolved_count = analysis
+        .source_inventory()
+        .items()
+        .iter()
+        .chain(analysis.destination_inventory().items())
+        .filter(|item| item.outcome() == AnalysisOutcome::Unsupported)
+        .count();
+    ui.collapsing(
+        format!("Unresolved or unsupported items ({unresolved_count})"),
+        |ui| {
+            if unresolved_count == 0 {
+                ui.label("No unresolved or unsupported inventory items were found.");
+            } else {
+                for item in analysis
+                    .source_inventory()
+                    .items()
+                    .iter()
+                    .chain(analysis.destination_inventory().items())
+                    .filter(|item| item.outcome() == AnalysisOutcome::Unsupported)
+                {
+                    ui.label(format!(
+                        "Unresolved unsupported item: {} ({:?}); execution must remain blocked.",
+                        item.relative_path().display(),
+                        item.item_type()
+                    ));
+                }
+            }
+        },
+    );
+
+    ui.collapsing("Advanced technical preview", |ui| {
+        ui.label("Generated from the reviewed typed Process Specification; arbitrary command editing is unavailable.");
+        let mut preview = analysis.specification().preview();
+        ui.add(egui::TextEdit::multiline(&mut preview).desired_rows(2).interactive(false));
+        ui.label("Any secret binding is redacted in this diagnostic preview.");
+    });
+}
+
+fn mapped_peers(profile: &SyncProfile) -> (&Peer, &Peer) {
+    match profile.mode() {
+        SyncMode::OneWay => match profile.source() {
+            OneWaySource::PeerA => (profile.peer_a(), profile.peer_b()),
+            OneWaySource::PeerB => (profile.peer_b(), profile.peer_a()),
+        },
+        SyncMode::Mirror => (profile.peer_a(), profile.peer_b()),
+    }
+}
+
+fn analysis_has_unresolved_items(analysis: &FreshAnalysis) -> bool {
+    analysis
+        .source_inventory()
+        .items()
+        .iter()
+        .chain(analysis.destination_inventory().items())
+        .any(|item| item.outcome() == AnalysisOutcome::Unsupported)
+}
+
+fn stronger_confirmation_satisfied(
+    review: &PlanReviewState,
+    precheck: &PrecheckResult,
+) -> bool {
+    let typed_path = review.stronger_confirmation_path.trim();
+    precheck
+        .warnings()
+        .iter()
+        .filter(|warning| warning.requires_stronger_confirmation())
+        .all(|warning| warning.source().display().to_string() == typed_path)
+}
+
+fn draw_confirmation_summary(ui: &mut egui::Ui, review: &PlanReviewState, analysis: &FreshAnalysis) {
+    let summary = analysis.plan().summary();
+    let (source, destination) = mapped_peers(&review.profile);
+    if review.profile.mode() == SyncMode::OneWay {
+        ui.label(format!(
+            "Exact reviewed mapping: {} → {}",
+            source.root().display(),
+            destination.root().display()
+        ));
+    } else {
+        ui.label(format!(
+            "Exact reviewed roots: Peer A {} and Peer B {}; actions may be in either direction.",
+            review.profile.peer_a().root().display(),
+            review.profile.peer_b().root().display()
+        ));
+    }
+    ui.label(format!(
+        "Exact reviewed actions: {} total; {} copies ({}), {} overwrites ({}), {} destination removals, {} source removals.",
+        analysis.plan().action_count(),
+        summary.copy_count(),
+        format_bytes(summary.copy_bytes()),
+        summary.overwrite_count(),
+        format_bytes(summary.overwrite_bytes()),
+        summary.destination_removal_count(),
+        summary.source_removal_count()
+    ));
+    let options = review.profile.options();
+    if options.safe_delete {
+        match options.deletion_method {
+            Some(DeletionMethod::Trash) => {
+                ui.label("Consequence: verified source removals move to the selected local Trash; an unavailable Trash blocks the run and is never replaced silently.");
+            }
+            Some(DeletionMethod::PermanentRemoval) => {
+                ui.label("Consequence: verified source removals are irreversible Permanent Removal and require this explicit Advanced confirmation.");
+            }
+            None => {
+                ui.label("Consequence: Safe Delete is selected but its deletion method is not valid, so confirmation remains unavailable.");
+            }
+        }
+    }
+    if options.destination_cleanup {
+        ui.label("Consequence: Destination Cleanup may remove destination items absent from the authoritative source; each removal remains visible above.");
+    }
+    if !options.safe_delete && !options.destination_cleanup {
+        ui.label("Consequence: no deletion or cleanup action is enabled; planned copies and overwrites affect only the displayed destination paths.");
+    }
+    if review.profile.mode() == SyncMode::Mirror {
+        ui.label("Mirror Sync has no implicit winner; any action direction is shown in the Explainable Actions list above.");
+    }
+    ui.label("A fresh precheck and Fresh Analysis validation run again when this explicit confirmation action is pressed; this view itself performs no filesystem mutation.");
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn format_precheck_error(error: &PrecheckErrorKind) -> String {
+    match error {
+        PrecheckErrorKind::InvalidSpecification(error) => format!("invalid profile: {error}"),
+        PrecheckErrorKind::Probe(error) => format!("precheck probe failed: {error}"),
     }
 }
 
@@ -535,6 +1159,7 @@ impl eframe::App for SyncPlusApp {
         egui::Panel::left("profiles").show(ui, |ui| self.draw_profile_list(ui));
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_profile_form(ui));
+            egui::ScrollArea::vertical().show(ui, |ui| self.draw_review(ui));
             ui.separator();
             ui.label(egui::RichText::new(&self.status).strong());
         });
@@ -619,7 +1244,7 @@ fn mode_label(mode: ApplicationMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
     use super::*;
 
@@ -666,6 +1291,28 @@ mod tests {
             },
             ..ProfileForm::default()
         }
+    }
+
+    fn filesystem_form() -> (ProfileForm, PathBuf, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!("syncplus-ui-{unique}-{}", std::process::id()));
+        let source = base.join("source");
+        let destination = base.join("destination");
+        fs::create_dir_all(&source).expect("source directory");
+        fs::create_dir_all(&destination).expect("destination directory");
+        fs::write(source.join("keep.txt"), b"new contents").expect("included file");
+        fs::write(source.join("ignored.tmp"), b"excluded file").expect("excluded file");
+        fs::write(destination.join("keep.txt"), b"old contents").expect("existing file");
+
+        let mut form = ProfileForm::default();
+        form.name = "Filesystem review".to_owned();
+        form.peer_a.local_path = source.display().to_string();
+        form.peer_b.local_path = destination.display().to_string();
+        form.exclusions = "*.tmp".to_owned();
+        (form, source, base)
     }
 
     #[test]
@@ -755,5 +1402,96 @@ mod tests {
                 .authentication(),
             SshAuthentication::SavedPassword(_)
         ));
+    }
+
+    #[test]
+    fn analyze_profile_builds_reviewable_plan_with_exclusions_and_preview() {
+        let (form, _source, base) = filesystem_form();
+        let mut app = app();
+        app.form = form;
+
+        app.analyze_profile().expect("local analysis should pass");
+        let review = app.review.as_ref().expect("review state");
+        let analysis = review.analysis.as_ref().expect("fresh analysis");
+        assert!(review.precheck.as_ref().expect("precheck").can_execute());
+        assert!(analysis
+            .source_inventory()
+            .excluded_items()
+            .any(|item| item.relative_path() == std::path::Path::new("ignored.tmp")));
+        assert!(analysis.plan().summary().overwrite_count() >= 1);
+        assert!(analysis.specification().preview().contains("rsync"));
+        assert!(!analysis.specification().preview().contains("test-only-secret"));
+        assert!(app.status().contains("Fresh Analysis ready"));
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn unavailable_source_is_a_precheck_blocker_and_cannot_be_confirmed() {
+        let (mut form, _source, base) = filesystem_form();
+        let missing = base.join("missing-source");
+        form.peer_a.local_path = missing.display().to_string();
+        let mut app = app();
+        app.form = form;
+
+        assert_eq!(app.analyze_profile(), Err(UiValidationError::PrecheckBlocked));
+        let review = app.review.as_ref().expect("blocked review state");
+        let precheck = review.precheck.as_ref().expect("precheck result");
+        assert!(!precheck.can_execute());
+        assert!(!precheck.blockers().is_empty());
+        assert!(app.confirm_review().is_err());
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn explicit_confirmation_rechecks_stale_analysis() {
+        let (form, source, base) = filesystem_form();
+        let mut app = app();
+        app.form = form;
+        app.analyze_profile().expect("local analysis should pass");
+
+        app.confirm_review()
+            .expect("the explicit confirmation method approves a clean review");
+        assert!(app.review.as_ref().expect("review state").confirmed);
+        fs::write(source.join("keep.txt"), b"changed after review").expect("change source");
+
+        let error = app.confirm_review().expect_err("stale analysis must block");
+        assert!(matches!(error, UiValidationError::Analysis(message) if message.contains("stale")));
+        assert!(!app.review.as_ref().expect("review state").confirmed);
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn advanced_options_are_typed_and_round_trip_without_command_editing() {
+        let mut form = valid_form();
+        form.timestamps = true;
+        form.ownership = true;
+        form.access_control_lists = true;
+        form.extended_attributes = true;
+        form.partial_transfer_policy = PartialTransferPolicy::KeepPartialForResume;
+        form.retry_attempts = "5".to_owned();
+        form.retry_delay_millis = "250".to_owned();
+
+        let profile = form.build().expect("typed advanced options");
+        let options = profile.options();
+        assert!(options.metadata.timestamps());
+        assert!(options.metadata.specialist_metadata().ownership());
+        assert!(options.metadata.specialist_metadata().access_control_lists());
+        assert!(options.metadata.specialist_metadata().extended_attributes());
+        assert_eq!(options.partial_transfer_policy, PartialTransferPolicy::KeepPartialForResume);
+        assert_eq!(options.retry_policy.max_attempts(), 5);
+        assert_eq!(options.retry_policy.initial_delay(), Duration::from_millis(250));
+        assert!(!syncplus_core::ProcessSpecification::from_profile(&profile)
+            .expect("validated specification")
+            .preview()
+            .contains("--arbitrary"));
+
+        form.retry_attempts = "11".to_owned();
+        assert_eq!(form.build(), Err(UiValidationError::InvalidRetryAttempts));
+        form.retry_attempts = "5".to_owned();
+        form.retry_delay_millis = "3600001".to_owned();
+        assert_eq!(form.build(), Err(UiValidationError::InvalidRetryDelay));
     }
 }
