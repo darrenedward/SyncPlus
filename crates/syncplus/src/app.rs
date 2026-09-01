@@ -762,7 +762,9 @@ fn help_topic_for_report_status(status: RunReportStatus) -> HelpTopic {
         RunReportStatus::Cancelled
         | RunReportStatus::Interrupted
         | RunReportStatus::RecoveryReview
-        | RunReportStatus::CompletedWithReviewRequired => HelpTopic::Recovery,
+        | RunReportStatus::CompletedWithReviewRequired => {
+            help_topic_for_surface(HelpSurface::Recovery)
+        }
         RunReportStatus::Completed | RunReportStatus::ReviewCleared => {
             help_topic_for_surface(HelpSurface::Report)
         }
