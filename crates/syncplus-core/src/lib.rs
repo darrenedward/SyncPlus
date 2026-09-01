@@ -168,6 +168,9 @@ mod storage_tests;
 mod config_transfer_tests;
 
 #[cfg(test)]
+mod sqlite_recovery_gate_tests;
+
+#[cfg(test)]
 mod baseline_tests;
 
 #[cfg(test)]
