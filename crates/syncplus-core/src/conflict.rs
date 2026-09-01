@@ -12,11 +12,49 @@ use crate::{
 
 const DEFAULT_TEXT_PREVIEW_LIMIT: u64 = 1_048_576;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConflictKind {
     SamePath,
     PossibleDuplicateOrRename,
     DestinationCompatibility,
+}
+
+/// Stable identity for one review row. A relative path alone is not enough:
+/// a same-path conflict and a possible rename can legitimately refer to the
+/// same path while requiring separate whole-file decisions.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConflictEntryKey {
+    kind: ConflictKind,
+    relative_path: PathBuf,
+    related_path: Option<PathBuf>,
+    destination_path: Option<PathBuf>,
+}
+
+impl ConflictEntryKey {
+    pub fn same_path(relative_path: impl Into<PathBuf>) -> Self {
+        Self {
+            kind: ConflictKind::SamePath,
+            relative_path: relative_path.into(),
+            related_path: None,
+            destination_path: None,
+        }
+    }
+
+    pub const fn kind(&self) -> ConflictKind {
+        self.kind
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    pub fn related_path(&self) -> Option<&Path> {
+        self.related_path.as_deref()
+    }
+
+    pub fn destination_path(&self) -> Option<&Path> {
+        self.destination_path.as_deref()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +78,6 @@ pub struct ConflictEvidence {
     symlink_target: Option<PathBuf>,
     sha256: Option<[u8; 32]>,
     classification: FileReviewClassification,
-    text_preview: Option<String>,
 }
 
 impl ConflictEvidence {
@@ -84,9 +121,6 @@ impl ConflictEvidence {
         self.classification
     }
 
-    pub fn text_preview(&self) -> Option<&str> {
-        self.text_preview.as_deref()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +134,15 @@ pub struct ConflictEntry {
 }
 
 impl ConflictEntry {
+    pub fn key(&self) -> ConflictEntryKey {
+        ConflictEntryKey {
+            kind: self.kind,
+            relative_path: self.relative_path.clone(),
+            related_path: self.related_path.clone(),
+            destination_path: self.destination_path.clone(),
+        }
+    }
+
     pub const fn kind(&self) -> ConflictKind {
         self.kind
     }
@@ -130,13 +173,24 @@ impl ConflictEntry {
         true
     }
 
-    /// Every review entry uses the same explicit whole-file decision set. The
-    /// selected decision is validated separately before it can become an
-    /// executable resolution plan.
-    pub const fn available_resolutions(&self) -> &'static [crate::ConflictResolution; 5] {
-        crate::ConflictResolution::all()
+    /// Same-path conflicts can receive an explicit winner or preservation
+    /// decision. Rename candidates can only be preserved or deferred. A
+    /// destination compatibility row is remediation-only and never becomes a
+    /// Resolution Run action.
+    pub fn available_resolutions(&self) -> &'static [crate::ConflictResolution] {
+        match self.kind {
+            ConflictKind::SamePath => crate::ConflictResolution::all(),
+            ConflictKind::PossibleDuplicateOrRename => &PRESERVATION_RESOLUTIONS,
+            ConflictKind::DestinationCompatibility => &[],
+        }
     }
 }
+
+const PRESERVATION_RESOLUTIONS: [crate::ConflictResolution; 3] = [
+    crate::ConflictResolution::PreserveBoth,
+    crate::ConflictResolution::RenamePreserveForReview,
+    crate::ConflictResolution::Defer,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConflictReview {
@@ -254,7 +308,9 @@ impl ConflictReview {
             for (other_hash, _other_side, other_path, other_evidence) in
                 locations.iter().skip(index + 1)
             {
-                if hash != other_hash || path == other_path {
+                if hash != other_hash
+                    || path == other_path
+                {
                     continue;
                 }
                 entries.push(ConflictEntry {
@@ -342,12 +398,12 @@ fn review_evidence(
     item: &InventorySnapshotItem,
     text_preview_limit: u64,
 ) -> ConflictEvidence {
-    let (classification, text_preview) = if item.item_type() != ItemType::RegularFile {
-        (FileReviewClassification::NonRegular, None)
+    let classification = if item.item_type() != ItemType::RegularFile {
+        FileReviewClassification::NonRegular
     } else if item.content_fingerprint().is_none() {
-        (FileReviewClassification::Unreadable, None)
+        FileReviewClassification::Unreadable
     } else if item.size() > text_preview_limit {
-        (FileReviewClassification::Large, None)
+        FileReviewClassification::Large
     } else {
         classify_file(
             &inventory.root().join(item.relative_path()),
@@ -365,11 +421,10 @@ fn review_evidence(
         symlink_target: item.symlink_target().map(Path::to_path_buf),
         sha256: item.content_fingerprint().copied(),
         classification,
-        text_preview,
     }
 }
 
-fn classify_file(path: &Path, text_preview_limit: u64) -> (FileReviewClassification, Option<String>) {
+fn classify_file(path: &Path, text_preview_limit: u64) -> FileReviewClassification {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -378,7 +433,7 @@ fn classify_file(path: &Path, text_preview_limit: u64) -> (FileReviewClassificat
         options.custom_flags(libc::O_NOFOLLOW);
     }
     let Ok(file) = options.open(path) else {
-        return (FileReviewClassification::Unreadable, None);
+        return FileReviewClassification::Unreadable;
     };
     let mut bytes = Vec::new();
     if file
@@ -386,18 +441,15 @@ fn classify_file(path: &Path, text_preview_limit: u64) -> (FileReviewClassificat
         .read_to_end(&mut bytes)
         .is_err()
     {
-        return (FileReviewClassification::Unreadable, None);
+        return FileReviewClassification::Unreadable;
     }
     if bytes.len() as u64 > text_preview_limit {
-        return (FileReviewClassification::Large, None);
+        return FileReviewClassification::Large;
     }
     if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
-        return (FileReviewClassification::Binary, None);
+        return FileReviewClassification::Binary;
     }
-    (
-        FileReviewClassification::Text,
-        Some(String::from_utf8(bytes).expect("UTF-8 was checked above")),
-    )
+    FileReviewClassification::Text
 }
 
 const fn side_rank(side: PeerSide) -> u8 {

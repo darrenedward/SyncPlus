@@ -156,7 +156,7 @@ impl ResolutionRun {
         let decisions = plan
             .actions()
             .iter()
-            .map(|action| ConflictDecision::new(action.relative_path(), action.resolution()));
+            .map(|action| ConflictDecision::for_key(action.key().clone(), action.resolution()));
         let validated_plan = analysis
             .conflict_review()
             .resolve(decisions)
