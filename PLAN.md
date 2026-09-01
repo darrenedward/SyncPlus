@@ -398,6 +398,9 @@ Tests express intended product behavior and safety contracts, not accidental imp
 - missing remote rsync/hash/recovery capability stops before mutation;
 - remote post-transfer SHA-256 mismatch preserves the source;
 - missing unattended credentials do not prompt or fall back;
+- the ignored disposable SSH release gate starts an ephemeral loopback `sshd`,
+  verifies its approved host key through a temporary known-hosts file, and
+  exercises core-generated push and pull transfers with hostile path data;
 - remote paths with spaces, Unicode, control characters, and shell metacharacters remain data, not commands;
 - permission failures identify the account/path and block before changes;
 - real case-insensitive/restricted filesystem coverage includes NTFS, FAT32, or exFAT where available;
@@ -417,7 +420,7 @@ Tests express intended product behavior and safety contracts, not accidental imp
 
 ### Quality and compliance gates
 
-At every milestone run configured formatting, compiler checks, `cargo clippy -- -D warnings`, unit/integration tests, dependency/license checks, and security review of process invocation. Before release, run the disposable end-to-end matrix on local folders, an external filesystem, and a real SSH peer. A green UI test suite alone is not release evidence.
+At every milestone run configured formatting, compiler checks, `cargo clippy -- -D warnings`, unit/integration tests, dependency/license checks, and security review of process invocation. Before release, run the disposable end-to-end matrix on local folders, an external filesystem, and a real SSH peer. The SSH gate is run with `cargo test -p syncplus-core --lib disposable_ssh_peer_exercises_push_pull_strict_identity_and_hostile_paths -- --ignored`; it requires `sshd`, `ssh-keygen`, `ssh`, and `rsync`. A green UI test suite alone is not release evidence.
 
 ## Help and user-facing requirements
 
