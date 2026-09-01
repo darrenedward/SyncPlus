@@ -5,9 +5,11 @@ use std::{
 
 use crate::storage::{ClaimedScheduledRun, SyncProfileId};
 use crate::{
-    PrecheckProbe, RunEvidenceStore, RunReport, RunSnapshot, RunWorkflow, StorageError,
-    WorkflowError,
+    CredentialResolver, PrecheckProbe, RemotePrecheckPermit,
+    RunEvidenceStore, RunReport, RunSnapshot, RunWorkflow, SecretStore, SshHostTrustPermit,
+    SshRunBackend, SshRunMode, StorageError, WorkflowError,
 };
+use crate::workflow::mark_unattended_blocked;
 
 /// A clock boundary kept outside scheduling policy so due-run behavior can be
 /// tested without changing the machine clock.
@@ -103,6 +105,68 @@ impl ScheduledRun {
             self.snapshot.profile(),
             self.snapshot.authorizations(),
             probe,
+            store,
+            should_cancel,
+        )
+    }
+
+    /// Resolve the profile's selected SSH credential in unattended mode and
+    /// launch through the shared SSH workflow. An interactive password source
+    /// is rejected by the resolver before a prompt can be attempted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_ssh<S, B, F>(
+        &self,
+        workflow: &RunWorkflow,
+        resolver: &CredentialResolver<S>,
+        host_permit: &SshHostTrustPermit,
+        precheck: &RemotePrecheckPermit,
+        backend: &B,
+        store: &mut RunEvidenceStore,
+        should_cancel: F,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        S: SecretStore,
+        B: SshRunBackend,
+        F: Fn() -> bool,
+    {
+        let peer = match (
+            self.snapshot().profile().peer_a().ssh_peer(),
+            self.snapshot().profile().peer_b().ssh_peer(),
+        ) {
+            (Some(peer), None) | (None, Some(peer)) => peer,
+            (None, None) => {
+                let error = WorkflowError::InvalidRun(
+                    "scheduled SSH execution requires exactly one SSH peer".to_owned(),
+                );
+                mark_unattended_blocked(store, self.run_id, self.snapshot().profile(), &error)?;
+                return Err(error);
+            }
+            (Some(_), Some(_)) => {
+                let error = WorkflowError::InvalidRun(
+                    "scheduled SSH execution does not support two SSH peers".to_owned(),
+                );
+                mark_unattended_blocked(store, self.run_id, self.snapshot().profile(), &error)?;
+                return Err(error);
+            }
+        };
+        let credential = match resolver.resolve(peer, SshRunMode::Unattended, None) {
+            Ok(credential) => credential,
+            Err(error) => {
+                let error = WorkflowError::InvalidRun(format!(
+                    "scheduled SSH credential is unavailable: {error}"
+                ));
+                mark_unattended_blocked(store, self.run_id, self.snapshot().profile(), &error)?;
+                return Err(error);
+            }
+        };
+        workflow.execute_ssh_unattended(
+            self.run_id,
+            self.snapshot().profile(),
+            self.snapshot().authorizations(),
+            &credential,
+            host_permit,
+            precheck,
+            backend,
             store,
             should_cancel,
         )
@@ -284,10 +348,14 @@ mod tests {
         assert!(claim
             .execute(&workflow, &LocalPrecheckProbe::default(), &mut store, || false)
             .is_err());
-        assert_eq!(
-            store.load_report(claim.run_id()).expect("report").status(),
-            RunReportStatus::Blocked
-        );
+        let report = store.load_report(claim.run_id()).expect("report");
+        assert_eq!(report.status(), RunReportStatus::Blocked);
+        let blocked_reason = report.blocked_reason().expect("blocked reason");
+        assert!(blocked_reason.contains("Sync Profile 'destructive scheduled profile'"));
+        assert!(blocked_reason.contains("source"));
+        assert!(blocked_reason.contains(source.to_string_lossy().as_ref()));
+        assert!(blocked_reason.contains("Next action:"));
+        assert!(!blocked_reason.contains("source data"));
         assert!(source.join("must-remain.txt").exists());
         fs::remove_dir_all(root).expect("fixture cleanup");
     }

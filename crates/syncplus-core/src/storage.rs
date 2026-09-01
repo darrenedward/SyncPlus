@@ -437,7 +437,6 @@ impl RunEvidenceStore {
         expected_revision: u64,
     ) -> Result<PersistedSyncProfile, StorageError> {
         validate_profile(profile)?;
-        validate_authorizations(profile, authorizations)?;
         let existing = self
             .load_profile(id)?
             .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
@@ -445,6 +444,12 @@ impl RunEvidenceStore {
             return Err(StorageError::ConcurrentProfileUpdate);
         }
         self.reject_duplicate_endpoint_pair(profile, Some(id))?;
+        let authorizations = if unattended_authorization_scope_changed(existing.profile(), profile) {
+            AuthorizationSnapshot::default()
+        } else {
+            authorizations
+        };
+        validate_authorizations(profile, authorizations)?;
         let values = ProfileValues::from_profile(profile);
         let transaction = self
             .connection_mut()
@@ -1067,6 +1072,15 @@ fn validate_authorizations(
         ));
     }
     Ok(())
+}
+
+fn unattended_authorization_scope_changed(before: &SyncProfile, after: &SyncProfile) -> bool {
+    before.peer_a() != after.peer_a()
+        || before.peer_b() != after.peer_b()
+        || before.mode() != after.mode()
+        || before.source() != after.source()
+        || before.options() != after.options()
+        || before.exclusions() != after.exclusions()
 }
 
 struct RawProfile {
