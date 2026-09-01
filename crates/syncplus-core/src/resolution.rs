@@ -59,6 +59,10 @@ impl ConflictDecision {
 pub enum ConflictResolutionError {
     MissingDecision { relative_path: PathBuf },
     UnknownConflict { relative_path: PathBuf },
+    UnavailableResolution {
+        relative_path: PathBuf,
+        resolution: ConflictResolution,
+    },
     DuplicateDecision { relative_path: PathBuf },
     FinalConfirmationRequired,
 }
@@ -72,6 +76,13 @@ impl fmt::Display for ConflictResolutionError {
             Self::UnknownConflict { relative_path } => {
                 write!(formatter, "resolution targets an unknown Mirror conflict: {relative_path:?}")
             }
+            Self::UnavailableResolution {
+                relative_path,
+                resolution,
+            } => write!(
+                formatter,
+                "resolution {resolution:?} is not available for Mirror conflict {relative_path:?}"
+            ),
             Self::DuplicateDecision { relative_path } => {
                 write!(formatter, "Mirror conflict has more than one resolution: {relative_path:?}")
             }
@@ -245,9 +256,19 @@ impl ConflictReview {
         let mut actions = Vec::new();
 
         for decision in decisions {
-            if !expected.contains(&decision.relative_path) {
+            let Some(entry) = self
+                .entries()
+                .iter()
+                .find(|entry| entry.relative_path() == decision.relative_path)
+            else {
                 return Err(ConflictResolutionError::UnknownConflict {
                     relative_path: decision.relative_path,
+                });
+            };
+            if !entry.available_resolutions().contains(&decision.resolution) {
+                return Err(ConflictResolutionError::UnavailableResolution {
+                    relative_path: decision.relative_path,
+                    resolution: decision.resolution,
                 });
             }
             if !seen.insert(decision.relative_path.clone()) {

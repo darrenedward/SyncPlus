@@ -133,10 +133,21 @@ impl ConflictEntry {
     /// Every review entry uses the same explicit whole-file decision set. The
     /// selected decision is validated separately before it can become an
     /// executable resolution plan.
-    pub const fn available_resolutions(&self) -> &'static [crate::ConflictResolution; 5] {
-        crate::ConflictResolution::all()
+    pub fn available_resolutions(&self) -> &'static [crate::ConflictResolution] {
+        match self.kind {
+            ConflictKind::SamePath => crate::ConflictResolution::all(),
+            ConflictKind::PossibleDuplicateOrRename | ConflictKind::DestinationCompatibility => {
+                &PRESERVATION_RESOLUTIONS
+            }
+        }
     }
 }
+
+const PRESERVATION_RESOLUTIONS: [crate::ConflictResolution; 3] = [
+    crate::ConflictResolution::PreserveBoth,
+    crate::ConflictResolution::RenamePreserveForReview,
+    crate::ConflictResolution::Defer,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConflictReview {
@@ -254,7 +265,12 @@ impl ConflictReview {
             for (other_hash, _other_side, other_path, other_evidence) in
                 locations.iter().skip(index + 1)
             {
-                if hash != other_hash || path == other_path {
+                if hash != other_hash
+                    || path == other_path
+                    || entries
+                        .iter()
+                        .any(|entry: &ConflictEntry| entry.relative_path() == path)
+                {
                     continue;
                 }
                 entries.push(ConflictEntry {
