@@ -1,4 +1,15 @@
-use std::{fs, io, path::{Component, Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io,
+    path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use crate::{ContentProof, FileIdentity, ItemType};
 use sha2::{Digest, Sha256};
@@ -18,15 +29,44 @@ pub struct RecoveryProvenance {
 impl RecoveryProvenance {
     pub fn new(peer: impl Into<String>, original_root: PathBuf, relative_path: PathBuf, run_id: crate::RunId, item_type: ItemType, content: Option<ContentProof>, source_identity: Option<FileIdentity>) -> Result<Self, RestoreError> {
         validate_relative_path(&relative_path)?;
-        Ok(Self { peer: peer.into(), original_root, relative_path, run_id, removed_at_unix_nanos: now(), item_type, content, source_identity })
+        validate_original_root(&original_root)?;
+        let peer = peer.into();
+        validate_peer(&peer)?;
+        Ok(Self { peer, original_root, relative_path, run_id, removed_at_unix_nanos: now(), item_type, content, source_identity })
     }
     pub fn peer(&self) -> &str { &self.peer }
     pub fn original_root(&self) -> &Path { &self.original_root }
     pub fn relative_path(&self) -> &Path { &self.relative_path }
     pub const fn run_id(&self) -> crate::RunId { self.run_id }
+    pub const fn removed_at_unix_nanos(&self) -> i64 { self.removed_at_unix_nanos }
     pub const fn item_type(&self) -> ItemType { self.item_type }
     pub fn content(&self) -> Option<ContentProof> { self.content }
     pub const fn source_identity(&self) -> Option<FileIdentity> { self.source_identity }
+
+    pub(crate) fn from_record(
+        peer: String,
+        original_root: PathBuf,
+        relative_path: PathBuf,
+        run_id: crate::RunId,
+        removed_at_unix_nanos: i64,
+        item_type: ItemType,
+        content: Option<ContentProof>,
+        source_identity: Option<FileIdentity>,
+    ) -> Result<Self, RestoreError> {
+        validate_relative_path(&relative_path)?;
+        validate_original_root(&original_root)?;
+        validate_peer(&peer)?;
+        Ok(Self {
+            peer,
+            original_root,
+            relative_path,
+            run_id,
+            removed_at_unix_nanos,
+            item_type,
+            content,
+            source_identity,
+        })
+    }
     pub fn destination(&self) -> Result<PathBuf, RestoreError> {
         let root = fs::canonicalize(&self.original_root).map_err(io_error)?;
         let destination = root.join(&self.relative_path);
@@ -49,20 +89,97 @@ impl RecoveryProvenance {
 
     pub fn read_sidecar(path: &Path) -> Result<Self, RestoreError> {
         let contents = fs::read_to_string(path).map_err(io_error)?;
-        let checksum = contents.lines().find_map(|line| line.strip_prefix("checksum=")).ok_or_else(|| RestoreError::SidecarInvalid("checksum is missing".into()))?;
-        let payload = contents.strip_suffix(&format!("checksum={checksum}\n")).ok_or_else(|| RestoreError::SidecarInvalid("sidecar is malformed".into()))?;
-        if digest_text(payload) != checksum { return Err(RestoreError::SidecarInvalid("sidecar integrity check failed".into())); }
-        let values: std::collections::BTreeMap<_, _> = payload.lines().filter_map(|line| line.split_once('=')).collect();
-        let root = PathBuf::from(values.get("root").ok_or_else(|| RestoreError::SidecarInvalid("original root is missing".into()))?);
-        let relative = PathBuf::from(values.get("relative").ok_or_else(|| RestoreError::SidecarInvalid("relative path is missing".into()))?);
-        let run_id = values.get("run_id").and_then(|v| v.parse().ok()).ok_or_else(|| RestoreError::SidecarInvalid("run id is invalid".into()))?;
-        let item_type = match values.get("item_type").copied() { Some("regular_file") => ItemType::RegularFile, Some("directory") => ItemType::Directory, Some("symlink") => ItemType::Symlink, _ => return Err(RestoreError::SidecarInvalid("item type is invalid".into())) };
-        Self::new(values.get("peer").copied().unwrap_or_default(), root, relative, crate::RunId::new(run_id), item_type, None, None).map_err(|e| RestoreError::SidecarInvalid(e.to_string()))
+        let marker = "\nchecksum=";
+        let marker_position = contents
+            .rfind(marker)
+            .ok_or_else(|| RestoreError::SidecarInvalid("checksum is missing".into()))?;
+        let payload = &contents[..marker_position + 1];
+        let checksum = contents[marker_position + 1..]
+            .strip_prefix("checksum=")
+            .and_then(|value| value.strip_suffix('\n'))
+            .ok_or_else(|| RestoreError::SidecarInvalid("sidecar is malformed".into()))?;
+        if checksum.len() != 64
+            || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || digest_text(payload) != checksum
+        {
+            return Err(RestoreError::SidecarInvalid(
+                "sidecar integrity check failed".into(),
+            ));
+        }
+        let mut values = BTreeMap::new();
+        for line in payload.lines() {
+            let (key, value) = line
+                .split_once('=')
+                .ok_or_else(|| RestoreError::SidecarInvalid("sidecar field is malformed".into()))?;
+            if !matches!(
+                key,
+                "peer_hex"
+                    | "root_hex"
+                    | "relative_hex"
+                    | "run_id"
+                    | "removed_at_unix_nanos"
+                    | "item_type"
+                    | "content"
+                    | "source_identity"
+            ) || values.insert(key, value).is_some()
+            {
+                return Err(RestoreError::SidecarInvalid(
+                    "sidecar has an unknown or duplicate field".into(),
+                ));
+            }
+        }
+        let peer = decode_string(values.get("peer_hex").copied().ok_or_else(|| {
+            RestoreError::SidecarInvalid("peer is missing".into())
+        })?)?;
+        let root = decode_path(values.get("root_hex").copied().ok_or_else(|| {
+            RestoreError::SidecarInvalid("original root is missing".into())
+        })?)?;
+        let relative = decode_path(values.get("relative_hex").copied().ok_or_else(|| {
+            RestoreError::SidecarInvalid("relative path is missing".into())
+        })?)?;
+        let run_id = values
+            .get("run_id")
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| RestoreError::SidecarInvalid("run id is invalid".into()))?;
+        let removed_at_unix_nanos = values
+            .get("removed_at_unix_nanos")
+            .and_then(|value| value.parse::<i64>().ok())
+            .ok_or_else(|| RestoreError::SidecarInvalid("removal time is invalid".into()))?;
+        let item_type = match values.get("item_type").copied() {
+            Some("regular_file") => ItemType::RegularFile,
+            Some("directory") => ItemType::Directory,
+            Some("symlink") => ItemType::Symlink,
+            Some("unsupported") => ItemType::Unsupported,
+            _ => return Err(RestoreError::SidecarInvalid("item type is invalid".into())),
+        };
+        let content = values
+            .get("content")
+            .filter(|value| !value.is_empty())
+            .map(|value| parse_content(value))
+            .transpose()?;
+        let source_identity = values
+            .get("source_identity")
+            .filter(|value| !value.is_empty())
+            .map(|value| parse_identity(value))
+            .transpose()?;
+        Self::from_record(
+            peer,
+            root,
+            relative,
+            crate::RunId::new(run_id),
+            removed_at_unix_nanos,
+            item_type,
+            content,
+            source_identity,
+        )
+        .map_err(|error| RestoreError::SidecarInvalid(error.to_string()))
     }
 
     fn sidecar_payload(&self) -> String {
         let item_type = match self.item_type { ItemType::RegularFile => "regular_file", ItemType::Directory => "directory", ItemType::Symlink => "symlink", ItemType::Unsupported => "unsupported" };
-        format!("peer={}\nroot={}\nrelative={}\nrun_id={}\nitem_type={}\n", self.peer, self.original_root.display(), self.relative_path.display(), self.run_id.value(), item_type)
+        let content = self.content.map(|proof| format!("{}:{}", proof.size(), hex_hash(proof.sha256()))).unwrap_or_default();
+        let identity = self.source_identity.map(|identity| format!("{}:{}", identity.device(), identity.inode())).unwrap_or_default();
+        format!("peer_hex={}\nroot_hex={}\nrelative_hex={}\nrun_id={}\nremoved_at_unix_nanos={}\nitem_type={}\ncontent={}\nsource_identity={}\n", encode_string(&self.peer), encode_path(&self.original_root), encode_path(&self.relative_path), self.run_id.value(), self.removed_at_unix_nanos, item_type, content, identity)
     }
 }
 
@@ -120,5 +237,47 @@ impl CollisionSafeRestore {
 }
 
 fn validate_relative_path(path: &Path) -> Result<(), RestoreError> { if path.as_os_str().is_empty() || path.is_absolute() || path.components().any(|c| !matches!(c, Component::Normal(_))) { return Err(RestoreError::InvalidProvenance("original path must be a non-empty normalized relative path".into())); } Ok(()) }
+fn validate_original_root(path: &Path) -> Result<(), RestoreError> { if path.as_os_str().is_empty() { return Err(RestoreError::InvalidProvenance("original peer root must be non-empty".into())); } Ok(()) }
+fn validate_peer(peer: &str) -> Result<(), RestoreError> { if peer.trim().is_empty() || peer.chars().any(|character| character == '\n' || character == '\r') { return Err(RestoreError::InvalidProvenance("recovery peer is missing or malformed".into())); } Ok(()) }
 fn now() -> i64 { SystemTime::now().duration_since(UNIX_EPOCH).ok().and_then(|d| i64::try_from(d.as_nanos()).ok()).unwrap_or_default() }
 fn digest_text(value: &str) -> String { let mut digest = Sha256::new(); digest.update(value.as_bytes()); digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect() }
+
+fn encode_bytes(bytes: &[u8]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
+fn decode_bytes(value: &str) -> Result<Vec<u8>, RestoreError> { if value.len() % 2 != 0 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) { return Err(RestoreError::SidecarInvalid("encoded sidecar value is invalid".into())); } value.as_bytes().chunks_exact(2).map(|chunk| u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or_default(), 16).map_err(|_| RestoreError::SidecarInvalid("encoded sidecar value is invalid".into()))).collect() }
+fn encode_string(value: &str) -> String { encode_bytes(value.as_bytes()) }
+fn decode_string(value: &str) -> Result<String, RestoreError> { String::from_utf8(decode_bytes(value)?).map_err(|_| RestoreError::SidecarInvalid("peer is not valid UTF-8".into())) }
+fn encode_path(path: &Path) -> String {
+    #[cfg(unix)]
+    { encode_bytes(path.as_os_str().as_bytes()) }
+    #[cfg(not(unix))]
+    { encode_string(&path.as_os_str().to_string_lossy()) }
+}
+fn decode_path(value: &str) -> Result<PathBuf, RestoreError> {
+    let bytes = decode_bytes(value)?;
+    #[cfg(unix)]
+    { Ok(PathBuf::from(OsString::from_vec(bytes))) }
+    #[cfg(not(unix))]
+    { String::from_utf8(bytes).map(PathBuf::from).map_err(|_| RestoreError::SidecarInvalid("path is not valid for this platform".into())) }
+}
+
+fn hex_hash(hash: &[u8; 32]) -> String { hash.iter().map(|byte| format!("{byte:02x}")).collect() }
+
+fn parse_content(value: &str) -> Result<ContentProof, RestoreError> {
+    let (size, hash) = value.split_once(':').ok_or_else(|| RestoreError::SidecarInvalid("content proof is malformed".into()))?;
+    let size = size.parse().map_err(|_| RestoreError::SidecarInvalid("content size is invalid".into()))?;
+    let bytes = hash.as_bytes();
+    if bytes.len() != 64 { return Err(RestoreError::SidecarInvalid("content digest is invalid".into())); }
+    let mut digest = [0u8; 32];
+    for (index, chunk) in bytes.chunks_exact(2).enumerate() {
+        digest[index] = u8::from_str_radix(std::str::from_utf8(chunk).map_err(|_| RestoreError::SidecarInvalid("content digest is invalid".into()))?, 16).map_err(|_| RestoreError::SidecarInvalid("content digest is invalid".into()))?;
+    }
+    Ok(ContentProof::new(size, digest))
+}
+
+fn parse_identity(value: &str) -> Result<FileIdentity, RestoreError> {
+    let (device, inode) = value.split_once(':').ok_or_else(|| RestoreError::SidecarInvalid("source identity is malformed".into()))?;
+    Ok(FileIdentity::new(
+        device.parse().map_err(|_| RestoreError::SidecarInvalid("source device is invalid".into()))?,
+        inode.parse().map_err(|_| RestoreError::SidecarInvalid("source inode is invalid".into()))?,
+    ))
+}

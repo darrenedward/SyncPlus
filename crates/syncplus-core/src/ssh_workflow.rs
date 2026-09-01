@@ -1,7 +1,8 @@
 use std::{fmt, path::Path};
 
 use crate::{
-    ActionReason, ContentProof, InventoryItem, ItemMetadata, ItemType, MetadataRequirements, Peer,
+    ActionReason, ContentProof, DeletionMethod, FileIdentity, InventoryItem, ItemMetadata, ItemType,
+    MetadataRequirements, Peer,
     PlanAction, ProcessError,
     ProcessSpecification, ProcessSupervisor, RemotePrecheckPermit, ResolvedSshCredential,
     RecoveryEvidence, SourceInventory, SshHostIdentityProbe, SshHostTrustPermit, SshPeer,
@@ -17,6 +18,16 @@ pub enum SshTransferBoundary {
     TemporaryDestination,
     DestinationInstalled,
     VerificationComplete,
+}
+
+/// The boundary reached while moving a verified remote source item into the
+/// configured recovery location. A result after the move starts is never
+/// treated as an ordinary retry because the source/recovery state is
+/// ambiguous until reviewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshRecoveryBoundary {
+    BeforeRecovery,
+    RecoveryStarted,
 }
 
 impl SshTransferBoundary {
@@ -42,6 +53,15 @@ pub enum SshRunError {
     RemoteVerificationMismatch {
         boundary: SshTransferBoundary,
     },
+    RemoteRecoveryUnavailable,
+    RemoteRecoveryFailed {
+        boundary: SshRecoveryBoundary,
+        evidence: Option<RecoveryEvidence>,
+    },
+    RemoteRecoveryAmbiguous {
+        boundary: SshRecoveryBoundary,
+        evidence: Option<RecoveryEvidence>,
+    },
     Disconnected {
         boundary: SshTransferBoundary,
     },
@@ -63,6 +83,9 @@ impl SshRunError {
             | Self::SourceChanged
             | Self::MetadataMismatch
             | Self::Cancelled
+            | Self::RemoteRecoveryUnavailable
+            | Self::RemoteRecoveryFailed { .. }
+            | Self::RemoteRecoveryAmbiguous { .. }
             | Self::InvalidOperation => SshTransferBoundary::BeforeTransfer,
             Self::RemoteVerificationUnavailable { boundary }
             | Self::RemoteVerificationMismatch { boundary }
@@ -81,6 +104,12 @@ impl SshRunError {
 
     pub const fn requires_recovery_review(&self) -> bool {
         self.boundary().requires_recovery_review()
+            || matches!(
+                self,
+                Self::RemoteRecoveryUnavailable
+                    | Self::RemoteRecoveryFailed { .. }
+                    | Self::RemoteRecoveryAmbiguous { .. }
+            )
     }
 
     pub const fn action_reason(&self) -> ActionReason {
@@ -88,10 +117,13 @@ impl SshRunError {
             Self::RemoteVerificationUnavailable { .. }
             | Self::RemoteVerificationMismatch { .. }
             | Self::MetadataMismatch => ActionReason::VerificationMismatch,
+            Self::RemoteRecoveryAmbiguous { .. } => ActionReason::InterruptedBoundary,
             Self::SourceChanged => ActionReason::SourceChanged,
             Self::Cancelled => ActionReason::CancellationRequested,
             Self::Precheck(_)
             | Self::RemoteUnavailable
+            | Self::RemoteRecoveryUnavailable
+            | Self::RemoteRecoveryFailed { .. }
             | Self::Disconnected { .. }
             | Self::Process { .. } => ActionReason::DestinationUnavailable,
             Self::InvalidOperation => ActionReason::TransferFailed,
@@ -111,6 +143,17 @@ impl fmt::Display for SshRunError {
             Self::RemoteVerificationMismatch { boundary } => write!(
                 formatter,
                 "the remote destination digest did not match at the {boundary:?} boundary"
+            ),
+            Self::RemoteRecoveryUnavailable => {
+                formatter.write_str("the verified remote Trash location is unavailable")
+            }
+            Self::RemoteRecoveryFailed { boundary, .. } => write!(
+                formatter,
+                "remote recovery failed at the {boundary:?} boundary"
+            ),
+            Self::RemoteRecoveryAmbiguous { boundary, .. } => write!(
+                formatter,
+                "remote recovery is ambiguous at the {boundary:?} boundary and requires review"
             ),
             Self::Disconnected { boundary } => {
                 write!(formatter, "the SSH connection disconnected at the {boundary:?} boundary")
@@ -132,16 +175,20 @@ impl std::error::Error for SshRunError {}
 
 /// Evidence returned only after a remote backend has transferred an item and
 /// verified the actual destination. It carries sizes and digests, never file
-/// contents or credentials.
+/// contents or credentials. The source-stability flag is set only after the
+/// backend has rechecked the approved source identity and content immediately
+/// before any source-removal boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshTransferEvidence {
     source_path: Option<std::path::PathBuf>,
     destination_path: Option<std::path::PathBuf>,
     source_metadata: Option<SshMetadataProof>,
     destination_metadata: Option<SshMetadataProof>,
+    source_identity: Option<FileIdentity>,
     source: Option<ContentProof>,
     destination: Option<ContentProof>,
     metadata_verified: bool,
+    source_stability_verified: bool,
     completed_bytes: u64,
 }
 
@@ -201,9 +248,11 @@ impl SshTransferEvidence {
             destination_path: None,
             source_metadata: None,
             destination_metadata: None,
+            source_identity: None,
             source,
             destination,
             metadata_verified,
+            source_stability_verified: false,
             completed_bytes,
         }
     }
@@ -223,9 +272,11 @@ impl SshTransferEvidence {
             destination_path: Some(destination_path.into()),
             source_metadata,
             destination_metadata,
+            source_identity: None,
             source,
             destination,
             metadata_verified,
+            source_stability_verified: false,
             completed_bytes,
         }
     }
@@ -246,6 +297,15 @@ impl SshTransferEvidence {
         self.destination_metadata.as_ref()
     }
 
+    pub const fn source_identity(&self) -> Option<FileIdentity> {
+        self.source_identity
+    }
+
+    pub fn with_source_identity(mut self, identity: FileIdentity) -> Self {
+        self.source_identity = Some(identity);
+        self
+    }
+
     pub const fn source(&self) -> Option<ContentProof> {
         self.source
     }
@@ -258,12 +318,21 @@ impl SshTransferEvidence {
         self.metadata_verified
     }
 
+    pub const fn source_stability_verified(&self) -> bool {
+        self.source_stability_verified
+    }
+
+    pub fn with_source_stability_verified(mut self) -> Self {
+        self.source_stability_verified = true;
+        self
+    }
+
     pub const fn completed_bytes(&self) -> u64 {
         self.completed_bytes
     }
 
     pub fn matches_inventory(&self, item: &InventoryItem, requirements: MetadataRequirements) -> bool {
-        if !self.metadata_verified {
+        if !self.metadata_verified || !self.source_stability_verified {
             return false;
         }
         let (Some(source_metadata), Some(destination_metadata)) =
@@ -300,19 +369,27 @@ impl SshTransferEvidence {
     }
 
     pub(crate) fn recovery_evidence(&self, observed_at_unix_nanos: i64) -> Option<RecoveryEvidence> {
-        let (Some(source), Some(destination)) = (self.source, self.destination) else {
+        let source_size = self
+            .source
+            .map(|content| content.size())
+            .or_else(|| self.source_metadata.as_ref().map(|proof| proof.metadata().size()));
+        let destination_size = self
+            .destination
+            .map(|content| content.size())
+            .or_else(|| self.destination_metadata.as_ref().map(|proof| proof.metadata().size()));
+        if source_size.is_none() || destination_size.is_none() {
             return None;
-        };
+        }
         Some(RecoveryEvidence::new(
             observed_at_unix_nanos,
             None,
             true,
             true,
             false,
-            Some(source.size()),
-            Some(destination.size()),
-            Some(*source.sha256()),
-            Some(*destination.sha256()),
+            source_size,
+            destination_size,
+            self.source.map(|content| *content.sha256()),
+            self.destination.map(|content| *content.sha256()),
         ))
     }
 }
@@ -446,6 +523,20 @@ impl<'a> SshTransferRequest<'a> {
         crate::RemoteHelperInvocation::sha256_with_permit(self.remote_peer, self.host_permit, path)
             .map(|helper| helper.invocation().clone())
     }
+
+    pub fn remote_recovery_target(&self) -> Option<std::path::PathBuf> {
+        if self.precheck.require_recovery() {
+            self.precheck
+                .trash_location()
+                .map(|root| root.join(self.action.relative_path()))
+        } else {
+            None
+        }
+    }
+
+    pub fn deletion_method(&self) -> Option<DeletionMethod> {
+        self.specification.options().deletion_method()
+    }
 }
 
 fn temporary_destination(destination: &Path, run_id: crate::RunId, action: &PlanAction) -> std::path::PathBuf {
@@ -491,12 +582,30 @@ pub trait SshRunBackend: SshHostIdentityProbe + SshRemotePrecheckProbe {
     /// Transfer one planned item and return evidence for the actual
     /// destination. For local-to-SSH this must include a digest obtained from
     /// the remote destination after transfer; an rsync exit code alone is not
-    /// a successful result. Implementations must leave temporary files hidden
-    /// and use the supplied process-group supervisor.
+    /// a successful result. Before setting the source-stability flag,
+    /// implementations must independently recheck the approved source
+    /// identity and content immediately before any source-removal boundary.
+    /// Implementations must leave temporary files hidden and use the supplied
+    /// process-group supervisor.
     fn transfer(
         &self,
         request: &SshTransferRequest<'_>,
         should_cancel: &dyn Fn() -> bool,
         progress: &mut dyn FnMut(u64),
     ) -> Result<SshTransferEvidence, SshRunError>;
+
+    /// Move a verified remote source item into the already verified remote
+    /// recovery location. Implementations must use a fixed typed operation,
+    /// recheck the source identity and content immediately before mutation,
+    /// prefer an atomic same-filesystem move, write a content-free provenance
+    /// sidecar before removing the source, and preserve the source on every
+    /// failed or ambiguous boundary. A successful result must independently
+    /// prove that the source is absent, the recovery item is present, and the
+    /// destination remains the verified item.
+    fn recover_source(
+        &self,
+        request: &SshTransferRequest<'_>,
+        transfer: &SshTransferEvidence,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<RecoveryEvidence, SshRunError>;
 }

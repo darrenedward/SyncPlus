@@ -101,7 +101,7 @@ pub use removal::{RecoveryMethod, RemovalReceipt, SafeDeleteError, SafeDeleteExe
 pub use restore::{CollisionSafeRestore, RecoveryProvenance, RestoreError, RestoreJournalEvent, RestoreOutcome};
 pub use workflow::{RunWorkflow, WorkflowError};
 pub use ssh_workflow::{
-    SshMetadataProof, SshRunBackend, SshRunError, SshTransferBoundary,
+    SshMetadataProof, SshRecoveryBoundary, SshRunBackend, SshRunError, SshTransferBoundary,
     SshTransferEvidence, SshTransferRequest,
 };
 pub use reconciliation::{

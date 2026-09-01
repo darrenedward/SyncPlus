@@ -317,6 +317,7 @@ For an Unattended Run, an unapproved or changed SSH Server Identity stops the af
 
 SSH is a first-release peer type alongside local folders and external drives. Its first-release scope includes the same precheck, review, verification, confirmation, cancellation, resume, and reporting guarantees; SSH-specific capability and identity checks are mandatory rather than deferred features.
 The shared core executes local-to-SSH and SSH-to-local runs through one typed SSH backend boundary. The boundary must recheck remote capabilities around confirmation, supervise SSH and rsync in the run's process group, stage destination-side data before installation, and return endpoint-bound metadata and content proofs; the platform adapter owns the network runtime while the core owns policy and journal decisions.
+For remote Safe Delete, the same boundary exposes only verified remote Trash recovery: the adapter receives the journaled transfer proof, performs a controlled recovery operation, writes content-free provenance for custom/remote recovery, and returns evidence that the core validates and persists. Any unavailable or ambiguous recovery preserves the source and keeps the action in Recovery Review; Permanent Removal requires separate authorization and never occurs as fallback.
 
 First-release SSH topology is one local peer and one SSH peer: local-to-SSH or SSH-to-local. SSH-to-SSH synchronization is outside the first-release scope.
 

@@ -12,11 +12,12 @@ use crate::{
     AuthorizationSnapshot, DeletionMethod, ItemType, MetadataRequirements, OneWaySource, Peer,
     PeerSide, PartialTransferPolicy, PlanActionKind, ProcessSpecError, ProcessSpecification,
     ProfileSnapshotId, ReconciliationFindingKind, ReconciliationReason, RetryPolicy, RunId,
-    AnalysisOutcome, CompletionReconciliation, ConflictResolution, InventorySnapshotItem,
+    AnalysisOutcome, CompletionReconciliation, ConflictResolution, ContentProof, InventorySnapshotItem,
     ResolutionOperation, SourceDrainStatus, SourceInventorySnapshot, SyncBaseline,
     SyncBaselineItem, SyncBaselineItemState, SyncMode, SyncOptions, SyncProfile,
     ValidatedSyncOptions, VolumeIdentity,
 };
+use crate::restore::RecoveryProvenance;
 
 pub type ActionId = u64;
 
@@ -190,6 +191,9 @@ pub struct RecoveryEvidence {
     destination_size: Option<u64>,
     source_sha256: Option<[u8; 32]>,
     destination_sha256: Option<[u8; 32]>,
+    recovery_size: Option<u64>,
+    recovery_sha256: Option<[u8; 32]>,
+    provenance: Option<RecoveryProvenance>,
 }
 
 impl RecoveryEvidence {
@@ -215,6 +219,9 @@ impl RecoveryEvidence {
             destination_size,
             source_sha256,
             destination_sha256,
+            recovery_size: None,
+            recovery_sha256: None,
+            provenance: None,
         }
     }
 
@@ -252,6 +259,29 @@ impl RecoveryEvidence {
 
     pub fn destination_sha256(&self) -> Option<&[u8; 32]> {
         self.destination_sha256.as_ref()
+    }
+
+    pub fn with_provenance(mut self, provenance: RecoveryProvenance) -> Self {
+        self.provenance = Some(provenance);
+        self
+    }
+
+    pub fn with_recovery_proof(mut self, size: u64, sha256: Option<[u8; 32]>) -> Self {
+        self.recovery_size = Some(size);
+        self.recovery_sha256 = sha256;
+        self
+    }
+
+    pub const fn recovery_size(&self) -> Option<u64> {
+        self.recovery_size
+    }
+
+    pub fn recovery_sha256(&self) -> Option<&[u8; 32]> {
+        self.recovery_sha256.as_ref()
+    }
+
+    pub fn provenance(&self) -> Option<&RecoveryProvenance> {
+        self.provenance.as_ref()
     }
 
     fn is_newer_than(&self, earlier: &Self) -> bool {
@@ -866,7 +896,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 12 {
+        if version > 14 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -1207,6 +1237,62 @@ impl RunEvidenceStore {
                 }
             }
             transaction.pragma_update(None, "user_version", 12)?;
+            transaction.commit()?;
+            version = 12;
+        }
+        if version == 12 {
+            let transaction = connection.transaction()?;
+            let columns = [
+                ("recovery_provenance_peer", "TEXT"),
+                ("recovery_provenance_root", "BLOB"),
+                ("recovery_provenance_relative", "BLOB"),
+                ("recovery_provenance_run_id", "INTEGER"),
+                ("recovery_provenance_removed_at_unix_nanos", "INTEGER"),
+                ("recovery_provenance_item_type", "TEXT"),
+                ("recovery_provenance_device", "INTEGER"),
+                ("recovery_provenance_inode", "INTEGER"),
+            ];
+            for (name, definition) in columns {
+                let exists: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info('action_events') WHERE name = ?1
+                    )",
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    transaction.execute(
+                        &format!("ALTER TABLE action_events ADD COLUMN {name} {definition}"),
+                        [],
+                    )?;
+                }
+            }
+            transaction.pragma_update(None, "user_version", 13)?;
+            transaction.commit()?;
+            version = 13;
+        }
+        if version == 13 {
+            let transaction = connection.transaction()?;
+            let columns = [
+                ("recovery_item_size", "INTEGER"),
+                ("recovery_item_sha256", "BLOB"),
+            ];
+            for (name, definition) in columns {
+                let exists: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info('action_events') WHERE name = ?1
+                    )",
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    transaction.execute(
+                        &format!("ALTER TABLE action_events ADD COLUMN {name} {definition}"),
+                        [],
+                    )?;
+                }
+            }
+            transaction.pragma_update(None, "user_version", 14)?;
             transaction.commit()?;
         }
         verify_integrity(&connection)?;
@@ -2242,8 +2328,14 @@ impl RunEvidenceStore {
                 recovery_present, recovery_source_size, recovery_destination_size,
                 recovery_source_sha256, recovery_destination_sha256, resolution,
                 proof_destination_size, proof_destination_sha256,
-                proof_metadata_verified, deletion_method
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30)",
+                proof_metadata_verified, deletion_method,
+                recovery_provenance_peer, recovery_provenance_root,
+                recovery_provenance_relative, recovery_provenance_run_id,
+                recovery_provenance_removed_at_unix_nanos,
+                recovery_provenance_item_type, recovery_provenance_device,
+                recovery_provenance_inode, recovery_item_size,
+                recovery_item_sha256
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
             params![
                 run_id.value(),
                 action_id,
@@ -2275,6 +2367,16 @@ impl RunEvidenceStore {
                 fields.proof_destination_sha256,
                 fields.proof_metadata_verified,
                 fields.deletion_method,
+                fields.recovery_provenance_peer,
+                fields.recovery_provenance_root,
+                fields.recovery_provenance_relative,
+                fields.recovery_provenance_run_id,
+                fields.recovery_provenance_removed_at_unix_nanos,
+                fields.recovery_provenance_item_type,
+                fields.recovery_provenance_device,
+                fields.recovery_provenance_inode,
+                fields.recovery_item_size,
+                fields.recovery_item_sha256,
             ],
         )?;
         transaction.commit()?;
@@ -2305,7 +2407,13 @@ impl RunEvidenceStore {
                     recovery_present, recovery_source_size, recovery_destination_size,
                     recovery_source_sha256, recovery_destination_sha256, resolution,
                     proof_destination_size, proof_destination_sha256,
-                    proof_metadata_verified, deletion_method
+                    proof_metadata_verified, deletion_method,
+                    recovery_provenance_peer, recovery_provenance_root,
+                    recovery_provenance_relative, recovery_provenance_run_id,
+                    recovery_provenance_removed_at_unix_nanos,
+                    recovery_provenance_item_type, recovery_provenance_device,
+                    recovery_provenance_inode, recovery_item_size,
+                    recovery_item_sha256
              FROM action_events WHERE run_id = ?1 ORDER BY action_id, sequence",
         )?;
         let rows = statement
@@ -2339,6 +2447,16 @@ impl RunEvidenceStore {
                     proof_destination_sha256: row.get(26)?,
                     proof_metadata_verified: row.get(27)?,
                     deletion_method: row.get(28)?,
+                    recovery_provenance_peer: row.get(29)?,
+                    recovery_provenance_root: row.get(30)?,
+                    recovery_provenance_relative: row.get(31)?,
+                    recovery_provenance_run_id: row.get(32)?,
+                    recovery_provenance_removed_at_unix_nanos: row.get(33)?,
+                    recovery_provenance_item_type: row.get(34)?,
+                    recovery_provenance_device: row.get(35)?,
+                    recovery_provenance_inode: row.get(36)?,
+                    recovery_item_size: row.get(37)?,
+                    recovery_item_sha256: row.get(38)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2571,6 +2689,16 @@ struct EventFields {
     proof_destination_sha256: Option<Vec<u8>>,
     proof_metadata_verified: Option<i64>,
     deletion_method: Option<&'static str>,
+    recovery_provenance_peer: Option<String>,
+    recovery_provenance_root: Option<Vec<u8>>,
+    recovery_provenance_relative: Option<Vec<u8>>,
+    recovery_provenance_run_id: Option<i64>,
+    recovery_provenance_removed_at_unix_nanos: Option<i64>,
+    recovery_provenance_item_type: Option<&'static str>,
+    recovery_provenance_device: Option<u64>,
+    recovery_provenance_inode: Option<u64>,
+    recovery_item_size: Option<i64>,
+    recovery_item_sha256: Option<Vec<u8>>,
 }
 
 impl EventFields {
@@ -2603,6 +2731,16 @@ impl EventFields {
             proof_destination_sha256: None,
             proof_metadata_verified: None,
             deletion_method: None,
+            recovery_provenance_peer: None,
+            recovery_provenance_root: None,
+            recovery_provenance_relative: None,
+            recovery_provenance_run_id: None,
+            recovery_provenance_removed_at_unix_nanos: None,
+            recovery_provenance_item_type: None,
+            recovery_provenance_device: None,
+            recovery_provenance_inode: None,
+            recovery_item_size: None,
+            recovery_item_sha256: None,
         };
         match event {
             JournalEvent::Planned { action } => Self {
@@ -2633,6 +2771,16 @@ impl EventFields {
                 proof_destination_sha256: None,
                 proof_metadata_verified: None,
                 deletion_method: None,
+                recovery_provenance_peer: None,
+                recovery_provenance_root: None,
+                recovery_provenance_relative: None,
+                recovery_provenance_run_id: None,
+                recovery_provenance_removed_at_unix_nanos: None,
+                recovery_provenance_item_type: None,
+                recovery_provenance_device: None,
+                recovery_provenance_inode: None,
+                recovery_item_size: None,
+                recovery_item_sha256: None,
             },
             JournalEvent::Started { .. } => {
                 let mut fields = empty();
@@ -2748,6 +2896,22 @@ fn set_recovery_fields(fields: &mut EventFields, evidence: &RecoveryEvidence) {
     fields.recovery_destination_size = evidence.destination_size.map(|size| size as i64);
     fields.recovery_source_sha256 = evidence.source_sha256.map(|hash| hash.to_vec());
     fields.recovery_destination_sha256 = evidence.destination_sha256.map(|hash| hash.to_vec());
+    fields.recovery_item_size = evidence.recovery_size.map(|size| size as i64);
+    fields.recovery_item_sha256 = evidence.recovery_sha256.map(|hash| hash.to_vec());
+    if let Some(provenance) = evidence.provenance() {
+        fields.recovery_provenance_peer = Some(provenance.peer().to_owned());
+        fields.recovery_provenance_root = Some(path_to_blob(provenance.original_root()));
+        fields.recovery_provenance_relative = Some(path_to_blob(provenance.relative_path()));
+        fields.recovery_provenance_run_id = Some(provenance.run_id().value() as i64);
+        fields.recovery_provenance_removed_at_unix_nanos = Some(provenance.removed_at_unix_nanos());
+        fields.recovery_provenance_item_type = Some(encode_item_type(provenance.item_type()));
+        fields.recovery_provenance_device = provenance
+            .source_identity()
+            .map(|identity| identity.device());
+        fields.recovery_provenance_inode = provenance
+            .source_identity()
+            .map(|identity| identity.inode());
+    }
 }
 
 fn terminal_fields(phase: &'static str, reason: ActionReason) -> EventFields {
@@ -2779,6 +2943,16 @@ fn terminal_fields(phase: &'static str, reason: ActionReason) -> EventFields {
         proof_destination_sha256: None,
         proof_metadata_verified: None,
         deletion_method: None,
+        recovery_provenance_peer: None,
+        recovery_provenance_root: None,
+        recovery_provenance_relative: None,
+        recovery_provenance_run_id: None,
+        recovery_provenance_removed_at_unix_nanos: None,
+        recovery_provenance_item_type: None,
+        recovery_provenance_device: None,
+        recovery_provenance_inode: None,
+        recovery_item_size: None,
+        recovery_item_sha256: None,
     }
 }
 
@@ -2838,6 +3012,16 @@ struct StoredEvent {
     proof_destination_sha256: Option<Vec<u8>>,
     proof_metadata_verified: Option<bool>,
     deletion_method: Option<String>,
+    recovery_provenance_peer: Option<String>,
+    recovery_provenance_root: Option<Vec<u8>>,
+    recovery_provenance_relative: Option<Vec<u8>>,
+    recovery_provenance_run_id: Option<i64>,
+    recovery_provenance_removed_at_unix_nanos: Option<i64>,
+    recovery_provenance_item_type: Option<String>,
+    recovery_provenance_device: Option<u64>,
+    recovery_provenance_inode: Option<u64>,
+    recovery_item_size: Option<u64>,
+    recovery_item_sha256: Option<Vec<u8>>,
 }
 
 fn apply_stored_event(
@@ -3179,6 +3363,8 @@ fn validate_removal_evidence(
         || !evidence.destination_present()
         || evidence.destination_size().is_none()
         || (content_proof_required && evidence.destination_sha256().is_none())
+        || (evidence.provenance().is_some()
+            && (evidence.recovery_size().is_none() || evidence.recovery_sha256().is_none()))
         || !valid_recovery
     {
         return Err(StorageError::CorruptEvidence(
@@ -3241,7 +3427,7 @@ fn decode_recovery_evidence(row: &StoredEvent) -> Result<RecoveryEvidence, Stora
     let recovery_present = row.recovery_present.ok_or_else(|| {
         StorageError::CorruptEvidence("recovery review has no recovery presence evidence".to_owned())
     })?;
-    Ok(RecoveryEvidence::new(
+    let evidence = RecoveryEvidence::new(
         observed_at_unix_nanos,
         row.recovery_target
             .as_deref()
@@ -3254,7 +3440,90 @@ fn decode_recovery_evidence(row: &StoredEvent) -> Result<RecoveryEvidence, Stora
         row.recovery_destination_size,
         decode_hash(row.recovery_source_sha256.as_deref())?,
         decode_hash(row.recovery_destination_sha256.as_deref())?,
-    ))
+    );
+    let evidence = match row.recovery_item_size {
+        Some(size) => evidence.with_recovery_proof(
+            size,
+            decode_hash(row.recovery_item_sha256.as_deref())?,
+        ),
+        None if row.recovery_item_sha256.is_some() => {
+            return Err(StorageError::CorruptEvidence(
+                "recovery item content proof is incomplete".to_owned(),
+            ));
+        }
+        None => evidence,
+    };
+    let provenance = decode_recovery_provenance(row)?;
+    Ok(match provenance {
+        Some(provenance) => evidence.with_provenance(provenance),
+        None => evidence,
+    })
+}
+
+fn decode_recovery_provenance(
+    row: &StoredEvent,
+) -> Result<Option<RecoveryProvenance>, StorageError> {
+    let fields_present = row.recovery_provenance_peer.is_some()
+        || row.recovery_provenance_root.is_some()
+        || row.recovery_provenance_relative.is_some()
+        || row.recovery_provenance_run_id.is_some()
+        || row.recovery_provenance_removed_at_unix_nanos.is_some()
+        || row.recovery_provenance_item_type.is_some()
+        || row.recovery_provenance_device.is_some()
+        || row.recovery_provenance_inode.is_some();
+    if !fields_present {
+        return Ok(None);
+    }
+    let peer = row.recovery_provenance_peer.clone().ok_or_else(|| {
+        StorageError::CorruptEvidence("recovery provenance has no peer".to_owned())
+    })?;
+    let root = blob_to_path(row.recovery_provenance_root.as_deref().ok_or_else(|| {
+        StorageError::CorruptEvidence("recovery provenance has no original root".to_owned())
+    })?)?;
+    let relative = blob_to_path(row.recovery_provenance_relative.as_deref().ok_or_else(|| {
+        StorageError::CorruptEvidence("recovery provenance has no relative path".to_owned())
+    })?)?;
+    let run_id = row.recovery_provenance_run_id.ok_or_else(|| {
+        StorageError::CorruptEvidence("recovery provenance has no run id".to_owned())
+    })?;
+    let removed_at = row.recovery_provenance_removed_at_unix_nanos.ok_or_else(|| {
+        StorageError::CorruptEvidence("recovery provenance has no removal time".to_owned())
+    })?;
+    let item_type = decode_item_type(row.recovery_provenance_item_type.as_deref().ok_or_else(|| {
+        StorageError::CorruptEvidence("recovery provenance has no item type".to_owned())
+    })?)?;
+    let source_identity = match (row.recovery_provenance_device, row.recovery_provenance_inode) {
+        (Some(device), Some(inode)) => Some(FileIdentity::new(device, inode)),
+        (None, None) => None,
+        _ => {
+            return Err(StorageError::CorruptEvidence(
+                "recovery provenance identity is incomplete".to_owned(),
+            ))
+        }
+    };
+    let content = match (row.recovery_source_size, decode_hash(row.recovery_source_sha256.as_deref())?) {
+        (Some(size), Some(hash)) => Some(ContentProof::new(size, hash)),
+        (None, None) => None,
+        _ => {
+            return Err(StorageError::CorruptEvidence(
+                "recovery provenance content proof is incomplete".to_owned(),
+            ))
+        }
+    };
+    RecoveryProvenance::from_record(
+        peer,
+        root,
+        relative,
+        RunId::new(u64::try_from(run_id).map_err(|_| {
+            StorageError::CorruptEvidence("recovery provenance run id is invalid".to_owned())
+        })?),
+        removed_at,
+        item_type,
+        content,
+        source_identity,
+    )
+    .map(Some)
+    .map_err(|error| StorageError::CorruptEvidence(error.to_string()))
 }
 
 fn decode_hash(bytes: Option<&[u8]>) -> Result<Option<[u8; 32]>, StorageError> {
@@ -4470,7 +4739,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 12);
+        assert_eq!(version, 14);
         assert!(
             migrated
                 .connection
