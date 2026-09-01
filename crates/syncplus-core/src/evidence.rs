@@ -478,6 +478,10 @@ impl ActionJournalEntry {
         self.started
     }
 
+    pub fn last_phase(&self) -> &str {
+        &self.last_phase
+    }
+
     pub fn progress_bytes(&self) -> &[u64] {
         &self.progress_bytes
     }
@@ -809,6 +813,12 @@ pub enum StorageError {
     ScheduleRequiresAdvanced,
     ConcurrentProfileUpdate,
     ProfileNotFound { id: u64 },
+    ReportNotFound { run_id: u64 },
+    ReportActionNotAllowed {
+        run_id: u64,
+        action: &'static str,
+        status: RunReportStatus,
+    },
     UnsafeDatabasePath,
     UnsupportedRemotePeer,
     InvalidSnapshot(String),
@@ -838,6 +848,15 @@ impl fmt::Display for StorageError {
                 "the Sync Profile changed in another UI or scheduler operation; reload it before saving",
             ),
             Self::ProfileNotFound { id } => write!(formatter, "Sync Profile {id} was not found"),
+            Self::ReportNotFound { run_id } => write!(formatter, "Sync Run report {run_id} was not found"),
+            Self::ReportActionNotAllowed {
+                run_id,
+                action,
+                status,
+            } => write!(
+                formatter,
+                "{action} is not available for Sync Run {run_id} with status {status:?}"
+            ),
             Self::UnsafeDatabasePath => formatter.write_str("the canonical database path is unsafe"),
             Self::UnsupportedRemotePeer => write!(
                 formatter,
@@ -2849,6 +2868,87 @@ impl RunEvidenceStore {
             peer_b_inventory,
             mirror_resolutions,
         })
+    }
+
+    /// Load durable reports newest first. Reports remain available across
+    /// application restarts until one of the explicit metadata actions below
+    /// is selected.
+    pub fn list_run_reports(&self) -> Result<Vec<RunReport>, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT run_id FROM run_snapshots ORDER BY run_id DESC")?;
+        let run_ids = statement
+            .query_map([], |row| row.get::<_, u64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        run_ids
+            .into_iter()
+            .map(|run_id| self.load_report(RunId::new(run_id)))
+            .collect()
+    }
+
+    /// Remove only a completed report's SQLite metadata. This method never
+    /// touches source or destination paths; unresolved work must use the
+    /// separate discard action so its consequence is explicit in the UI.
+    pub fn remove_completed_report(&mut self, run_id: RunId) -> Result<(), StorageError> {
+        let report = self.load_report_or_not_found(run_id)?;
+        if !matches!(report.status(), RunReportStatus::Completed | RunReportStatus::ReviewCleared) {
+            return Err(StorageError::ReportActionNotAllowed {
+                run_id: run_id.value(),
+                action: "Remove Completed Report",
+                status: report.status(),
+            });
+        }
+        self.delete_report_metadata(run_id)
+    }
+
+    /// Discard only unresolved report metadata. It intentionally performs no
+    /// filesystem operation and tells callers that Recovery Review evidence is
+    /// being discarded with the report.
+    pub fn discard_unresolved_run(&mut self, run_id: RunId) -> Result<(), StorageError> {
+        let report = self.load_report_or_not_found(run_id)?;
+        if matches!(
+            report.status(),
+            RunReportStatus::Completed | RunReportStatus::ReviewCleared | RunReportStatus::InProgress
+        ) {
+            return Err(StorageError::ReportActionNotAllowed {
+                run_id: run_id.value(),
+                action: "Discard Unresolved Run",
+                status: report.status(),
+            });
+        }
+        self.delete_report_metadata(run_id)
+    }
+
+    fn load_report_or_not_found(&self, run_id: RunId) -> Result<RunReport, StorageError> {
+        self.load_report(run_id).map_err(|error| {
+            if matches!(
+                &error,
+                StorageError::Sqlite(rusqlite::Error::QueryReturnedNoRows)
+            ) {
+                StorageError::ReportNotFound {
+                    run_id: run_id.value(),
+                }
+            } else {
+                error
+            }
+        })
+    }
+
+    fn delete_report_metadata(&mut self, run_id: RunId) -> Result<(), StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "DELETE FROM run_snapshots WHERE run_id = ?1",
+            params![run_id.value()],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ReportNotFound {
+                run_id: run_id.value(),
+            });
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Record the user's explicit final acknowledgement after every action is
