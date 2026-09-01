@@ -251,6 +251,32 @@ fn profile_edits_and_removal_do_not_mutate_a_started_run_snapshot() {
 }
 
 #[test]
+fn profile_removal_changes_metadata_only_and_preserves_endpoint_files() {
+    let database = database();
+    let source = TestDirectory::new();
+    let destination = TestDirectory::new();
+    let source_file = source.path().join("source.txt");
+    let destination_file = destination.path().join("destination.txt");
+    fs::write(&source_file, b"source data").expect("source file");
+    fs::write(&destination_file, b"destination data").expect("destination file");
+    let profile = SyncProfile::new(
+        "local files",
+        Peer::new("source", source.path().to_path_buf()),
+        Peer::new("destination", destination.path().to_path_buf()),
+    );
+
+    let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+    let profile_id = store.create_profile(&profile).expect("create profile").id();
+    assert!(store.remove_profile(profile_id).expect("remove profile"));
+    assert!(source_file.is_file());
+    assert!(destination_file.is_file());
+    assert!(store
+        .load_profile(profile_id)
+        .expect("load removed profile")
+        .is_none());
+}
+
+#[test]
 fn stale_profile_revision_cannot_overwrite_a_concurrent_update() {
     let database = database();
     let mut initializer = RunEvidenceStore::open(database.path()).expect("open database");

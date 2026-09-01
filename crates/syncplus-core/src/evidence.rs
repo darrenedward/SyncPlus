@@ -2890,33 +2890,29 @@ impl RunEvidenceStore {
     /// touches source or destination paths; unresolved work must use the
     /// separate discard action so its consequence is explicit in the UI.
     pub fn remove_completed_report(&mut self, run_id: RunId) -> Result<(), StorageError> {
-        let report = self.load_report_or_not_found(run_id)?;
-        if !matches!(report.status(), RunReportStatus::Completed | RunReportStatus::ReviewCleared) {
-            return Err(StorageError::ReportActionNotAllowed {
-                run_id: run_id.value(),
-                action: "Remove Completed Report",
-                status: report.status(),
-            });
-        }
-        self.delete_report_metadata(run_id)
+        self.delete_report_metadata(
+            run_id,
+            "Remove Completed Report",
+            |status| matches!(status, RunReportStatus::Completed | RunReportStatus::ReviewCleared),
+        )
     }
 
     /// Discard only unresolved report metadata. It intentionally performs no
     /// filesystem operation and tells callers that Recovery Review evidence is
     /// being discarded with the report.
     pub fn discard_unresolved_run(&mut self, run_id: RunId) -> Result<(), StorageError> {
-        let report = self.load_report_or_not_found(run_id)?;
-        if matches!(
-            report.status(),
-            RunReportStatus::Completed | RunReportStatus::ReviewCleared | RunReportStatus::InProgress
-        ) {
-            return Err(StorageError::ReportActionNotAllowed {
-                run_id: run_id.value(),
-                action: "Discard Unresolved Run",
-                status: report.status(),
-            });
-        }
-        self.delete_report_metadata(run_id)
+        self.delete_report_metadata(
+            run_id,
+            "Discard Unresolved Run",
+            |status| {
+                !matches!(
+                    status,
+                    RunReportStatus::Completed
+                        | RunReportStatus::ReviewCleared
+                        | RunReportStatus::InProgress
+                )
+            },
+        )
     }
 
     fn load_report_or_not_found(&self, run_id: RunId) -> Result<RunReport, StorageError> {
@@ -2934,38 +2930,77 @@ impl RunEvidenceStore {
         })
     }
 
-    fn delete_report_metadata(&mut self, run_id: RunId) -> Result<(), StorageError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "DELETE FROM run_snapshots WHERE run_id = ?1",
-            params![run_id.value()],
-        )?;
-        if changed != 1 {
-            return Err(StorageError::ReportNotFound {
-                run_id: run_id.value(),
-            });
+    fn delete_report_metadata(
+        &mut self,
+        run_id: RunId,
+        action: &'static str,
+        allowed: impl FnOnce(RunReportStatus) -> bool,
+    ) -> Result<(), StorageError> {
+        self.with_immediate_transaction(|store| {
+            let report = store.load_report_or_not_found(run_id)?;
+            if !allowed(report.status()) {
+                return Err(StorageError::ReportActionNotAllowed {
+                    run_id: run_id.value(),
+                    action,
+                    status: report.status(),
+                });
+            }
+            let changed = store.connection.execute(
+                "DELETE FROM run_snapshots WHERE run_id = ?1",
+                params![run_id.value()],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::ReportNotFound {
+                    run_id: run_id.value(),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn with_immediate_transaction<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = operation(self);
+        match result {
+            Ok(value) => match self.connection.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    let _ = self.connection.execute_batch("ROLLBACK");
+                    Err(StorageError::Sqlite(error))
+                }
+            },
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
-        transaction.commit()?;
-        Ok(())
     }
 
     /// Record the user's explicit final acknowledgement after every action is
     /// settled. This never changes user files or erases the journal.
     pub fn mark_review_cleared(&mut self, run_id: RunId) -> Result<(), StorageError> {
-        let report = self.load_report(run_id)?;
-        if !report.can_mark_review_cleared() {
-            return Err(StorageError::InvalidEvent(
-                "Review-Cleared requires settled actions and a reconciliation with no findings"
-                    .to_owned(),
-            ));
-        }
-        self.connection.execute(
-            "UPDATE run_snapshots SET review_cleared = 1 WHERE run_id = ?1",
-            params![run_id.value()],
-        )?;
-        Ok(())
+        self.with_immediate_transaction(|store| {
+            let report = store.load_report_or_not_found(run_id)?;
+            if !report.can_mark_review_cleared() {
+                return Err(StorageError::InvalidEvent(
+                    "Review-Cleared requires settled actions and a reconciliation with no findings"
+                        .to_owned(),
+                ));
+            }
+            let changed = store.connection.execute(
+                "UPDATE run_snapshots SET review_cleared = 1 WHERE run_id = ?1",
+                params![run_id.value()],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::ReportNotFound {
+                    run_id: run_id.value(),
+                });
+            }
+            Ok(())
+        })
     }
 }
 

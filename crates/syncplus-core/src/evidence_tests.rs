@@ -166,7 +166,9 @@ fn interrupted_action_is_durable_and_remains_open_for_resume() {
         .append_event(run_id, JournalEvent::Interrupted { action_id: 1 })
         .expect("persist interruption");
 
-    let report = store.load_report(run_id).expect("load interrupted report");
+    drop(store);
+    let reopened = RunEvidenceStore::open(path.path()).expect("reopen evidence store");
+    let report = reopened.load_report(run_id).expect("load interrupted report");
     assert_eq!(report.status(), RunReportStatus::Interrupted);
     assert_eq!(report.execution_result(), RunExecutionResult::Interrupted);
     assert_eq!(report.items()[0].progress_bytes(), 21);
@@ -605,6 +607,122 @@ fn run_report_metadata_actions_are_status_guarded_and_filesystem_neutral() {
     assert!(store.list_run_reports().expect("list after discard").is_empty());
     let _ = fs::remove_dir_all(source);
     let _ = fs::remove_dir_all(destination);
+}
+
+#[test]
+fn report_retention_survives_restart_and_protects_unresolved_outcomes() {
+    let path = TestDatabase::new();
+    let mut store = RunEvidenceStore::open(path.path()).expect("open evidence store");
+    let completed_run = RunId::new(39);
+    store
+        .begin_run(&snapshot(completed_run.value()))
+        .expect("completed snapshot");
+    store
+        .append_event(
+            completed_run,
+            JournalEvent::Planned { action: action(1) },
+        )
+        .expect("completed plan");
+    store
+        .append_event(completed_run, JournalEvent::Started { action_id: 1 })
+        .expect("completed start");
+    store
+        .append_event(completed_run, JournalEvent::Completed { action_id: 1 })
+        .expect("completed outcome");
+    let statuses = [
+        (40, JournalEvent::Failed {
+            action_id: 1,
+            reason: ActionReason::TransferFailed,
+        }),
+        (41, JournalEvent::Cancelled { action_id: 1 }),
+        (42, JournalEvent::Interrupted { action_id: 1 }),
+        (43, JournalEvent::Unresolved {
+            action_id: 1,
+            reason: ActionReason::PermissionDenied,
+        }),
+    ];
+    for (run_id, terminal_event) in statuses {
+        let run_id = RunId::new(run_id);
+        store.begin_run(&snapshot(run_id.value())).expect("snapshot");
+        store
+            .append_event(run_id, JournalEvent::Planned { action: action(1) })
+            .expect("plan");
+        store
+            .append_event(run_id, JournalEvent::Started { action_id: 1 })
+            .expect("start");
+        store.append_event(run_id, terminal_event).expect("terminal event");
+    }
+    drop(store);
+
+    let mut reopened = RunEvidenceStore::open(path.path()).expect("reopen evidence store");
+    let reports = reopened.list_run_reports().expect("retained reports");
+    assert_eq!(reports.len(), 5);
+    assert_eq!(
+        reports
+            .iter()
+            .find(|report| report.run_id() == completed_run)
+            .expect("completed report")
+            .status(),
+        RunReportStatus::Completed
+    );
+    reopened
+        .remove_completed_report(completed_run)
+        .expect("explicit completed report removal");
+    for report in reports {
+        if report.run_id() == completed_run {
+            continue;
+        }
+        assert!(reopened
+            .remove_completed_report(report.run_id())
+            .is_err(),
+            "{} must not use the completed-report action",
+            report.run_id().value()
+        );
+    }
+    for run_id in [40, 41, 42, 43].map(RunId::new) {
+        reopened
+            .discard_unresolved_run(run_id)
+            .expect("explicit unresolved discard");
+    }
+    assert!(reopened.list_run_reports().expect("reports after discard").is_empty());
+}
+
+#[test]
+fn concurrent_completed_report_removal_has_one_metadata_winner() {
+    let path = TestDatabase::new();
+    let run_id = RunId::new(44);
+    let mut setup = RunEvidenceStore::open(path.path()).expect("open evidence store");
+    setup.begin_run(&snapshot(run_id.value())).expect("snapshot");
+    setup
+        .append_event(run_id, JournalEvent::Planned { action: action(1) })
+        .expect("plan");
+    setup
+        .append_event(run_id, JournalEvent::Started { action_id: 1 })
+        .expect("start");
+    setup
+        .append_event(run_id, JournalEvent::Completed { action_id: 1 })
+        .expect("complete");
+    drop(setup);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let barrier = std::sync::Arc::clone(&barrier);
+        let database_path = path.path().to_path_buf();
+        workers.push(std::thread::spawn(move || {
+            let mut store = RunEvidenceStore::open(database_path).expect("worker database");
+            barrier.wait();
+            store.remove_completed_report(run_id).is_ok()
+        }));
+    }
+    let successful_removals = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker should finish"))
+        .filter(|removed| *removed)
+        .count();
+    assert_eq!(successful_removals, 1);
+    let reopened = RunEvidenceStore::open(path.path()).expect("reopen evidence store");
+    assert!(reopened.list_run_reports().expect("reports after race").is_empty());
 }
 
 fn tempfile_dir(label: &str) -> PathBuf {
