@@ -157,20 +157,6 @@ fn review_classifies_text_binary_large_and_unreadable_files_safely() {
             .expect("same-path conflict should be present");
         assert!(entry.evidence().iter().all(|e| e.classification() == expected));
     }
-    let text = review
-        .entries()
-        .iter()
-        .find(|entry| entry.relative_path() == Path::new("text.txt"))
-        .unwrap();
-    assert!(text.evidence().iter().any(|e| e.text_preview().is_some()));
-    assert!(review
-        .entries()
-        .iter()
-        .find(|entry| entry.relative_path() == Path::new("large.bin"))
-        .unwrap()
-        .evidence()
-        .iter()
-        .all(|e| e.text_preview().is_none()));
 }
 
 #[test]

@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{ConflictReview, PeerSide};
+use crate::{ConflictEntry, ConflictEntryKey, ConflictReview, PeerSide};
 
 /// The only decisions a Mirror conflict may receive.
 ///
@@ -34,20 +34,35 @@ impl ConflictResolution {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictDecision {
-    relative_path: PathBuf,
+    entry_key: ConflictEntryKey,
     resolution: ConflictResolution,
 }
 
 impl ConflictDecision {
     pub fn new(relative_path: impl Into<PathBuf>, resolution: ConflictResolution) -> Self {
         Self {
-            relative_path: relative_path.into(),
+            entry_key: ConflictEntryKey::same_path(relative_path),
             resolution,
         }
     }
 
+    pub fn for_entry(entry: &ConflictEntry, resolution: ConflictResolution) -> Self {
+        Self::for_key(entry.key(), resolution)
+    }
+
+    pub fn for_key(entry_key: ConflictEntryKey, resolution: ConflictResolution) -> Self {
+        Self {
+            entry_key,
+            resolution,
+        }
+    }
+
+    pub fn key(&self) -> &ConflictEntryKey {
+        &self.entry_key
+    }
+
     pub fn relative_path(&self) -> &Path {
-        &self.relative_path
+        self.entry_key.relative_path()
     }
 
     pub const fn resolution(&self) -> ConflictResolution {
@@ -109,6 +124,7 @@ pub enum ResolutionOperation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictResolutionAction {
+    entry_key: ConflictEntryKey,
     relative_path: PathBuf,
     resolution: ConflictResolution,
     operation: ResolutionOperation,
@@ -122,6 +138,7 @@ impl ConflictResolutionAction {
     }
 
     fn from_decision(decision: ConflictDecision) -> Self {
+        let relative_path = decision.relative_path().to_path_buf();
         let (operation, source_side, target_side) = match decision.resolution {
             ConflictResolution::KeepPeerA => (
                 ResolutionOperation::CopyWholeFile,
@@ -142,12 +159,17 @@ impl ConflictResolutionAction {
             ConflictResolution::Defer => (ResolutionOperation::Defer, None, None),
         };
         Self {
-            relative_path: decision.relative_path,
+            entry_key: decision.entry_key,
+            relative_path,
             resolution: decision.resolution,
             operation,
             source_side,
             target_side,
         }
+    }
+
+    pub fn key(&self) -> &ConflictEntryKey {
+        &self.entry_key
     }
 
     pub fn relative_path(&self) -> &Path {
@@ -247,33 +269,34 @@ impl ConflictReview {
     where
         I: IntoIterator<Item = ConflictDecision>,
     {
-        let expected: BTreeSet<PathBuf> = self
+        let expected: BTreeSet<ConflictEntryKey> = self
             .entries()
             .iter()
-            .map(|entry| entry.relative_path().to_path_buf())
+            .filter(|entry| !entry.available_resolutions().is_empty())
+            .map(ConflictEntry::key)
             .collect();
-        let mut seen = BTreeSet::new();
+        let mut seen: BTreeSet<ConflictEntryKey> = BTreeSet::new();
         let mut actions = Vec::new();
 
         for decision in decisions {
             let Some(entry) = self
                 .entries()
                 .iter()
-                .find(|entry| entry.relative_path() == decision.relative_path)
+                .find(|entry| entry.key() == *decision.key())
             else {
                 return Err(ConflictResolutionError::UnknownConflict {
-                    relative_path: decision.relative_path,
+                    relative_path: decision.relative_path().to_path_buf(),
                 });
             };
             if !entry.available_resolutions().contains(&decision.resolution) {
                 return Err(ConflictResolutionError::UnavailableResolution {
-                    relative_path: decision.relative_path,
+                    relative_path: decision.relative_path().to_path_buf(),
                     resolution: decision.resolution,
                 });
             }
-            if !seen.insert(decision.relative_path.clone()) {
+            if !seen.insert(decision.key().clone()) {
                 return Err(ConflictResolutionError::DuplicateDecision {
-                    relative_path: decision.relative_path,
+                    relative_path: decision.relative_path().to_path_buf(),
                 });
             }
             actions.push(ConflictResolutionAction::from_decision(decision));
@@ -281,7 +304,7 @@ impl ConflictReview {
 
         if let Some(relative_path) = expected.difference(&seen).next() {
             return Err(ConflictResolutionError::MissingDecision {
-                relative_path: relative_path.clone(),
+                relative_path: relative_path.relative_path().to_path_buf(),
             });
         }
 

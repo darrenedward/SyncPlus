@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use eframe::egui;
 use syncplus_core::{
     AnalysisOutcome, ApplicationMode, ApplicationSettings, ConflictDecision, ConflictEntry,
+    ConflictEntryKey,
     ConflictResolution, ConflictReview, DeletionMethod, FreshAnalysis, LocalPrecheckProbe,
     MetadataRequirements, OneWaySource, PartialTransferPolicy, Peer, PeerEndpoint,
     PersistedSyncProfile, PrecheckErrorKind, PrecheckResult, ResolutionRun, RetryPolicy,
@@ -370,7 +371,7 @@ impl ProfileForm {
 #[derive(Debug, Clone)]
 struct ConflictReviewState {
     review: ConflictReview,
-    decisions: BTreeMap<PathBuf, ConflictResolution>,
+    decisions: BTreeMap<ConflictEntryKey, ConflictResolution>,
     resolution_run: Option<ResolutionRun>,
     confirmed: bool,
     error: Option<String>,
@@ -391,7 +392,8 @@ impl ConflictReviewState {
         self.review
             .entries()
             .iter()
-            .all(|entry| self.decisions.contains_key(entry.relative_path()))
+            .filter(|entry| !entry.available_resolutions().is_empty())
+            .all(|entry| self.decisions.contains_key(&entry.key()))
     }
 }
 
@@ -595,10 +597,27 @@ impl SyncPlusApp {
 
     pub fn conflict_resolution(&self, relative_path: impl Into<PathBuf>) -> Option<ConflictResolution> {
         let relative_path = relative_path.into();
+        let review = self.review.as_ref()?;
+        let conflicts = review.conflicts.as_ref()?;
+        let entries = conflicts
+            .review
+            .entries()
+            .iter()
+            .filter(|entry| entry.relative_path() == relative_path)
+            .collect::<Vec<_>>();
+        (entries.len() == 1)
+            .then(|| conflicts.decisions.get(&entries[0].key()).copied())
+            .flatten()
+    }
+
+    pub fn conflict_entry_resolution(
+        &self,
+        key: &ConflictEntryKey,
+    ) -> Option<ConflictResolution> {
         self.review
             .as_ref()
             .and_then(|review| review.conflicts.as_ref())
-            .and_then(|conflicts| conflicts.decisions.get(&relative_path).copied())
+            .and_then(|conflicts| conflicts.decisions.get(key).copied())
     }
 
     pub fn set_conflict_resolution(
@@ -607,6 +626,39 @@ impl SyncPlusApp {
         resolution: ConflictResolution,
     ) -> Result<(), UiValidationError> {
         let relative_path = relative_path.into();
+        let key = {
+            let review = self
+                .review
+                .as_ref()
+                .ok_or(UiValidationError::ConflictReviewNotReady)?;
+            let conflicts = review
+                .conflicts
+                .as_ref()
+                .ok_or(UiValidationError::ConflictReviewNotReady)?;
+            let mut entries = conflicts
+                .review
+                .entries()
+                .iter()
+                .filter(|entry| entry.relative_path() == relative_path);
+            let entry = entries
+                .next()
+                .ok_or_else(|| UiValidationError::Resolution(format!("no reviewed conflict exists for {}", relative_path.display())))?;
+            if entries.next().is_some() {
+                return Err(UiValidationError::Resolution(format!(
+                    "multiple reviewed conflicts use {}; select the typed conflict row",
+                    relative_path.display()
+                )));
+            }
+            entry.key()
+        };
+        self.set_conflict_entry_resolution(&key, resolution)
+    }
+
+    pub fn set_conflict_entry_resolution(
+        &mut self,
+        key: &ConflictEntryKey,
+        resolution: ConflictResolution,
+    ) -> Result<(), UiValidationError> {
         let conflicts = self
             .review
             .as_mut()
@@ -616,11 +668,11 @@ impl SyncPlusApp {
             .review
             .entries()
             .iter()
-            .find(|entry| entry.relative_path() == relative_path)
+            .find(|entry| entry.key() == *key)
             .ok_or_else(|| {
                 UiValidationError::Resolution(format!(
                     "no reviewed conflict exists for {}",
-                    relative_path.display()
+                    key.relative_path().display()
                 ))
             })?;
         if !entry.available_resolutions().contains(&resolution) {
@@ -630,14 +682,14 @@ impl SyncPlusApp {
                 conflict_kind_label(entry.kind())
             )));
         }
-        conflicts.decisions.insert(relative_path.clone(), resolution);
+        conflicts.decisions.insert(key.clone(), resolution);
         conflicts.resolution_run = None;
         conflicts.confirmed = false;
         conflicts.error = None;
         self.status = format!(
             "Selected {} for {}. Start a fresh Resolution Run review before any confirmation.",
             resolution_label(resolution),
-            relative_path.display()
+            key.relative_path().display()
         );
         Ok(())
     }
@@ -682,10 +734,7 @@ impl SyncPlusApp {
                 .entries()
                 .iter()
                 .map(|entry| {
-                    ConflictDecision::new(
-                        entry.relative_path(),
-                        conflicts.decisions[entry.relative_path()],
-                    )
+                    ConflictDecision::for_entry(entry, conflicts.decisions[&entry.key()])
                 })
                 .collect::<Vec<_>>();
             let reviewed_analysis = review
@@ -1227,7 +1276,8 @@ fn draw_conflict_review(ui: &mut egui::Ui, review: &mut PlanReviewState) -> Conf
 
         for entry in &entries {
             let path = entry.relative_path().to_path_buf();
-            ui.push_id(path.to_string_lossy(), |ui| {
+            let key = entry.key();
+            ui.push_id(format!("{:?}:{:?}", entry.kind(), key), |ui| {
                 ui.separator();
                 ui.label(format!("Conflict path: {}", path.display()));
                 ui.label(format!("Conflict kind: {}", conflict_kind_label(entry.kind())));
@@ -1252,7 +1302,7 @@ fn draw_conflict_review(ui: &mut egui::Ui, review: &mut PlanReviewState) -> Conf
                 }
 
                 ui.label(conflict_next_action(entry.kind()));
-                let previous = conflicts.decisions.get(&path).copied();
+                let previous = conflicts.decisions.get(&key).copied();
                 let mut selected = previous;
                 for resolution in entry.available_resolutions().iter().copied() {
                     ui.radio_value(
@@ -1263,9 +1313,9 @@ fn draw_conflict_review(ui: &mut egui::Ui, review: &mut PlanReviewState) -> Conf
                 }
                 if selected != previous {
                     if let Some(resolution) = selected {
-                        conflicts.decisions.insert(path.clone(), resolution);
+                        conflicts.decisions.insert(key.clone(), resolution);
                     } else {
-                        conflicts.decisions.remove(&path);
+                        conflicts.decisions.remove(&key);
                     }
                     decisions_changed = true;
                 }
