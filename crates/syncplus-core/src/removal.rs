@@ -331,7 +331,7 @@ impl SafeDeleteExecutor {
                 SafeDeleteError::Verification(VerificationError::HashMismatch),
             );
         }
-        let recovery_target = if let Some(recovery_root) = self.recovery_method.recovery_root() {
+        let (recovery_target, provenance) = if let Some(recovery_root) = self.recovery_method.recovery_root() {
             let (_recovery_root, recovery_target, same_filesystem) =
                 match validate_recovery_root(&source_root, &source, &recovery_root)
                 {
@@ -382,7 +382,26 @@ impl SafeDeleteExecutor {
                     return self.fail_unresolved(run_id, action.action_id(), store, error);
                 }
             }
-            Some(recovery_target)
+            let snapshot = store.load_snapshot(run_id)?;
+            let peer = match action.source_side() {
+                crate::PeerSide::PeerA => snapshot.profile().peer_a().name(),
+                crate::PeerSide::PeerB => snapshot.profile().peer_b().name(),
+            };
+            let source_metadata = proof.source_after().metadata();
+            let provenance = crate::RecoveryProvenance::new_for_action_with_target(
+                action.action_id(),
+                peer,
+                source_root.clone(),
+                action.relative_path().to_path_buf(),
+                run_id,
+                selected_method,
+                source_metadata.item_type(),
+                proof.source_after().content_proof(),
+                source_metadata.identity(),
+                source_metadata.symlink_target().map(Path::to_path_buf),
+            )
+            .map_err(|error| SafeDeleteError::RecoveryUnavailable(error.to_string()))?;
+            (Some(recovery_target), Some(provenance))
         } else {
             self.fail_unresolved(
                 run_id,
@@ -393,7 +412,7 @@ impl SafeDeleteExecutor {
                         .to_owned(),
                 ),
             )?;
-            None
+            (None, None)
         };
 
         let transfer_evidence = RecoveryEvidence::new(
@@ -447,6 +466,9 @@ impl SafeDeleteExecutor {
             action.relative_path(),
             proof,
             metadata_requirements,
+            provenance
+                .as_ref()
+                .ok_or_else(|| SafeDeleteError::RecoveryUnavailable("recovery provenance is unavailable".to_owned()))?,
         ) {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -506,12 +528,19 @@ impl SafeDeleteExecutor {
         relative_path: &Path,
         proof: &crate::VerifiedTransferProof,
         metadata_requirements: crate::MetadataRequirements,
+        provenance: &crate::RecoveryProvenance,
     ) -> Result<RemovalAttempt, SafeDeleteError> {
         match self.recovery_method.recovery_root() {
             Some(recovery_root) => {
                 let (recovery_root, recovery_target, same_filesystem) =
                     validate_recovery_root(source_root, source, &recovery_root)?;
-                let provenance = self.prepare_native_provenance(&source, &recovery_target)?;
+                if matches!(self.recovery_method, RecoveryMethod::VerifiedRecoveryFolder { .. }) {
+                    if let Some(parent) = recovery_target.parent() {
+                        fs::create_dir_all(parent).map_err(io_error)?;
+                    }
+                }
+                let provenance_path =
+                    self.prepare_recovery_provenance(provenance, &source, &recovery_target)?;
                 let result = if same_filesystem {
                     self.move_to_same_filesystem_recovery(
                         source_root,
@@ -521,6 +550,7 @@ impl SafeDeleteExecutor {
                         &recovery_target,
                         proof,
                         metadata_requirements,
+                        provenance,
                     )
                 } else {
                     self.copy_to_cross_filesystem_recovery(
@@ -531,10 +561,11 @@ impl SafeDeleteExecutor {
                         &recovery_target,
                         proof,
                         metadata_requirements,
+                        provenance,
                     )
                 };
                 if result.is_err() {
-                    if let Some(path) = provenance {
+                    if let Some(path) = provenance_path {
                         let _ = fs::remove_file(path);
                     }
                 }
@@ -568,9 +599,32 @@ impl SafeDeleteExecutor {
         let escaped = source.to_string_lossy().replace('%', "%25").replace('\n', "%0A");
         let contents = format!("[Trash Info]\nPath={escaped}\nDeletionDate={}\n", now_unix_nanos());
         let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&info).map_err(io_error)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600)).map_err(io_error)?;
+        }
         file.write_all(contents.as_bytes()).map_err(io_error)?;
         file.sync_all().map_err(io_error)?;
         Ok(Some(info))
+    }
+
+    fn prepare_recovery_provenance(
+        &self,
+        provenance: &crate::RecoveryProvenance,
+        source: &Path,
+        recovery_target: &Path,
+    ) -> Result<Option<PathBuf>, SafeDeleteError> {
+        match self.recovery_method {
+            RecoveryMethod::NativeTrash { .. } => {
+                self.prepare_native_provenance(source, recovery_target)
+            }
+            RecoveryMethod::VerifiedRecoveryFolder { .. } => provenance
+                .write_sidecar_for(recovery_target)
+                .map(Some)
+                .map_err(|error| SafeDeleteError::RecoveryUnavailable(error.to_string())),
+            RecoveryMethod::PermanentRemoval => Ok(None),
+        }
     }
 
     fn move_to_same_filesystem_recovery(
@@ -582,6 +636,7 @@ impl SafeDeleteExecutor {
         recovery_target: &Path,
         proof: &crate::VerifiedTransferProof,
         metadata_requirements: crate::MetadataRequirements,
+        provenance: &crate::RecoveryProvenance,
     ) -> Result<RemovalAttempt, SafeDeleteError> {
         #[cfg(target_os = "linux")]
         {
@@ -633,7 +688,7 @@ impl SafeDeleteExecutor {
             Ok(RemovalAttempt {
                 result: RemovalResult::new(
                     DeletionMethod::Trash,
-                    removal_evidence(Some(recovery_target), true, proof),
+                    removal_evidence(Some(recovery_target), true, proof, provenance.clone()),
                 ),
                 source_guard,
             })
@@ -663,6 +718,7 @@ impl SafeDeleteExecutor {
         recovery_target: &Path,
         proof: &crate::VerifiedTransferProof,
         metadata_requirements: crate::MetadataRequirements,
+        provenance: &crate::RecoveryProvenance,
     ) -> Result<RemovalAttempt, SafeDeleteError> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -672,8 +728,9 @@ impl SafeDeleteExecutor {
                 relative_path,
                 _source,
                 recovery_target,
-            proof,
-            metadata_requirements,
+                proof,
+                metadata_requirements,
+                provenance,
             );
             return Err(SafeDeleteError::RecoveryUnavailable(
                 "descriptor-relative cross-filesystem recovery is supported only on Linux"
@@ -731,7 +788,7 @@ impl SafeDeleteExecutor {
                     Ok(RemovalAttempt {
                         result: RemovalResult::new(
                             DeletionMethod::Trash,
-                            removal_evidence(Some(recovery_target), true, proof),
+                            removal_evidence(Some(recovery_target), true, proof, provenance.clone()),
                         ),
                         source_guard,
                     })
@@ -1749,9 +1806,10 @@ fn removal_evidence(
     recovery_target: Option<&Path>,
     recovery_present: bool,
     proof: &crate::VerifiedTransferProof,
+    provenance: crate::RecoveryProvenance,
 ) -> RecoveryEvidence {
     let content = proof.installed_destination_proof();
-    RecoveryEvidence::new(
+    let evidence = RecoveryEvidence::new(
         now_unix_nanos(),
         recovery_target.map(Path::to_path_buf),
         false,
@@ -1764,6 +1822,11 @@ fn removal_evidence(
         None,
         content.map(|content| *content.sha256()),
     )
+    .with_provenance(provenance);
+    match proof.source_after().content_proof() {
+        Some(content) => evidence.with_recovery_proof(content.size(), Some(*content.sha256())),
+        None => evidence,
+    }
 }
 
 fn observe_recovery_boundary(

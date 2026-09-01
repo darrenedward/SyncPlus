@@ -104,7 +104,10 @@ pub use verification::{
 };
 pub use transfer::{ControlledTransfer, TransferError};
 pub use removal::{RecoveryMethod, RemovalReceipt, SafeDeleteError, SafeDeleteExecutor};
-pub use restore::{CollisionSafeRestore, RecoveryProvenance, RestoreError, RestoreJournalEvent, RestoreOutcome};
+pub use restore::{
+    CollisionSafeRestore, RecoveryProvenance, RecoveryVerificationState, RestoreError,
+    RestoreJournalEvent, RestoreOutcome,
+};
 pub use workflow::{RunWorkflow, WorkflowError};
 pub use ssh_workflow::{
     SshMetadataProof, SshRecoveryBoundary, SshRunBackend, SshRunError, SshTransferBoundary,

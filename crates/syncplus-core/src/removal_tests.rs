@@ -166,13 +166,26 @@ fn verified_source_is_moved_to_recovery_and_journaled_before_next_item() {
         "same-filesystem recovery should atomically move the original inode"
     );
     assert_eq!(fs::read(destination_path).expect("installed destination"), b"verified source");
+    let sidecar = crate::RecoveryProvenance::sidecar_path(&recovery.join("item.txt"))
+        .expect("custom recovery should have a sidecar path");
+    assert!(sidecar.exists(), "custom recovery must have durable provenance");
     let report = store.load_report(run_id).expect("report should load");
     assert!(matches!(
         report.items()[0].outcome(),
         crate::ActionOutcome::Completed
     ));
     assert!(report.items()[0].journal().proof_boundary().is_some());
-    assert!(report.items()[0].journal().removal_result().is_some());
+    let result = report.items()[0]
+        .journal()
+        .removal_result()
+        .expect("removal result should be persisted");
+    let provenance = result
+        .evidence()
+        .provenance()
+        .expect("removal provenance should be persisted");
+    assert_eq!(provenance.action_id(), Some(action.action_id()));
+    assert_eq!(provenance.recovery_method(), DeletionMethod::Trash);
+    assert_eq!(provenance.verification_state(), crate::RecoveryVerificationState::Verified);
 }
 
 #[test]
