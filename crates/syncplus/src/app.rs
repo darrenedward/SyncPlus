@@ -882,6 +882,57 @@ fn format_profile_diagnostic(
     )
 }
 
+fn format_form_validation_diagnostic(form: &ProfileForm, error: &UiValidationError) -> String {
+    let (peer, endpoint) = match error {
+        UiValidationError::EmptyPeerName { peer }
+        | UiValidationError::EmptyLocalPath { peer } => {
+            if *peer == "Source" {
+                ("Source", &form.peer_a)
+            } else {
+                ("Destination", &form.peer_b)
+            }
+        }
+        _ if form.peer_a.kind == EndpointKind::Ssh => ("Source", &form.peer_a),
+        _ if form.peer_b.kind == EndpointKind::Ssh => ("Destination", &form.peer_b),
+        _ => ("Source and destination", &form.peer_a),
+    };
+    let account = if endpoint.kind == EndpointKind::Ssh {
+        if endpoint.username.trim().is_empty() {
+            "not configured".to_owned()
+        } else {
+            single_line(endpoint.username.trim())
+        }
+    } else {
+        "not applicable (local peer)".to_owned()
+    };
+    let scope = if endpoint.kind == EndpointKind::Ssh {
+        endpoint.remote_path.trim().to_owned()
+    } else {
+        endpoint.local_path.trim().to_owned()
+    };
+    let scope = if scope.is_empty() {
+        format!(
+            "{} -> {}",
+            form.peer_a.local_path.trim(),
+            form.peer_b.local_path.trim()
+        )
+    } else {
+        scope
+    };
+    format!(
+        "Profile: {} | Peer: {} | Account: {} | Scope: {} | Reason: {} | Next action: correct the named typed field and validate the profile again.",
+        single_line(if form.name.trim().is_empty() {
+            "(unsaved profile)"
+        } else {
+            form.name.trim()
+        }),
+        peer,
+        account,
+        single_line(scope),
+        single_line(error.to_string())
+    )
+}
+
 fn format_precheck_diagnostic(profile: &SyncProfile, blocker: &syncplus_core::PrecheckBlocker) -> String {
     format_profile_diagnostic(
         profile,
@@ -1996,17 +2047,17 @@ impl SyncPlusApp {
         ui.horizontal(|ui| {
             if ui.button("Analyze current state").clicked() {
                 if let Err(error) = self.analyze_profile() {
-                    self.status = format!("Plan review is not ready: {error}");
+                    self.status = format_form_validation_diagnostic(&self.form, &error);
                 }
             }
             if ui.button("Validate").clicked() {
                 if let Err(error) = self.validate_profile() {
-                    self.status = format!("Profile is not valid: {error}");
+                    self.status = format_form_validation_diagnostic(&self.form, &error);
                 }
             }
             if ui.button("Save profile").clicked() {
                 if let Err(error) = self.save_profile() {
-                    self.status = format!("Profile was not saved: {error}");
+                    self.status = format_form_validation_diagnostic(&self.form, &error);
                 }
             }
         });
@@ -2692,18 +2743,30 @@ fn draw_analysis_review(
             if unresolved_count == 0 {
                 ui.label("No unresolved or unsupported inventory items were found.");
             } else {
-                for item in analysis
-                    .source_inventory()
-                    .items()
-                    .iter()
-                    .chain(analysis.destination_inventory().items())
-                    .filter(|item| item.outcome() == AnalysisOutcome::Unsupported)
-                {
-                    ui.label(format!(
-                        "Unresolved unsupported item: {} ({:?}); execution must remain blocked.",
-                        item.relative_path().display(),
-                        item.item_type()
-                    ));
+                for inventory in [
+                    analysis.source_inventory(),
+                    analysis.destination_inventory(),
+                ] {
+                    for item in inventory
+                        .items()
+                        .iter()
+                        .filter(|item| item.outcome() == AnalysisOutcome::Unsupported)
+                    {
+                        let path = inventory.root().join(item.relative_path());
+                        ui.label(format!(
+                            "Unresolved unsupported item: {}",
+                            format_profile_diagnostic(
+                                &review.profile,
+                                Some(&path),
+                                format!(
+                                    "{} ({:?}); execution must remain blocked",
+                                    item.relative_path().display(),
+                                    item.item_type()
+                                ),
+                                "Inspect the item and peer capability, then correct, exclude, or preserve it before running Fresh Analysis again.",
+                            )
+                        ));
+                    }
                 }
             }
         },
@@ -2910,11 +2973,22 @@ fn draw_run_report_detail(
             | RunReportStatus::Blocked
     ) {
         ui.group(|ui| {
-            ui.heading("Recovery Review");
+            let report_help_topic = help_topic_for_report_status(report.status());
+            let review_heading = match report.status() {
+                RunReportStatus::Failed => "Execution Failure Review",
+                RunReportStatus::Blocked => "Precheck Blocked Review",
+                _ => "Recovery Review",
+            };
+            let review_help_label = match report_help_topic {
+                HelpTopic::ExecutionFailures => "Execution failure guidance",
+                HelpTopic::PrecheckBlockers => "Precheck blocker guidance",
+                _ => "Recovery guidance",
+            };
+            ui.heading(review_heading);
             draw_contextual_help_request(
                 ui,
-                "Recovery guidance",
-                help_topic_for_surface(HelpSurface::Recovery),
+                review_help_label,
+                report_help_topic,
                 requested_help,
             );
             ui.label(run_recovery_message(report.status()));
@@ -3871,6 +3945,18 @@ mod tests {
             let topic = help_topic_for_surface(surface);
             assert_eq!(topic, expected_topic);
             assert!(!help_entry(topic).next_action.is_empty());
+        }
+    }
+
+    #[test]
+    fn help_panel_renders_text_controls_in_light_and_dark_themes() {
+        for theme in [egui::ThemePreference::Light, egui::ThemePreference::Dark] {
+            egui::__run_test_ui(|ui| {
+                ui.ctx().set_theme(theme);
+                let mut selected_topic = HelpTopic::Modes;
+                draw_help(ui, &mut selected_topic);
+                assert_eq!(selected_topic, HelpTopic::Modes);
+            });
         }
     }
 
