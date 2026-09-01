@@ -156,18 +156,49 @@ impl RunWorkflow {
         C: FnOnce(&ConfirmedPlan) -> bool,
         F: Fn() -> bool,
     {
+        self.execute_with_authorizations(
+            run_id,
+            profile,
+            probe,
+            AuthorizationSnapshot::default(),
+            confirm,
+            store,
+            should_cancel,
+        )
+    }
+
+    /// Run the complete lifecycle with the immutable authorization decision
+    /// selected for this run. The authorization snapshot is persisted with
+    /// the run before any filesystem mutation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_with_authorizations<P, C, F>(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        probe: &P,
+        authorizations: AuthorizationSnapshot,
+        confirm: C,
+        store: &mut RunEvidenceStore,
+        should_cancel: F,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        P: PrecheckProbe,
+        C: FnOnce(&ConfirmedPlan) -> bool,
+        F: Fn() -> bool,
+    {
         let lease = match self.acquire_precheck(run_id, profile, probe) {
             Ok(lease) => lease,
             Err(error) => {
                 let (source_volume_identity, destination_volume_identity) =
                     blocked_volume_identities(&error);
-                self.persist_blocked(
+                self.persist_blocked_with_authorizations(
                     run_id,
                     profile,
                     store,
                     &error,
                     source_volume_identity,
                     destination_volume_identity,
+                    authorizations,
                 )?;
                 return Err(error);
             }
@@ -187,19 +218,21 @@ impl RunWorkflow {
             false,
             false,
         ) {
-            self.persist_blocked(
+            self.persist_blocked_with_authorizations(
                 run_id,
                 profile,
                 store,
                 &error,
                 source_volume_identity,
                 destination_volume_identity,
+                authorizations,
             )?;
             return Err(error);
         }
-        let report = self.execute_confirmed(
+        let report = self.execute_confirmed_with_authorizations(
             run_id,
             &confirmed,
+            authorizations,
             store,
             should_cancel,
             source_volume_identity,
@@ -228,18 +261,52 @@ impl RunWorkflow {
         C: FnOnce(&FreshAnalysis, &[ConflictResolutionAction]) -> bool,
         F: Fn() -> bool,
     {
+        self.execute_resolution_run_with_authorizations(
+            run_id,
+            resolution,
+            profile,
+            baseline,
+            probe,
+            AuthorizationSnapshot::default(),
+            confirm,
+            store,
+            should_cancel,
+        )
+    }
+
+    /// Execute a reviewed Mirror Resolution Run with the selected immutable
+    /// authorization snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_resolution_run_with_authorizations<P, C, F>(
+        &self,
+        run_id: RunId,
+        resolution: &ResolutionRun,
+        profile: &crate::SyncProfile,
+        baseline: Option<&SyncBaseline>,
+        probe: &P,
+        authorizations: AuthorizationSnapshot,
+        confirm: C,
+        store: &mut RunEvidenceStore,
+        should_cancel: F,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        P: PrecheckProbe,
+        C: FnOnce(&FreshAnalysis, &[ConflictResolutionAction]) -> bool,
+        F: Fn() -> bool,
+    {
         let lease = match self.acquire_precheck(run_id, profile, probe) {
             Ok(lease) => lease,
             Err(error) => {
                 let (source_volume_identity, destination_volume_identity) =
                     blocked_volume_identities(&error);
-                self.persist_blocked(
+                self.persist_blocked_with_authorizations(
                     run_id,
                     profile,
                     store,
                     &error,
                     source_volume_identity,
                     destination_volume_identity,
+                    authorizations,
                 )?;
                 return Err(error);
             }
@@ -268,7 +335,7 @@ impl RunWorkflow {
         let snapshot = RunSnapshot::from_profile_with_volume_identities(
             run_id,
             profile,
-            crate::AuthorizationSnapshot::default(),
+            authorizations,
             peer_a_volume_identity,
             peer_b_volume_identity,
         )?;
@@ -499,6 +566,7 @@ impl RunWorkflow {
             ));
         }
         let profile = reopened.snapshot().profile().clone();
+        let authorizations = reopened.snapshot().authorizations();
         let _initial_remote_permit =
             self.refresh_ssh_precheck(&profile, credential, host_permit, backend)?;
         let analysis = self.analyze_ssh(&profile, credential, host_permit, backend)?;
@@ -511,7 +579,7 @@ impl RunWorkflow {
         self.execute_ssh_confirmed(
             next_run_id,
             &confirmed,
-            AuthorizationSnapshot::default(),
+            authorizations,
             credential,
             host_permit,
             &remote_permit,
@@ -1224,10 +1292,11 @@ impl RunWorkflow {
     /// Execute only a plan that has passed the Fresh Analysis confirmation
     /// gate. Every action is planned durably before the first filesystem
     /// mutation, and cancellation settles the remaining planned actions.
-    fn execute_confirmed<F>(
+    fn execute_confirmed_with_authorizations<F>(
         &self,
         run_id: RunId,
         confirmed: &ConfirmedPlan,
+        authorizations: AuthorizationSnapshot,
         store: &mut RunEvidenceStore,
         should_cancel: F,
         source_volume_identity: Option<crate::VolumeIdentity>,
@@ -1247,7 +1316,7 @@ impl RunWorkflow {
         let snapshot = RunSnapshot::from_profile_with_volume_identities(
             run_id,
             confirmed.profile(),
-            crate::AuthorizationSnapshot::default(),
+            authorizations,
             peer_a_volume_identity,
             peer_b_volume_identity,
         )?;
@@ -1352,6 +1421,7 @@ impl RunWorkflow {
         }
 
         let profile = report.snapshot().profile().clone();
+        let authorizations = report.snapshot().authorizations();
         let expected_source_volume_identity = report
             .snapshot()
             .volume_identity(crate::PeerSide::from(profile.source()));
@@ -1395,25 +1465,27 @@ impl RunWorkflow {
                     ) {
                         Ok(lease) => lease,
                         Err(error) => {
-                            self.persist_blocked(
+                            self.persist_blocked_with_authorizations(
                                 next_run_id,
                                 &profile,
                                 store,
                                 &error,
                                 expected_source_volume_identity,
                                 expected_destination_volume_identity,
+                                authorizations,
                             )?;
                             return Err(error);
                         }
                     }
                 } else {
-                    self.persist_blocked(
+                    self.persist_blocked_with_authorizations(
                         next_run_id,
                         &profile,
                         store,
                         &error,
                         expected_source_volume_identity,
                         expected_destination_volume_identity,
+                        authorizations,
                     )?;
                     return Err(error);
                 }
@@ -1430,6 +1502,7 @@ impl RunWorkflow {
             ));
         }
         let profile = reopened.snapshot().profile().clone();
+        let authorizations = reopened.snapshot().authorizations();
         let analysis = FreshAnalysis::analyze(&profile)?;
         let confirmed = analysis.confirm(&profile)?;
         if !confirm(&confirmed) {
@@ -1443,19 +1516,21 @@ impl RunWorkflow {
             true,
             false,
         ) {
-            self.persist_blocked(
+            self.persist_blocked_with_authorizations(
                 next_run_id,
                 &profile,
                 store,
                 &error,
                 expected_source_volume_identity,
                 expected_destination_volume_identity,
+                authorizations,
             )?;
             return Err(error);
         }
-        let report = self.execute_confirmed(
+        let report = self.execute_confirmed_with_authorizations(
             next_run_id,
             &confirmed,
+            authorizations,
             store,
             should_cancel,
             source_volume_identity,
@@ -1510,7 +1585,7 @@ impl RunWorkflow {
         result.map_err(WorkflowError::Precheck)
     }
 
-    fn persist_blocked(
+    fn persist_blocked_with_authorizations(
         &self,
         run_id: RunId,
         profile: &crate::SyncProfile,
@@ -1518,6 +1593,7 @@ impl RunWorkflow {
         error: &WorkflowError,
         source_volume_identity: Option<crate::VolumeIdentity>,
         destination_volume_identity: Option<crate::VolumeIdentity>,
+        authorizations: AuthorizationSnapshot,
     ) -> Result<(), WorkflowError> {
         let (peer_a_volume_identity, peer_b_volume_identity) = orient_volume_identities(
             profile,
@@ -1527,7 +1603,7 @@ impl RunWorkflow {
         let snapshot = RunSnapshot::from_profile_with_volume_identities(
             run_id,
             profile,
-            crate::AuthorizationSnapshot::default(),
+            authorizations,
             peer_a_volume_identity,
             peer_b_volume_identity,
         )?;
@@ -3846,9 +3922,10 @@ mod tests {
         let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
         let calls = AtomicUsize::new(0);
         let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
-            .execute_confirmed(
+            .execute_confirmed_with_authorizations(
                 RunId::new(1),
                 &confirmed,
+                AuthorizationSnapshot::default(),
                 &mut store,
                 || calls.fetch_add(1, Ordering::Relaxed) >= 514,
                 None,

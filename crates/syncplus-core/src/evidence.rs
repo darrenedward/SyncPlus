@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::{
     AuthorizationSnapshot, DeletionMethod, ItemType, MetadataRequirements, OneWaySource, Peer,
@@ -805,6 +805,9 @@ pub enum StorageError {
     InvalidPeerName,
     DuplicateEndpointPair,
     InvalidAuthorization(String),
+    InvalidSchedule(String),
+    ScheduleRequiresAdvanced,
+    ConcurrentProfileUpdate,
     ProfileNotFound { id: u64 },
     UnsafeDatabasePath,
     UnsupportedRemotePeer,
@@ -827,6 +830,13 @@ impl fmt::Display for StorageError {
             Self::InvalidAuthorization(reason) => {
                 write!(formatter, "invalid unattended authorization: {reason}")
             }
+            Self::InvalidSchedule(reason) => write!(formatter, "invalid schedule: {reason}"),
+            Self::ScheduleRequiresAdvanced => {
+                formatter.write_str("enabling a schedule requires Advanced Mode")
+            }
+            Self::ConcurrentProfileUpdate => formatter.write_str(
+                "the Sync Profile changed in another UI or scheduler operation; reload it before saving",
+            ),
             Self::ProfileNotFound { id } => write!(formatter, "Sync Profile {id} was not found"),
             Self::UnsafeDatabasePath => formatter.write_str("the canonical database path is unsafe"),
             Self::UnsupportedRemotePeer => write!(
@@ -952,9 +962,11 @@ impl RunEvidenceStore {
 
     fn from_connection(mut connection: Connection) -> Result<Self, StorageError> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 15 {
+        if version > 16 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -1053,18 +1065,27 @@ impl RunEvidenceStore {
         }
         if version == 3 {
             let transaction = connection.transaction()?;
-            transaction.execute_batch(
-                "
-                ALTER TABLE run_snapshots
-                    ADD COLUMN metadata_file_type INTEGER NOT NULL DEFAULT 1;
-                ALTER TABLE run_snapshots
-                    ADD COLUMN metadata_executable_permissions INTEGER NOT NULL DEFAULT 1;
-                ALTER TABLE run_snapshots
-                    ADD COLUMN metadata_symlink_targets INTEGER NOT NULL DEFAULT 1;
-                ALTER TABLE run_snapshots
-                    ADD COLUMN metadata_timestamps INTEGER NOT NULL DEFAULT 0;
-                ",
-            )?;
+            let columns = [
+                ("metadata_file_type", "INTEGER NOT NULL DEFAULT 1"),
+                ("metadata_executable_permissions", "INTEGER NOT NULL DEFAULT 1"),
+                ("metadata_symlink_targets", "INTEGER NOT NULL DEFAULT 1"),
+                ("metadata_timestamps", "INTEGER NOT NULL DEFAULT 0"),
+            ];
+            for (name, definition) in columns {
+                let exists: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info('run_snapshots') WHERE name = ?1
+                    )",
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    transaction.execute(
+                        &format!("ALTER TABLE run_snapshots ADD COLUMN {name} {definition}"),
+                        [],
+                    )?;
+                }
+            }
             transaction.pragma_update(None, "user_version", 4)?;
             transaction.commit()?;
             version = 4;
@@ -1417,6 +1438,77 @@ impl RunEvidenceStore {
             transaction.pragma_update(None, "user_version", 15)?;
             verify_integrity(&transaction)?;
             transaction.commit()?;
+            version = 15;
+        }
+        if version == 15 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS sync_profile_schedules (
+                    profile_id INTEGER PRIMARY KEY,
+                    interval_minutes INTEGER NOT NULL CHECK (interval_minutes BETWEEN 1 AND 10080),
+                    timezone TEXT NOT NULL CHECK (length(timezone) BETWEEN 1 AND 128),
+                    enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+                    FOREIGN KEY (profile_id) REFERENCES sync_profiles(profile_id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS run_id_sequence (
+                    sequence_id INTEGER PRIMARY KEY CHECK (sequence_id = 1),
+                    next_run_id INTEGER NOT NULL CHECK (next_run_id >= 1)
+                );
+                ",
+            )?;
+            for (table, name, definition) in [
+                (
+                    "run_snapshots",
+                    "metadata_ownership",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "run_snapshots",
+                    "metadata_access_control_lists",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "run_snapshots",
+                    "metadata_extended_attributes",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "sync_profiles",
+                    "profile_revision",
+                    "INTEGER NOT NULL DEFAULT 0 CHECK (profile_revision >= 0)",
+                ),
+            ] {
+                let exists: bool = transaction.query_row(
+                    &format!(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1
+                        )"
+                    ),
+                    params![name],
+                    |row| row.get(0),
+                )?;
+                if !exists {
+                    transaction.execute(
+                        &format!("ALTER TABLE {table} ADD COLUMN {name} {definition}"),
+                        [],
+                    )?;
+                }
+            }
+            let next_run_id: i64 = transaction.query_row(
+                "SELECT COALESCE(MAX(run_id), 0) + 1 FROM run_snapshots",
+                [],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO run_id_sequence (sequence_id, next_run_id) VALUES (1, ?1)
+                 ON CONFLICT(sequence_id) DO UPDATE SET
+                    next_run_id = MAX(next_run_id, excluded.next_run_id)",
+                params![next_run_id],
+            )?;
+            transaction.pragma_update(None, "user_version", 16)?;
+            verify_integrity(&transaction)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -1436,7 +1528,9 @@ impl RunEvidenceStore {
 
     /// Persist the immutable snapshot before any filesystem action starts.
     pub fn begin_run(&mut self, snapshot: &RunSnapshot) -> Result<(), StorageError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let profile = snapshot.profile();
         let options = snapshot.validated_options();
         let authorizations = snapshot.authorizations();
@@ -1453,9 +1547,11 @@ impl RunEvidenceStore {
                 allow_unattended_destructive, allow_unattended_permanent_removal,
                 metadata_file_type, metadata_executable_permissions,
                 metadata_symlink_targets, metadata_timestamps,
+                metadata_ownership, metadata_access_control_lists,
+                metadata_extended_attributes,
                 partial_transfer_policy, retry_max_attempts,
                 retry_initial_delay_millis
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)",
             params![
                 snapshot.run_id().value(),
                 snapshot.snapshot_id().value(),
@@ -1493,10 +1589,23 @@ impl RunEvidenceStore {
                 bool_to_int(options.metadata().executable_permissions()),
                 bool_to_int(options.metadata().symlink_targets()),
                 bool_to_int(options.metadata().timestamps()),
+                bool_to_int(options.metadata().specialist_metadata().ownership()),
+                bool_to_int(options.metadata().specialist_metadata().access_control_lists()),
+                bool_to_int(options.metadata().specialist_metadata().extended_attributes()),
                 encode_partial_transfer_policy(options.partial_transfer_policy()),
                 options.retry_policy().max_attempts(),
                 options.retry_policy().initial_delay().as_millis() as u64,
             ],
+        )?;
+        let next_run_id = i64::try_from(snapshot.run_id().value())
+            .ok()
+            .and_then(|run_id| run_id.checked_add(1))
+            .ok_or_else(|| StorageError::InvalidSnapshot("run identifier is out of range".to_owned()))?;
+        transaction.execute(
+            "UPDATE run_id_sequence
+             SET next_run_id = MAX(next_run_id, ?1)
+             WHERE sequence_id = 1",
+            params![next_run_id],
         )?;
         for (ordinal, pattern) in profile.exclusions().iter().enumerate() {
             transaction.execute(
@@ -2179,13 +2288,37 @@ impl RunEvidenceStore {
         Ok(())
     }
 
-    pub fn next_run_id(&self) -> Result<RunId, StorageError> {
-        let next: u64 = self.connection.query_row(
-            "SELECT COALESCE(MAX(run_id), 0) + 1 FROM run_snapshots",
+    pub fn next_run_id(&mut self) -> Result<RunId, StorageError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let allocated: i64 = transaction.query_row(
+            "SELECT next_run_id FROM run_id_sequence WHERE sequence_id = 1",
             [],
             |row| row.get(0),
         )?;
-        Ok(RunId::new(next))
+        let highest_existing: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(run_id), 0) FROM run_snapshots",
+            [],
+            |row| row.get(0),
+        )?;
+        let next = allocated.max(
+            highest_existing
+                .checked_add(1)
+                .ok_or_else(|| StorageError::InvalidSnapshot("run identifier is exhausted".to_owned()))?,
+        );
+        let following = next
+            .checked_add(1)
+            .ok_or_else(|| StorageError::InvalidSnapshot("run identifier is exhausted".to_owned()))?;
+        transaction.execute(
+            "UPDATE run_id_sequence SET next_run_id = ?1 WHERE sequence_id = 1",
+            params![following],
+        )?;
+        transaction.commit()?;
+        Ok(RunId::new(
+            u64::try_from(next)
+                .map_err(|_| StorageError::InvalidSnapshot("run identifier is invalid".to_owned()))?,
+        ))
     }
 
     pub fn load_snapshot(&self, run_id: RunId) -> Result<RunSnapshot, StorageError> {
@@ -2203,6 +2336,8 @@ impl RunEvidenceStore {
                         allow_unattended_destructive, allow_unattended_permanent_removal,
                         metadata_file_type, metadata_executable_permissions,
                         metadata_symlink_targets, metadata_timestamps,
+                        metadata_ownership, metadata_access_control_lists,
+                        metadata_extended_attributes,
                         partial_transfer_policy, retry_max_attempts,
                         retry_initial_delay_millis
                  FROM run_snapshots WHERE run_id = ?1",
@@ -2240,9 +2375,12 @@ impl RunEvidenceStore {
                         row.get::<_, bool>(28)?,
                         row.get::<_, bool>(29)?,
                         row.get::<_, bool>(30)?,
-                        row.get::<_, String>(31)?,
-                        row.get::<_, u8>(32)?,
-                        row.get::<_, u64>(33)?,
+                        row.get::<_, bool>(31)?,
+                        row.get::<_, bool>(32)?,
+                        row.get::<_, bool>(33)?,
+                        row.get::<_, String>(34)?,
+                        row.get::<_, u8>(35)?,
+                        row.get::<_, u64>(36)?,
                     ))
                 },
             )
@@ -2279,6 +2417,9 @@ impl RunEvidenceStore {
             metadata_executable_permissions,
             metadata_symlink_targets,
             metadata_timestamps,
+            metadata_ownership,
+            metadata_access_control_lists,
+            metadata_extended_attributes,
             partial_transfer_policy,
             retry_max_attempts,
             retry_initial_delay_millis,
@@ -2342,7 +2483,12 @@ impl RunEvidenceStore {
                 metadata_executable_permissions,
                 metadata_symlink_targets,
                 metadata_timestamps,
-            ),
+            )
+            .with_specialist_metadata(crate::SpecialistMetadataRequirements::new(
+                metadata_ownership,
+                metadata_access_control_lists,
+                metadata_extended_attributes,
+            )),
             partial_transfer_policy: decode_partial_transfer_policy(&partial_transfer_policy)?,
             retry_policy: RetryPolicy::new(
                 retry_max_attempts,
@@ -4970,7 +5116,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         assert!(
             migrated
                 .connection
@@ -5021,7 +5167,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         for table in ["application_settings", "sync_profiles", "sync_profile_exclusions"] {
             assert!(
                 migrated

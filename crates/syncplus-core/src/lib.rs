@@ -88,7 +88,10 @@ pub use evidence::{
     MirrorResolutionOutcome, MirrorResolutionReportItem, MirrorResolutionReviewState,
     RunReportStatus, RunSnapshot, StorageError,
 };
-pub use storage::{ApplicationMode, ApplicationSettings, PersistedSyncProfile, SyncProfileId, ThemePreference};
+pub use storage::{
+    ApplicationMode, ApplicationSettings, PersistedSyncProfile, ScheduleDefinition, SyncProfileId,
+    ThemePreference,
+};
 pub use parser::{
     ItemizedRecord, ParseDiagnostic, ParsedOutput, ParsedTransferOutput, ProgressRecord,
     TransferOutputParser,

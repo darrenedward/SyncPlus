@@ -49,6 +49,7 @@ pub enum UiValidationError {
     UnresolvedItems,
     ConflictReviewNotReady,
     ResolutionRequiresMirror,
+    ProfileChangedDuringEdit,
     Resolution(String),
     Analysis(String),
     Core(String),
@@ -113,6 +114,9 @@ impl std::fmt::Display for UiValidationError {
             Self::ResolutionRequiresMirror => {
                 formatter.write_str("Conflict Review and Resolution Runs require Mirror Sync.")
             }
+            Self::ProfileChangedDuringEdit => formatter.write_str(
+                "This Sync Profile changed elsewhere. Reload it before saving your edits.",
+            ),
             Self::Resolution(message) => write!(formatter, "Resolution Run could not proceed: {message}"),
             Self::Analysis(message) => write!(formatter, "Fresh Analysis could not be completed: {message}"),
             Self::Core(message) => formatter.write_str(message),
@@ -298,6 +302,7 @@ enum CloneAuthorizationChoice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProfileForm {
     id: Option<SyncProfileId>,
+    profile_revision: Option<u64>,
     name: String,
     peer_a: EndpointForm,
     peer_b: EndpointForm,
@@ -326,6 +331,7 @@ impl Default for ProfileForm {
     fn default() -> Self {
         Self {
             id: None,
+            profile_revision: None,
             name: String::new(),
             peer_a: EndpointForm::source_defaults(),
             peer_b: EndpointForm::destination_defaults(),
@@ -360,6 +366,7 @@ impl ProfileForm {
         let specialist = metadata.specialist_metadata();
         Self {
             id: Some(profile.id()),
+            profile_revision: Some(profile.revision()),
             name: value.name().to_owned(),
             peer_a: EndpointForm::from_peer(value.peer_a()),
             peer_b: EndpointForm::from_peer(value.peer_b()),
@@ -542,6 +549,7 @@ impl SyncPlusApp {
             || persisted.authorizations().allow_unattended_permanent_removal();
         let mut form = ProfileForm::from_persisted(&persisted);
         form.id = None;
+        form.profile_revision = None;
         form.name = self.next_clone_name(source.name());
         form.peer_a = form.peer_a.without_saved_credentials();
         form.peer_b = form.peer_b.without_saved_credentials();
@@ -599,7 +607,16 @@ impl SyncPlusApp {
         let persisted = match self.form.id {
             Some(id) => self
                 .store
-                .update_profile_with_authorizations(id, &profile, authorizations)
+                .update_profile_with_authorizations_if_revision(
+                    id,
+                    &profile,
+                    authorizations,
+                    self.form.profile_revision.ok_or_else(|| {
+                        UiValidationError::Core(
+                            "the selected profile has no revision; reload it before saving".to_owned(),
+                        )
+                    })?,
+                )
                 .map_err(map_storage_error)?,
             None => self
                 .store
@@ -2017,6 +2034,9 @@ fn format_bytes(bytes: u64) -> String {
 fn map_storage_error(error: syncplus_core::StorageError) -> UiValidationError {
     match error {
         syncplus_core::StorageError::DuplicateEndpointPair => UiValidationError::DuplicateEndpointPair,
+        syncplus_core::StorageError::ConcurrentProfileUpdate => {
+            UiValidationError::ProfileChangedDuringEdit
+        }
         other => UiValidationError::Core(other.to_string()),
     }
 }
@@ -2205,6 +2225,31 @@ mod tests {
         assert!(!profile.options().safe_delete);
         assert!(!profile.options().destination_cleanup);
         assert_eq!(profile.options().deletion_method, None);
+    }
+
+    #[test]
+    fn stale_profile_form_cannot_overwrite_a_scheduler_update() {
+        let mut app = app();
+        app.form = valid_form();
+        let id = app.save_profile().expect("create profile");
+
+        let externally_edited = app
+            .profiles()
+            .iter()
+            .find(|profile| profile.id() == id)
+            .expect("created profile")
+            .profile()
+            .clone()
+            .with_mode(SyncMode::Mirror);
+        app.store
+            .update_profile(id, &externally_edited)
+            .expect("scheduler update");
+
+        app.form.mode = SyncMode::Mirror;
+        assert_eq!(
+            app.save_profile(),
+            Err(UiValidationError::ProfileChangedDuringEdit)
+        );
     }
 
     #[test]

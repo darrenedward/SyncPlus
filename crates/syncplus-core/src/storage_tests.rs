@@ -1,11 +1,17 @@
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Barrier},
+    thread,
+};
 
 use rusqlite::params;
 
 use crate::{
-    ApplicationMode, ApplicationSettings, AuthorizationSnapshot, Peer, RunEvidenceStore, RunId,
-    RunSnapshot, SavedSecretReference, SshAuthentication, SyncMode, SyncProfile,
-    StorageError, ThemePreference,
+    ApplicationMode, ApplicationSettings, AuthorizationSnapshot, HostTrustError, Peer,
+    RunEvidenceStore, RunId, RunSnapshot, SavedSecretReference, ScheduleDefinition,
+    SshAuthentication, SshHost, SshHostFingerprint, SyncMode,
+    SyncProfile, StorageError, ThemePreference,
 };
 
 fn profile() -> SyncProfile {
@@ -186,6 +192,168 @@ fn invalid_unattended_authorizations_are_rejected() {
         ),
         Err(StorageError::InvalidAuthorization(_))
     ));
+}
+
+#[test]
+fn recurring_schedule_round_trips_and_requires_advanced_mode_to_enable() {
+    let database = database();
+    let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+    let id = store.create_profile(&profile()).expect("create profile").id();
+    let disabled = ScheduleDefinition::new(60, "Pacific/Auckland", false).expect("schedule");
+
+    let persisted = store
+        .update_schedule(id, Some(disabled.clone()), ApplicationMode::Simple)
+        .expect("save disabled schedule");
+    assert_eq!(persisted.schedule(), Some(&disabled));
+    assert!(!persisted.schedule_enabled());
+
+    let enabled = disabled.with_enabled(true);
+    assert!(matches!(
+        store.update_schedule(id, Some(enabled.clone()), ApplicationMode::Simple),
+        Err(StorageError::ScheduleRequiresAdvanced)
+    ));
+    let persisted = store
+        .update_schedule(id, Some(enabled.clone()), ApplicationMode::Advanced)
+        .expect("enable schedule in Advanced Mode");
+    assert_eq!(persisted.schedule(), Some(&enabled));
+    assert!(persisted.schedule_enabled());
+
+    drop(store);
+    let reopened = RunEvidenceStore::open(database.path()).expect("reopen database");
+    let loaded = reopened
+        .load_profile(id)
+        .expect("load profile")
+        .expect("profile exists");
+    assert_eq!(loaded.schedule(), Some(&enabled));
+}
+
+#[test]
+fn profile_edits_and_removal_do_not_mutate_a_started_run_snapshot() {
+    let database = database();
+    let original = profile();
+    let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+    let persisted = store.create_profile(&original).expect("create profile");
+    let run = RunSnapshot::from_profile(
+        RunId::new(79),
+        persisted.profile(),
+        persisted.authorizations(),
+    )
+    .expect("create run snapshot");
+    store.begin_run(&run).expect("persist run snapshot");
+
+    let edited = original.clone().with_mode(SyncMode::Mirror);
+    store
+        .update_profile(persisted.id(), &edited)
+        .expect("edit profile");
+    assert!(store.remove_profile(persisted.id()).expect("remove profile"));
+
+    assert_eq!(store.load_snapshot(RunId::new(79)).expect("load snapshot"), run);
+}
+
+#[test]
+fn stale_profile_revision_cannot_overwrite_a_concurrent_update() {
+    let database = database();
+    let mut initializer = RunEvidenceStore::open(database.path()).expect("open database");
+    let id = initializer.create_profile(&profile()).expect("create profile").id();
+    let baseline = initializer.load_profile(id).expect("load profile").expect("profile exists");
+    drop(initializer);
+
+    let mut first = RunEvidenceStore::open(database.path()).expect("open first store");
+    let mut second = RunEvidenceStore::open(database.path()).expect("open second store");
+    let first_profile = baseline.profile().clone().with_mode(SyncMode::Mirror);
+    let second_profile = baseline.profile().clone().with_exclusion("later/");
+    first
+        .update_profile_with_authorizations_if_revision(
+            id,
+            &first_profile,
+            baseline.authorizations(),
+            baseline.revision(),
+        )
+        .expect("first update");
+    assert!(matches!(
+        second.update_profile_with_authorizations_if_revision(
+            id,
+            &second_profile,
+            baseline.authorizations(),
+            baseline.revision(),
+        ),
+        Err(StorageError::ConcurrentProfileUpdate)
+    ));
+
+    let loaded = first.load_profile(id).expect("load profile").expect("profile exists");
+    assert_eq!(loaded.profile().mode(), SyncMode::Mirror);
+    assert!(!loaded.profile().exclusions().contains(&"later/".to_owned()));
+}
+
+#[test]
+fn concurrent_run_id_reservations_are_unique_across_database_connections() {
+    let database = database();
+    RunEvidenceStore::open(database.path()).expect("initialize database");
+    let barrier = Arc::new(Barrier::new(6));
+    let handles = (0..5)
+        .map(|_| {
+            let path = database.path().to_owned();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut store = RunEvidenceStore::open(path).expect("open concurrent store");
+                barrier.wait();
+                store.next_run_id().expect("reserve run id").value()
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let mut ids = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("reservation thread"))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn host_fingerprint_persists_across_restart_and_changed_approval_is_rejected() {
+    let database = database();
+    let peer = Peer::ssh(
+        "remote",
+        "backup.example.com",
+        "sync-user",
+        22,
+        None,
+        SshAuthentication::Agent,
+        "/srv/backup",
+    )
+    .expect("SSH peer");
+    let host = SshHost::from_peer(peer.ssh_peer().expect("SSH peer"));
+    let original = SshHostFingerprint::sha256([1; 32]);
+    let changed = SshHostFingerprint::sha256([2; 32]);
+    {
+        let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+        store
+            .approve_ssh_host_fingerprint(&host, &original)
+            .expect("persist host fingerprint");
+    }
+    let reopened = RunEvidenceStore::open(database.path()).expect("reopen database");
+    assert_eq!(
+        reopened
+            .load_ssh_host_fingerprint(&host)
+            .expect("load host fingerprint"),
+        Some(original)
+    );
+    let decision = crate::HostTrustDecision::ChangedFingerprint {
+        host: host.clone(),
+        approved: original,
+        observed: changed,
+    };
+    let mut controller = crate::SshHostTrustController::new(reopened);
+    assert_eq!(
+        controller.approve(
+            peer.ssh_peer().expect("SSH peer"),
+            &decision,
+            crate::HostTrustMode::Interactive,
+        ),
+        Err(HostTrustError::ChangedFingerprintRejected)
+    );
 }
 
 #[test]

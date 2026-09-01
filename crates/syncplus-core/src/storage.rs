@@ -72,6 +72,66 @@ pub enum ThemePreference {
     Dark,
 }
 
+/// A validated, nonsecret recurring schedule definition. The scheduler owns
+/// execution; this value only describes the profile's persisted cadence and
+/// whether that cadence is explicitly enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleDefinition {
+    interval_minutes: u32,
+    timezone: String,
+    enabled: bool,
+}
+
+impl ScheduleDefinition {
+    pub fn new(
+        interval_minutes: u32,
+        timezone: impl Into<String>,
+        enabled: bool,
+    ) -> Result<Self, StorageError> {
+        let schedule = Self {
+            interval_minutes,
+            timezone: timezone.into(),
+            enabled,
+        };
+        schedule.validate()?;
+        Ok(schedule)
+    }
+
+    pub const fn interval_minutes(&self) -> u32 {
+        self.interval_minutes
+    }
+
+    pub fn timezone(&self) -> &str {
+        &self.timezone
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    fn validate(&self) -> Result<(), StorageError> {
+        if !(1..=10_080).contains(&self.interval_minutes) {
+            return Err(StorageError::InvalidSchedule(
+                "interval must be between 1 minute and 7 days".to_owned(),
+            ));
+        }
+        if self.timezone.trim().is_empty()
+            || self.timezone.len() > 128
+            || self.timezone.contains('\0')
+        {
+            return Err(StorageError::InvalidSchedule(
+                "timezone must be a nonempty value of at most 128 characters".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A persisted profile together with policy fields that are intentionally
 /// disabled for new profiles. Scheduling and unattended authorization are
 /// expanded by the scheduler persistence slice while retaining this safe
@@ -81,6 +141,8 @@ pub struct PersistedSyncProfile {
     id: SyncProfileId,
     profile: SyncProfile,
     schedule_enabled: bool,
+    schedule: Option<ScheduleDefinition>,
+    revision: u64,
     authorizations: AuthorizationSnapshot,
 }
 
@@ -95,6 +157,14 @@ impl PersistedSyncProfile {
 
     pub const fn schedule_enabled(&self) -> bool {
         self.schedule_enabled
+    }
+
+    pub fn schedule(&self) -> Option<&ScheduleDefinition> {
+        self.schedule.as_ref()
+    }
+
+    pub const fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub const fn authorizations(&self) -> AuthorizationSnapshot {
@@ -172,6 +242,8 @@ impl RunEvidenceStore {
             id,
             profile: profile.clone(),
             schedule_enabled: false,
+            schedule: None,
+            revision: 0,
             authorizations,
         })
     }
@@ -184,7 +256,12 @@ impl RunEvidenceStore {
         let existing = self
             .load_profile(id)?
             .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
-        self.update_profile_with_authorizations(id, profile, existing.authorizations())
+        self.update_profile_with_authorizations_if_revision(
+            id,
+            profile,
+            existing.authorizations(),
+            existing.revision(),
+        )
     }
 
     pub fn update_profile_with_authorizations(
@@ -197,13 +274,37 @@ impl RunEvidenceStore {
         let existing = self
             .load_profile(id)?
             .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
+        self.update_profile_with_authorizations_if_revision(
+            id,
+            profile,
+            authorizations,
+            existing.revision(),
+        )
+    }
+
+    pub fn update_profile_with_authorizations_if_revision(
+        &mut self,
+        id: SyncProfileId,
+        profile: &SyncProfile,
+        authorizations: AuthorizationSnapshot,
+        expected_revision: u64,
+    ) -> Result<PersistedSyncProfile, StorageError> {
+        validate_profile(profile)?;
         validate_authorizations(profile, authorizations)?;
+        let existing = self
+            .load_profile(id)?
+            .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
+        if existing.revision() != expected_revision {
+            return Err(StorageError::ConcurrentProfileUpdate);
+        }
         self.reject_duplicate_endpoint_pair(profile, Some(id))?;
         let values = ProfileValues::from_profile(profile);
-        let transaction = self.connection_mut().transaction()?;
-        let changed = update_profile_row(&transaction, id, &values, authorizations)?;
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = update_profile_row(&transaction, id, &values, authorizations, expected_revision)?;
         if changed != 1 {
-            return Err(StorageError::ProfileNotFound { id: id.value() });
+            return Err(StorageError::ConcurrentProfileUpdate);
         }
         transaction.execute(
             "DELETE FROM sync_profile_exclusions WHERE profile_id = ?1",
@@ -211,47 +312,124 @@ impl RunEvidenceStore {
         )?;
         insert_exclusions(&transaction, id.value_as_i64()?, profile)?;
         transaction.commit()?;
+        let revision = existing
+            .revision()
+            .checked_add(1)
+            .ok_or_else(|| StorageError::CorruptEvidence("profile revision is exhausted".to_owned()))?;
         Ok(PersistedSyncProfile {
             id,
             profile: profile.clone(),
             schedule_enabled: existing.schedule_enabled,
+            schedule: existing.schedule.clone(),
+            revision,
             authorizations,
         })
+    }
+
+    pub fn update_schedule(
+        &mut self,
+        id: SyncProfileId,
+        schedule: Option<ScheduleDefinition>,
+        mode: ApplicationMode,
+    ) -> Result<PersistedSyncProfile, StorageError> {
+        if let Some(schedule) = &schedule {
+            schedule.validate()?;
+            if schedule.enabled() && mode != ApplicationMode::Advanced {
+                return Err(StorageError::ScheduleRequiresAdvanced);
+            }
+        }
+        let existing = self
+            .load_profile(id)?
+            .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
+        let revision = existing
+            .revision()
+            .checked_add(1)
+            .ok_or_else(|| StorageError::CorruptEvidence("profile revision is exhausted".to_owned()))?;
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE sync_profiles
+             SET schedule_enabled = ?1, profile_revision = ?2
+             WHERE profile_id = ?3 AND profile_revision = ?4",
+            params![
+                schedule.as_ref().is_some_and(ScheduleDefinition::enabled),
+                revision,
+                id.value_as_i64()?,
+                existing.revision(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::ConcurrentProfileUpdate);
+        }
+        if let Some(schedule) = &schedule {
+            transaction.execute(
+                "INSERT INTO sync_profile_schedules
+                    (profile_id, interval_minutes, timezone, enabled)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(profile_id) DO UPDATE SET
+                    interval_minutes = excluded.interval_minutes,
+                    timezone = excluded.timezone,
+                    enabled = excluded.enabled",
+                params![
+                    id.value_as_i64()?,
+                    schedule.interval_minutes(),
+                    schedule.timezone(),
+                    schedule.enabled(),
+                ],
+            )?;
+        } else {
+            transaction.execute(
+                "DELETE FROM sync_profile_schedules WHERE profile_id = ?1",
+                params![id.value_as_i64()?],
+            )?;
+        }
+        transaction.commit()?;
+        self.load_profile(id)?.ok_or(StorageError::ProfileNotFound { id: id.value() })
     }
 
     pub fn load_profile(
         &self,
         id: SyncProfileId,
     ) -> Result<Option<PersistedSyncProfile>, StorageError> {
-        let raw = self
-            .connection()
+        let transaction = self.connection().unchecked_transaction()?;
+        let raw = transaction
             .query_row(
                 &format!("{PROFILE_SELECT} WHERE profile_id = ?1"),
                 params![id.value_as_i64()?],
                 RawProfile::from_row,
             )
             .optional()?;
-        raw.map(|raw| self.materialize_profile(raw)).transpose()
+        let profile = raw
+            .map(|raw| Self::materialize_profile(&transaction, raw))
+            .transpose()?;
+        transaction.commit()?;
+        Ok(profile)
     }
 
     pub fn list_profiles(&self) -> Result<Vec<PersistedSyncProfile>, StorageError> {
-        let mut statement = self
-            .connection()
-            .prepare(&format!("{PROFILE_SELECT} ORDER BY profile_id"))?;
+        let transaction = self.connection().unchecked_transaction()?;
+        let mut statement = transaction.prepare(&format!("{PROFILE_SELECT} ORDER BY profile_id"))?;
         let rows = statement.query_map([], RawProfile::from_row)?;
         let raw_profiles = rows.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
-        raw_profiles
+        let profiles = raw_profiles
             .into_iter()
-            .map(|raw| self.materialize_profile(raw))
-            .collect()
+            .map(|raw| Self::materialize_profile(&transaction, raw))
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction.commit()?;
+        Ok(profiles)
     }
 
     pub fn remove_profile(&mut self, id: SyncProfileId) -> Result<bool, StorageError> {
-        let changed = self.connection_mut().execute(
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "DELETE FROM sync_profiles WHERE profile_id = ?1",
             params![id.value_as_i64()?],
         )?;
+        transaction.commit()?;
         Ok(changed == 1)
     }
 
@@ -271,29 +449,74 @@ impl RunEvidenceStore {
         Ok(())
     }
 
-    fn materialize_profile(&self, raw: RawProfile) -> Result<PersistedSyncProfile, StorageError> {
-        let exclusions = self.load_exclusions(raw.id)?;
+    fn materialize_profile(
+        connection: &rusqlite::Connection,
+        raw: RawProfile,
+    ) -> Result<PersistedSyncProfile, StorageError> {
+        let exclusions = Self::load_exclusions(connection, raw.id)?;
         let id = SyncProfileId::new(
             u64::try_from(raw.id)
                 .map_err(|_| StorageError::CorruptEvidence("invalid profile identifier".to_owned()))?,
         );
         let schedule_enabled = decode_profile_bool(raw.schedule_enabled)?;
+        let schedule = Self::load_schedule(connection, raw.id)?;
+        if schedule.as_ref().is_some_and(|schedule| schedule.enabled()) != schedule_enabled {
+            return Err(StorageError::CorruptEvidence(
+                "profile schedule enabled state differs from its definition".to_owned(),
+            ));
+        }
         let authorizations = AuthorizationSnapshot::new(
             decode_profile_bool(raw.allow_unattended_destructive)?,
             decode_profile_bool(raw.allow_unattended_permanent_removal)?,
         );
+        let revision = u64::try_from(raw.profile_revision)
+            .map_err(|_| StorageError::CorruptEvidence("invalid profile revision".to_owned()))?;
         let profile = raw.into_profile(exclusions)?;
         validate_authorizations(&profile, authorizations)?;
         Ok(PersistedSyncProfile {
             id,
             profile,
             schedule_enabled,
+            schedule,
+            revision,
             authorizations,
         })
     }
 
-    fn load_exclusions(&self, profile_id: i64) -> Result<Vec<String>, StorageError> {
-        let mut statement = self.connection().prepare(
+    fn load_schedule(
+        connection: &rusqlite::Connection,
+        profile_id: i64,
+    ) -> Result<Option<ScheduleDefinition>, StorageError> {
+        let raw = connection
+            .query_row(
+                "SELECT interval_minutes, timezone, enabled
+                 FROM sync_profile_schedules WHERE profile_id = ?1",
+                params![profile_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        raw.map(|(interval_minutes, timezone, enabled)| {
+            ScheduleDefinition::new(
+                u32::try_from(interval_minutes)
+                    .map_err(|_| StorageError::InvalidSchedule("invalid interval".to_owned()))?,
+                timezone,
+                decode_profile_bool(enabled)?,
+            )
+        })
+        .transpose()
+    }
+
+    fn load_exclusions(
+        connection: &rusqlite::Connection,
+        profile_id: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let mut statement = connection.prepare(
             "SELECT pattern FROM sync_profile_exclusions
              WHERE profile_id = ?1 ORDER BY ordinal",
         )?;
@@ -322,7 +545,7 @@ const PROFILE_SELECT: &str = "SELECT
     metadata_timestamps, metadata_ownership, metadata_access_control_lists,
     metadata_extended_attributes, partial_transfer_policy, retry_max_attempts,
     retry_initial_delay_millis, schedule_enabled, allow_unattended_destructive,
-    allow_unattended_permanent_removal
+    allow_unattended_permanent_removal, profile_revision
     FROM sync_profiles";
 
 struct ProfileValues {
@@ -457,11 +680,13 @@ fn update_profile_row(
     id: SyncProfileId,
     values: &ProfileValues,
     authorizations: AuthorizationSnapshot,
+    expected_revision: u64,
 ) -> Result<usize, StorageError> {
     let mut parameters = profile_params(values);
     parameters.push(Box::new(i64::from(authorizations.allow_unattended_destructive())));
     parameters.push(Box::new(i64::from(authorizations.allow_unattended_permanent_removal())));
     parameters.push(Box::new(id.value_as_i64()?));
+    parameters.push(Box::new(expected_revision));
     Ok(transaction.execute(
         "UPDATE sync_profiles SET
             name = ?1, mode = ?2, source = ?3,
@@ -478,8 +703,9 @@ fn update_profile_row(
             metadata_extended_attributes = ?29, partial_transfer_policy = ?30,
             retry_max_attempts = ?31, retry_initial_delay_millis = ?32,
             allow_unattended_destructive = ?33,
-            allow_unattended_permanent_removal = ?34
-        WHERE profile_id = ?35",
+            allow_unattended_permanent_removal = ?34,
+            profile_revision = profile_revision + 1
+        WHERE profile_id = ?35 AND profile_revision = ?36",
         rusqlite::params_from_iter(parameters.iter().map(|value| value.as_ref())),
     )?)
 }
@@ -598,6 +824,7 @@ struct RawProfile {
     schedule_enabled: i64,
     allow_unattended_destructive: i64,
     allow_unattended_permanent_removal: i64,
+    profile_revision: i64,
 }
 
 struct RawPeer {
@@ -654,6 +881,7 @@ impl RawProfile {
             schedule_enabled: row.get(33)?,
             allow_unattended_destructive: row.get(34)?,
             allow_unattended_permanent_removal: row.get(35)?,
+            profile_revision: row.get(36)?,
         })
     }
 
