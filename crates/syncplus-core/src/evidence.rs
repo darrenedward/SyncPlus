@@ -3520,7 +3520,7 @@ fn apply_stored_event(
             let deletion_method = decode_deletion_method(method)?;
             validate_replayed_deletion_method(entry, deletion_method, configured_deletion_method)?;
             let content_proof_required =
-                entry.plan.pre_action().item_type() != ItemType::Symlink;
+                entry.plan.pre_action().item_type() == ItemType::RegularFile;
             if row.proof_metadata_verified != Some(true)
                 || row.proof_destination_size.is_none()
                 || (content_proof_required && row.proof_destination_sha256.is_none())
@@ -3726,7 +3726,7 @@ fn validate_removal_evidence(
     deletion_method: DeletionMethod,
     evidence: &RecoveryEvidence,
 ) -> Result<(), StorageError> {
-    let content_proof_required = entry.plan.pre_action().item_type() != ItemType::Symlink;
+    let content_proof_required = entry.plan.pre_action().item_type() == ItemType::RegularFile;
     let valid_recovery = match deletion_method {
         DeletionMethod::Trash => evidence.recovery_present() && evidence.recovery_target().is_some(),
         DeletionMethod::PermanentRemoval => {
@@ -3758,10 +3758,10 @@ fn validate_transfer_evidence(
         || evidence.recovery_present()
         || evidence.recovery_target().is_some()
         || evidence.source_size() != Some(entry.plan.pre_action().size())
-        || (entry.plan.pre_action().item_type() != ItemType::Symlink
+        || (entry.plan.pre_action().item_type() == ItemType::RegularFile
             && evidence.source_sha256() != entry.plan.pre_action().sha256())
         || evidence.destination_size().is_none()
-        || (entry.plan.pre_action().item_type() != ItemType::Symlink
+        || (entry.plan.pre_action().item_type() == ItemType::RegularFile
             && evidence.destination_sha256().is_none())
     {
         return Err(StorageError::CorruptEvidence(
@@ -3922,7 +3922,7 @@ fn validate_event(
     planned_item_type: Option<&str>,
     configured_deletion_method: Option<&str>,
 ) -> Result<(), StorageError> {
-    let content_proof_required = planned_item_type != Some("symlink");
+    let content_proof_required = planned_item_type == Some("regular_file");
     if let JournalEvent::TransferVerified {
         evidence,
         metadata_verified,
@@ -4267,7 +4267,7 @@ fn validate_removal_result_against_proof(
         .and_then(|size| u64::try_from(size).ok())
         .ok_or_else(|| StorageError::InvalidEvent("proof boundary has no destination size".to_owned()))?;
     let proof_sha256 = decode_hash(proof_sha256.as_deref())?;
-    if item_type != "symlink" && proof_sha256.is_none() {
+    if item_type == "regular_file" && proof_sha256.is_none() {
         return Err(StorageError::InvalidEvent(
             "proof boundary has no destination SHA-256".to_owned(),
         ));
@@ -4309,7 +4309,7 @@ fn validate_transfer_event_against_plan(
         .and_then(|value| u64::try_from(value).ok())
         .ok_or_else(|| StorageError::InvalidEvent("planned action has no source size".to_owned()))?;
     let sha256 = decode_hash(sha256.as_deref())?;
-    if item_type != "symlink" && sha256.is_none() {
+    if item_type == "regular_file" && sha256.is_none() {
         return Err(StorageError::InvalidEvent(
             "planned action has no source SHA-256".to_owned(),
         ));
