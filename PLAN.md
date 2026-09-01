@@ -261,6 +261,16 @@ If the database is corrupt, the app opens a Database Recovery Screen. Before res
 
 Completed reports remain until the user selects Remove. Unresolved reports require Discard Unresolved Run and a warning that recovery/review metadata will be lost. Removing reports or profiles never changes user files.
 
+Explicit configuration migration uses a versioned JSON export/import workflow.
+Exports contain only validated application settings, Sync Profiles, named
+options, exclusions, and schedule definitions; run evidence, host-trust
+records, recovery state, credential references, and secret values are not
+exported. Imports are previewed and fully validated before one SQLite
+transaction replaces editable configuration. Imported schedules are disabled,
+saved-password authentication requires interactive reconfiguration, and
+destructive options plus unattended authorizations are stripped so importing a
+file cannot silently grant destructive or unattended authority.
+
 ## Architecture
 
 Use a Cargo workspace with a GUI crate and a GUI-free core crate:

@@ -25,6 +25,7 @@ mod ssh_host;
 mod ssh;
 mod ssh_workflow;
 mod storage;
+mod config_transfer;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
@@ -94,6 +95,9 @@ pub use storage::{
     ApplicationMode, ApplicationSettings, PersistedSyncProfile, ScheduleDefinition, SyncProfileId,
     ThemePreference,
 };
+pub use config_transfer::{
+    ConfigurationImportPreview, ConfigurationTransferError,
+};
 pub use parser::{
     ItemizedRecord, ParseDiagnostic, ParsedOutput, ParsedTransferOutput, ProgressRecord,
     TransferOutputParser,
@@ -160,6 +164,8 @@ mod preserved_copy_tests;
 
 #[cfg(test)]
 mod storage_tests;
+#[cfg(test)]
+mod config_transfer_tests;
 
 #[cfg(test)]
 mod baseline_tests;

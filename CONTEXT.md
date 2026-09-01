@@ -464,6 +464,17 @@ _Avoid_: Split competing JSON state stores, YAML configuration, or secrets in SQ
 
 Before a destructive run, SyncPlus creates a small rotating backup of the Application Database. This protects profiles, baselines, action journals, and recovery records, but it does not restore user files or replace Trash/recovery handling.
 
+Explicit configuration migration is a versioned JSON workflow, not a second
+live store. An export contains validated application settings, Sync Profiles,
+named Sync Options, exclusions, and schedule definitions. It does not contain
+run evidence, SSH host-trust records, recovery state, passwords, passphrases,
+private-key contents, keyring values, or saved credential references. Imports
+are previewed and validated as a complete document before an atomic SQLite
+replacement of editable configuration. Imported schedules are disabled,
+saved-password authentication becomes interactive reconfiguration, and Safe
+Delete, Destination Cleanup, deletion methods, and unattended authorizations
+are stripped until the user deliberately configures them again.
+
 Backups are created only before a file-changing run, database migration, or repair; an idle tray application does not create daily backups. SyncPlus integrity-checks the live database before snapshotting and validates the new timestamped, gzip-compressed snapshot before retaining it. The rotation keeps at most two validated backups and never removes the last known-good backup. If the live database is corrupt, it is not backed up and existing good backups are left untouched.
 
 **Database Recovery Screen**:

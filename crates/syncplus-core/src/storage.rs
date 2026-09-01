@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -146,6 +147,20 @@ pub struct PersistedSyncProfile {
     authorizations: AuthorizationSnapshot,
 }
 
+/// Fully validated, nonsecret configuration prepared by the explicit JSON
+/// import workflow. Import replaces editable configuration in one SQLite
+/// transaction; run evidence, host-trust evidence, and recovery records are
+/// deliberately not part of this value.
+pub(crate) struct ConfigurationImport {
+    pub(crate) settings: ApplicationSettings,
+    pub(crate) profiles: Vec<ImportedProfile>,
+}
+
+pub(crate) struct ImportedProfile {
+    pub(crate) profile: SyncProfile,
+    pub(crate) schedule: Option<ScheduleDefinition>,
+}
+
 impl PersistedSyncProfile {
     pub const fn id(&self) -> SyncProfileId {
         self.id
@@ -211,6 +226,72 @@ impl RunEvidenceStore {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![encode_theme_preference(settings.theme())],
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn replace_configuration(
+        &mut self,
+        configuration: ConfigurationImport,
+    ) -> Result<(), StorageError> {
+        let mut profile_names = HashSet::with_capacity(configuration.profiles.len());
+        let mut endpoint_profiles: Vec<(Peer, Peer)> =
+            Vec::with_capacity(configuration.profiles.len());
+        for imported in &configuration.profiles {
+            validate_profile(&imported.profile)?;
+            if !profile_names.insert(imported.profile.name().to_owned()) {
+                return Err(StorageError::CorruptEvidence(
+                    "import contains duplicate Sync Profile names".to_owned(),
+                ));
+            }
+            if let Some(schedule) = &imported.schedule {
+                schedule.validate()?;
+                if schedule.enabled() {
+                    return Err(StorageError::InvalidSchedule(
+                        "imported schedules must be disabled until explicitly enabled".to_owned(),
+                    ));
+                }
+            }
+            if endpoint_profiles.iter().any(|(peer_a, peer_b)| {
+                peer_a.same_endpoint(imported.profile.peer_a())
+                    && peer_b.same_endpoint(imported.profile.peer_b())
+            }) {
+                return Err(StorageError::DuplicateEndpointPair);
+            }
+            endpoint_profiles.push((
+                imported.profile.peer_a().clone(),
+                imported.profile.peer_b().clone(),
+            ));
+        }
+
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM sync_profiles", [])?;
+        transaction.execute(
+            "INSERT INTO application_settings (key, value) VALUES ('ui_mode', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![encode_application_mode(configuration.settings.mode())],
+        )?;
+        transaction.execute(
+            "INSERT INTO application_settings (key, value) VALUES ('theme', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![encode_theme_preference(configuration.settings.theme())],
+        )?;
+
+        for imported in configuration.profiles {
+            let values = ProfileValues::from_profile(&imported.profile);
+            let id = insert_profile(&transaction, &values, AuthorizationSnapshot::default())?;
+            insert_exclusions(&transaction, id, &imported.profile)?;
+            if let Some(schedule) = imported.schedule {
+                transaction.execute(
+                    "INSERT INTO sync_profile_schedules
+                        (profile_id, interval_minutes, timezone, enabled)
+                     VALUES (?1, ?2, ?3, 0)",
+                    params![id, schedule.interval_minutes(), schedule.timezone()],
+                )?;
+            }
+        }
         transaction.commit()?;
         Ok(())
     }
