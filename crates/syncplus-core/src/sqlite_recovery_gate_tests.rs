@@ -12,15 +12,48 @@ use flate2::read::GzDecoder;
 use crate::{
     ActionReason, ApplicationMode, ApplicationSettings, AuthorizationSnapshot, ContentProof,
     CompletionReconciliation, DatabaseBackupManager, DeletionMethod, FileIdentity, FreshAnalysis,
-    ItemType, JournalEvent, LocalPrecheckProbe, MetadataRequirements, Peer,
-    PeerSide, PlanActionKind, PlanRecord, PreActionState, RecoveryEvidence, RecoveryMethod,
+    CollisionSafeRestore, CredentialResolutionError, CredentialResolver, HostTrustDecision,
+    ItemType, JournalEvent, LocalPrecheckProbe, MetadataRequirements, Peer, PeerSide,
+    PlanActionKind, PlanRecord, PreActionState, RecoveryEvidence, RecoveryMethod,
     RecoveryProvenance, RunEvidenceStore, RunId, RunReportStatus, RunSnapshot,
-    SavedSecretReference, ScheduleDefinition, SshAuthentication, SshHost, SshHostFingerprint,
-    SyncMode, SyncProfile, ThemePreference,
+    SavedSecretReference, ScheduleDefinition, SecretStore, SecretStoreError, SecretValue,
+    SshAuthentication, SshHost, SshHostFingerprint, SshHostIdentityError, SshHostIdentityProbe,
+    SshHostTrustController, SshRunMode, SyncMode, SyncOptions, SyncProfile, ThemePreference,
 };
 
 const SECRET_FILE_CONTENT: &[u8] = b"private file contents must never become database evidence";
 const SECRET_REFERENCE: &str = "keyring-only-secret-reference";
+
+struct MissingSecretStore;
+
+impl SecretStore for MissingSecretStore {
+    fn save(
+        &self,
+        _reference: &SavedSecretReference,
+        _secret: &SecretValue,
+    ) -> Result<(), SecretStoreError> {
+        Ok(())
+    }
+
+    fn load(&self, _reference: &SavedSecretReference) -> Result<SecretValue, SecretStoreError> {
+        Err(SecretStoreError::Missing)
+    }
+
+    fn delete(&self, _reference: &SavedSecretReference) -> Result<(), SecretStoreError> {
+        Ok(())
+    }
+}
+
+struct FixedFingerprint(SshHostFingerprint);
+
+impl SshHostIdentityProbe for FixedFingerprint {
+    fn probe(
+        &self,
+        _peer: &crate::SshPeer,
+    ) -> Result<SshHostFingerprint, SshHostIdentityError> {
+        Ok(self.0)
+    }
+}
 
 struct Fixture {
     root: PathBuf,
@@ -98,6 +131,20 @@ fn ssh_profile(name: &str) -> SyncProfile {
         )
         .expect("SSH peer should be valid"),
     )
+}
+
+fn safe_delete_profile(name: &str, source: &Path, destination: &Path) -> SyncProfile {
+    local_profile(name, source, destination).with_options(SyncOptions {
+        safe_delete: true,
+        deletion_method: Some(DeletionMethod::Trash),
+        ..SyncOptions::default()
+    })
+}
+
+fn database_sidecar(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 fn plan(action_id: u64, relative_path: &str) -> PlanRecord {
@@ -196,6 +243,30 @@ fn sqlite_recovery_gate_round_trips_all_evidence_and_nonsecret_configuration() {
             .expect("load SSH host fingerprint"),
         Some(fingerprint)
     );
+    let missing_credential = CredentialResolver::new(MissingSecretStore)
+        .resolve(
+            ssh.peer_b().ssh_peer().expect("SSH peer"),
+            SshRunMode::Interactive,
+            None,
+        )
+        .expect_err("missing saved credential must block without fallback");
+    assert_eq!(
+        missing_credential,
+        CredentialResolutionError::SavedSecretUnavailable
+    );
+
+    let mut trust_store = RunEvidenceStore::open_in_memory().expect("open trust store");
+    trust_store
+        .approve_ssh_host_fingerprint(&host, &fingerprint)
+        .expect("persist test host approval");
+    let changed = SshHostTrustController::new(trust_store)
+        .inspect(
+            ssh.peer_b().ssh_peer().expect("SSH peer"),
+            &FixedFingerprint(SshHostFingerprint::sha256([0x2b; 32])),
+        )
+        .expect("inspect changed fingerprint");
+    assert!(matches!(changed, HostTrustDecision::ChangedFingerprint { .. }));
+    assert!(!changed.is_approved());
 
     let snapshot = RunSnapshot::from_profile(
         run_id,
@@ -260,6 +331,47 @@ fn sqlite_recovery_gate_round_trips_all_evidence_and_nonsecret_configuration() {
             .relative_path(),
         Path::new("secret.txt")
     );
+    let tampered_sidecar = fixture.recovery().join("tampered.syncplus-manifest");
+    provenance
+        .write_sidecar(&tampered_sidecar)
+        .expect("write tamper fixture sidecar");
+    let mut tampered_bytes = fs::read(&tampered_sidecar).expect("read tamper fixture sidecar");
+    tampered_bytes[0] ^= 1;
+    fs::write(&tampered_sidecar, tampered_bytes).expect("tamper sidecar");
+    assert!(matches!(
+        RecoveryProvenance::read_sidecar(&tampered_sidecar),
+        Err(crate::RestoreError::SidecarInvalid(_))
+    ));
+
+    let collision_recovered = fixture.recovery().join("collision-recovered");
+    let collision_destination = fixture.source().join("collision.txt");
+    fs::write(&collision_recovered, b"recovered bytes")
+        .expect("write collision recovery item");
+    fs::write(&collision_destination, b"newer user bytes")
+        .expect("write collision target");
+    let collision_provenance = RecoveryProvenance::new(
+        "source",
+        fixture.source(),
+        PathBuf::from("collision.txt"),
+        run_id,
+        ItemType::RegularFile,
+        Some(ContentProof::from_path(&collision_recovered).expect("hash collision item")),
+        None,
+    )
+    .expect("create collision provenance");
+    let missing_recovered = fixture.recovery().join("missing-recovered");
+    assert!(matches!(
+        CollisionSafeRestore::restore(&missing_recovered, &collision_provenance, || false),
+        Err(crate::RestoreError::Io(_))
+    ));
+    assert!(matches!(
+        CollisionSafeRestore::restore(&collision_recovered, &collision_provenance, || false),
+        Err(crate::RestoreError::Collision(_, _))
+    ));
+    assert_eq!(
+        fs::read(&collision_destination).expect("read preserved collision target"),
+        b"newer user bytes"
+    );
 
     store
         .append_event(run_id, JournalEvent::Planned { action: plan(1, "secret.txt") })
@@ -319,6 +431,12 @@ fn sqlite_recovery_gate_round_trips_all_evidence_and_nonsecret_configuration() {
     assert_backup_does_not_contain(backup.path(), SECRET_FILE_CONTENT);
 
     drop(store);
+    for suffix in ["-wal", "-shm"] {
+        let sidecar_path = database_sidecar(&fixture.database(), suffix);
+        if sidecar_path.is_file() {
+            assert_bytes_do_not_contain(&sidecar_path, SECRET_FILE_CONTENT);
+        }
+    }
     let reopened = RunEvidenceStore::open(&fixture.database())
         .expect("reopen application database");
     assert_eq!(
@@ -455,6 +573,7 @@ fn sqlite_recovery_gate_preserves_concurrent_records_and_filesystem_boundary_unc
     let fixture = Fixture::new("concurrency");
     fs::create_dir_all(fixture.source()).expect("create source");
     fs::create_dir_all(fixture.destination()).expect("create destination");
+    fs::create_dir_all(fixture.recovery()).expect("create recovery");
 
     let workers = 4;
     {
@@ -479,9 +598,20 @@ fn sqlite_recovery_gate_preserves_concurrent_records_and_filesystem_boundary_unc
             );
             let mut store = RunEvidenceStore::open(&database).expect("open concurrent database");
             barrier.wait();
-            store
+            let profile_id = store
                 .create_profile(&profile)
-                .expect("persist concurrent profile");
+                .expect("persist concurrent profile")
+                .id();
+            store
+                .update_schedule(
+                    profile_id,
+                    Some(
+                        ScheduleDefinition::new(5 + worker as u32, "Pacific/Auckland", true)
+                            .expect("valid concurrent schedule"),
+                    ),
+                    ApplicationMode::Advanced,
+                )
+                .expect("persist concurrent schedule");
             let run_id = store.next_run_id().expect("reserve concurrent run id");
             let snapshot = RunSnapshot::from_profile(
                 run_id,
@@ -525,6 +655,11 @@ fn sqlite_recovery_gate_preserves_concurrent_records_and_filesystem_boundary_unc
         store.list_run_reports().expect("list concurrent reports").len(),
         workers
     );
+    assert!(store
+        .list_profiles()
+        .expect("reload concurrent profiles")
+        .iter()
+        .all(|profile| profile.schedule().is_some_and(|schedule| schedule.enabled())));
     for run_id in run_ids {
         let report = store.load_report(run_id).expect("load concurrent report");
         assert_eq!(report.status(), RunReportStatus::RecoveryReview);
@@ -568,4 +703,46 @@ fn sqlite_recovery_gate_preserves_concurrent_records_and_filesystem_boundary_unc
             .status(),
         RunReportStatus::RecoveryReview
     );
+
+    let safe_fixture = Fixture::new("safe-delete-boundary");
+    fs::create_dir_all(safe_fixture.source()).expect("create Safe Delete source");
+    fs::create_dir_all(safe_fixture.destination()).expect("create Safe Delete destination");
+    fs::create_dir_all(safe_fixture.recovery()).expect("create Safe Delete recovery");
+    let safe_delete_source = safe_fixture.source().join("safe-delete-boundary.txt");
+    let safe_delete_recovery = safe_fixture.recovery().join("safe-delete-boundary.txt");
+    fs::write(&safe_delete_source, b"verified removal before journal failure")
+        .expect("write Safe Delete source");
+    let safe_delete_profile = safe_delete_profile(
+        "Safe Delete boundary",
+        &safe_fixture.source(),
+        &safe_fixture.destination(),
+    );
+    let safe_delete_run = RunId::new(8511);
+    let mut safe_delete_store = RunEvidenceStore::open(&safe_fixture.database())
+        .expect("open Safe Delete boundary database");
+    safe_delete_store.fail_next_event_phase_for_test("removal_completed");
+    let safe_delete_report = crate::RunWorkflow::new(RecoveryMethod::trash(safe_fixture.recovery()))
+        .execute(
+            safe_delete_run,
+            &safe_delete_profile,
+            &LocalPrecheckProbe::default(),
+            |_| true,
+            &mut safe_delete_store,
+            || false,
+        )
+        .expect("removal uncertainty must become a reviewable report");
+    assert!(!safe_delete_source.exists(), "verified removal already happened");
+    assert!(safe_delete_recovery.is_file(), "recovery item must remain available");
+    assert_eq!(
+        fs::read(&safe_delete_recovery).expect("read recovered Safe Delete item"),
+        b"verified removal before journal failure"
+    );
+    assert_eq!(safe_delete_report.status(), RunReportStatus::RecoveryReview);
+    assert!(safe_delete_report.items().iter().any(|item| {
+        item.relative_path() == Path::new("safe-delete-boundary.txt")
+            && matches!(
+                item.outcome(),
+                crate::ActionOutcome::RecoveryReview(ActionReason::InterruptedBoundary)
+            )
+    }));
 }
