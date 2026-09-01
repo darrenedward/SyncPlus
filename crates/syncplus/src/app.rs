@@ -2,11 +2,13 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use eframe::egui;
 use syncplus_core::{
-    AnalysisOutcome, ApplicationMode, ApplicationSettings, AuthorizationSnapshot, ConflictDecision,
+    ActionOutcome, AnalysisOutcome, ApplicationMode, ApplicationSettings, AuthorizationSnapshot,
+    ConflictDecision,
     ConflictEntry, ConflictEntryKey, ConflictResolution, ConflictReview, DeletionMethod,
     FreshAnalysis, LocalPrecheckProbe, MetadataRequirements, OneWaySource, PartialTransferPolicy,
     Peer, PeerEndpoint, PersistedSyncProfile, PrecheckErrorKind, PrecheckResult, ResolutionRun,
-    RetryPolicy, RunEvidenceStore, RunPrecheck, SavedSecretReference, SecretStore, SecretStoreError,
+    RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle, RunPrecheck,
+    RunReport, RunReportStatus, SavedSecretReference, SecretStore, SecretStoreError,
     SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
     SyncProfileId, ThemePreference,
 };
@@ -479,6 +481,12 @@ struct PlanReviewState {
     confirmed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingReportAction {
+    RemoveCompletedReport(RunId),
+    DiscardUnresolvedRun(RunId),
+}
+
 pub struct SyncPlusApp {
     store: RunEvidenceStore,
     secret_store: Box<dyn SecretStore>,
@@ -487,6 +495,9 @@ pub struct SyncPlusApp {
     form: ProfileForm,
     status: String,
     review: Option<PlanReviewState>,
+    run_reports: Vec<RunReport>,
+    selected_run_report: Option<RunId>,
+    pending_report_action: Option<PendingReportAction>,
 }
 
 impl SyncPlusApp {
@@ -504,6 +515,8 @@ impl SyncPlusApp {
     ) -> Result<Self, syncplus_core::StorageError> {
         let settings = store.load_settings()?;
         let profiles = store.list_profiles()?;
+        let run_reports = store.list_run_reports()?;
+        let selected_run_report = run_reports.first().map(RunReport::run_id);
         Ok(Self {
             store,
             secret_store: Box::new(secret_store),
@@ -512,6 +525,9 @@ impl SyncPlusApp {
             form: ProfileForm::default(),
             status: "Ready. Create a Sync Profile to begin.".to_owned(),
             review: None,
+            run_reports,
+            selected_run_report,
+            pending_report_action: None,
         })
     }
 
@@ -529,6 +545,93 @@ impl SyncPlusApp {
 
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    pub fn run_reports(&self) -> &[RunReport] {
+        &self.run_reports
+    }
+
+    pub fn selected_run_report(&self) -> Option<&RunReport> {
+        self.selected_run_report.and_then(|run_id| {
+            self.run_reports
+                .iter()
+                .find(|report| report.run_id() == run_id)
+        })
+    }
+
+    pub fn refresh_run_reports(&mut self) -> Result<(), UiValidationError> {
+        let reports = self
+            .store
+            .list_run_reports()
+            .map_err(|error| UiValidationError::Core(error.to_string()))?;
+        let selected = self
+            .selected_run_report
+            .filter(|run_id| reports.iter().any(|report| report.run_id() == *run_id))
+            .or_else(|| reports.first().map(RunReport::run_id));
+        self.run_reports = reports;
+        self.selected_run_report = selected;
+        if self
+            .pending_report_action
+            .is_some_and(|action| match action {
+                PendingReportAction::RemoveCompletedReport(run_id)
+                | PendingReportAction::DiscardUnresolvedRun(run_id) => {
+                    self.run_reports.iter().all(|report| report.run_id() != run_id)
+                }
+            })
+        {
+            self.pending_report_action = None;
+        }
+        Ok(())
+    }
+
+    pub fn select_run_report(&mut self, run_id: RunId) -> Result<(), UiValidationError> {
+        if self.run_reports.iter().any(|report| report.run_id() == run_id) {
+            self.selected_run_report = Some(run_id);
+            self.pending_report_action = None;
+            self.status = format!("Viewing durable report for Sync Run {}.", run_id.value());
+            Ok(())
+        } else {
+            Err(UiValidationError::Core(format!(
+                "Sync Run report {} was not found",
+                run_id.value()
+            )))
+        }
+    }
+
+    pub fn remove_completed_report(&mut self, run_id: RunId) -> Result<(), UiValidationError> {
+        self.store
+            .remove_completed_report(run_id)
+            .map_err(map_storage_error)?;
+        self.refresh_run_reports()?;
+        self.status = format!(
+            "Removed completed report metadata for Sync Run {}. Source and destination files were not changed.",
+            run_id.value()
+        );
+        Ok(())
+    }
+
+    pub fn discard_unresolved_run(&mut self, run_id: RunId) -> Result<(), UiValidationError> {
+        self.store
+            .discard_unresolved_run(run_id)
+            .map_err(map_storage_error)?;
+        self.refresh_run_reports()?;
+        self.status = format!(
+            "Discarded unresolved report metadata for Sync Run {}. Source and destination files were not changed; Recovery Review evidence is no longer available in this report.",
+            run_id.value()
+        );
+        Ok(())
+    }
+
+    pub fn mark_review_cleared(&mut self, run_id: RunId) -> Result<(), UiValidationError> {
+        self.store
+            .mark_review_cleared(run_id)
+            .map_err(map_storage_error)?;
+        self.refresh_run_reports()?;
+        self.status = format!(
+            "Marked Sync Run {} as Review Cleared. No source or destination files were changed.",
+            run_id.value()
+        );
+        Ok(())
     }
 
     pub fn start_new_profile(&mut self) {
@@ -1560,6 +1663,127 @@ impl SyncPlusApp {
             }
         }
     }
+
+    fn draw_run_reports(&mut self, ui: &mut egui::Ui) {
+        let mut action_to_run = None;
+        let mut cancel_pending = false;
+        let mut review_to_clear = None;
+        ui.separator();
+        ui.heading("Sync Run lifecycle, Run Reports, and Recovery Review");
+        ui.label("Run Reports are durable safety evidence. They contain status, progress, paths, outcomes, and recovery facts, never passwords or file contents.");
+        ui.label("All lifecycle state, progress, warnings, and recovery actions have text labels and keyboard-focusable controls.");
+        if self.run_reports.is_empty() {
+            ui.label("No durable Sync Run reports are available.");
+            return;
+        }
+
+        let reports = self.run_reports.clone();
+        ui.columns(2, |columns| {
+            columns[0].heading("Run Reports");
+            for report in &reports {
+                let selected = self.selected_run_report == Some(report.run_id());
+                let label = format!(
+                    "Run {} — {} — {}",
+                    report.run_id().value(),
+                    report.snapshot().profile().name(),
+                    run_report_status_label(report.status())
+                );
+                if columns[0]
+                    .selectable_label(selected, label)
+                    .on_hover_text("Select this durable report")
+                    .clicked()
+                {
+                    self.selected_run_report = Some(report.run_id());
+                    self.pending_report_action = None;
+                }
+            }
+
+            let selected = self
+                .selected_run_report
+                .and_then(|run_id| reports.iter().find(|report| report.run_id() == run_id));
+            let Some(report) = selected else {
+                columns[1].label("Select a Run Report to inspect its lifecycle and evidence.");
+                return;
+            };
+            draw_run_report_detail(&mut columns[1], report);
+
+            let pending = self
+                .pending_report_action
+                .filter(|action| match action {
+                    PendingReportAction::RemoveCompletedReport(run_id)
+                    | PendingReportAction::DiscardUnresolvedRun(run_id) => *run_id == report.run_id(),
+                });
+            if let Some(action) = pending {
+                columns[1].group(|ui| {
+                    ui.label("Confirm metadata action");
+                    match action {
+                        PendingReportAction::RemoveCompletedReport(_) => {
+                            ui.label("This removes only the completed report metadata. It does not remove synchronized source or destination files.");
+                            if ui.button("Confirm Remove Completed Report").clicked() {
+                                action_to_run = Some(action);
+                            }
+                        }
+                        PendingReportAction::DiscardUnresolvedRun(_) => {
+                            ui.label("This discards unresolved report and Recovery Review metadata. It does not undo or remove synchronized source or destination files; review evidence will no longer be available here.");
+                            if ui.button("Confirm Discard Unresolved Run").clicked() {
+                                action_to_run = Some(action);
+                            }
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel_pending = true;
+                    }
+                });
+            } else {
+                if report.can_mark_review_cleared()
+                    && columns[1].button("Mark Review Cleared").clicked()
+                {
+                    review_to_clear = Some(report.run_id());
+                }
+                match report.status() {
+                    RunReportStatus::Completed | RunReportStatus::ReviewCleared => {
+                        if columns[1].button("Remove Completed Report").clicked() {
+                            self.pending_report_action = Some(
+                                PendingReportAction::RemoveCompletedReport(report.run_id()),
+                            );
+                        }
+                    }
+                    RunReportStatus::InProgress => {
+                        columns[1].label("This active Sync Run cannot be discarded. Let it settle or cancel it first so its durable boundary remains available for Recovery Review.");
+                    }
+                    _ => {
+                        if columns[1].button("Discard Unresolved Run").clicked() {
+                            self.pending_report_action = Some(
+                                PendingReportAction::DiscardUnresolvedRun(report.run_id()),
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        if cancel_pending {
+            self.pending_report_action = None;
+        }
+        if let Some(action) = action_to_run {
+            self.pending_report_action = None;
+            let result = match action {
+                PendingReportAction::RemoveCompletedReport(run_id) => {
+                    self.remove_completed_report(run_id)
+                }
+                PendingReportAction::DiscardUnresolvedRun(run_id) => {
+                    self.discard_unresolved_run(run_id)
+                }
+            };
+            if let Err(error) = result {
+                self.status = format!("Run Report action was not completed: {error}");
+            }
+        } else if let Some(run_id) = review_to_clear {
+            if let Err(error) = self.mark_review_cleared(run_id) {
+                self.status = format!("Review could not be cleared: {error}");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2051,14 +2275,239 @@ fn format_precheck_error(error: &PrecheckErrorKind) -> String {
 impl eframe::App for SyncPlusApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.apply_theme(ui.ctx());
+        if let Err(error) = self.refresh_run_reports() {
+            self.status = format!("Run Reports are unavailable: {error}");
+        }
         egui::Panel::top("settings").show(ui, |ui| self.draw_settings(ui));
         egui::Panel::left("profiles").show(ui, |ui| self.draw_profile_list(ui));
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_profile_form(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_review(ui));
+            egui::ScrollArea::vertical().show(ui, |ui| self.draw_run_reports(ui));
             ui.separator();
             ui.label(egui::RichText::new(&self.status).strong());
         });
+    }
+}
+
+fn draw_run_report_detail(ui: &mut egui::Ui, report: &RunReport) {
+    ui.heading(format!("Sync Run {}", report.run_id().value()));
+    ui.label(format!(
+        "Profile: {} | Mode: {} | Snapshot: {}",
+        report.snapshot().profile().name(),
+        sync_mode_label(report.snapshot().profile().mode()),
+        report.snapshot().snapshot_id().value()
+    ));
+    ui.label(format!(
+        "Status: {} | Execution: {} | Lifecycle: {}",
+        run_report_status_label(report.status()),
+        run_execution_result_label_for_report(report),
+        run_lifecycle_label(report.lifecycle())
+    ));
+    ui.label(format!(
+        "Recorded actions: {} | Reports are retained until an explicit metadata action.",
+        report.items().len()
+    ));
+
+    if report.status() == RunReportStatus::InProgress {
+        ui.group(|ui| {
+            ui.heading("Active Sync Run");
+            if let Some(item) = report
+                .items()
+                .iter()
+                .rev()
+                .find(|item| matches!(item.outcome(), ActionOutcome::InProgress))
+            {
+                draw_explainable_action(ui, item);
+            } else {
+                ui.label("The run is active, but no current action boundary has been recorded yet.");
+                ui.label("The source remains protected until the next durable action boundary is written.");
+            }
+            ui.label("Cancellation is stateful: the latest durable phase and progress remain available while the run is cancelled, interrupted, or awaiting review.");
+        });
+    }
+
+    if matches!(
+        report.status(),
+        RunReportStatus::Cancelled
+            | RunReportStatus::Interrupted
+            | RunReportStatus::RecoveryReview
+            | RunReportStatus::CompletedWithReviewRequired
+            | RunReportStatus::Failed
+            | RunReportStatus::Blocked
+    ) {
+        ui.group(|ui| {
+            ui.heading("Recovery Review");
+            ui.label(run_recovery_message(report.status()));
+            if let Some(reason) = report.blocked_reason() {
+                ui.label(format!("Blocker: {reason}"));
+            }
+            if let Some(reconciliation) = report.reconciliation() {
+                if reconciliation.findings().is_empty() {
+                    ui.label("Completion Reconciliation recorded no findings.");
+                } else {
+                    for finding in reconciliation.findings() {
+                        ui.label(format!(
+                            "Reconciliation finding: {} — {}",
+                            finding.relative_path().display(),
+                            finding.reason()
+                        ));
+                    }
+                }
+            }
+            for item in report.items().iter().filter(|item| {
+                !matches!(item.outcome(), ActionOutcome::Completed)
+                    || item.journal().recovery_evidence().is_some()
+            }) {
+                ui.label(format!(
+                    "Review item: {} — {}",
+                    item.relative_path().display(),
+                    action_outcome_label(item.outcome())
+                ));
+                if let Some(evidence) = item.journal().recovery_evidence() {
+                    ui.label(format!(
+                        "Preserved-state evidence: source present {}, destination present {}, recovery present {}; observed sizes: source {}, destination {}.",
+                        evidence.source_present(),
+                        evidence.destination_present(),
+                        evidence.recovery_present(),
+                        evidence.source_size().map_or_else(|| "unknown".to_owned(), |size| format_bytes(size)),
+                        evidence.destination_size().map_or_else(|| "unknown".to_owned(), |size| format_bytes(size)),
+                    ));
+                }
+            }
+        });
+    }
+
+    ui.collapsing(format!("Explainable Actions ({})", report.items().len()), |ui| {
+        if report.items().is_empty() {
+            ui.label("No action boundaries have been recorded yet.");
+        }
+        for item in report.items() {
+            ui.group(|ui| draw_explainable_action(ui, item));
+        }
+    });
+    if !report.mirror_resolutions().is_empty() {
+        ui.collapsing("Mirror resolution evidence", |ui| {
+            for resolution in report.mirror_resolutions() {
+                ui.label(format!(
+                    "{} — {:?} — {:?} — review state {:?}",
+                    resolution.relative_path().display(),
+                    resolution.operation(),
+                    resolution.outcome(),
+                    resolution.review_state()
+                ));
+            }
+        });
+    }
+}
+
+fn draw_explainable_action(ui: &mut egui::Ui, item: &syncplus_core::RunReportItem) {
+            ui.label(format!(
+        "{} — {} — {}",
+        item.relative_path().display(),
+        plan_action_label(item.operation()),
+        action_outcome_label(item.outcome())
+    ));
+    let planned = item.journal().plan().planned_bytes();
+    let progress = item.progress_bytes();
+    let progress_text = planned.map_or_else(
+        || format_bytes(progress),
+        |planned| format!("{} of {}", format_bytes(progress), format_bytes(planned)),
+    );
+    ui.label(format!(
+        "Phase: {} | Progress: {} | Consequence: {}",
+        item.journal().last_phase(),
+        progress_text,
+        item.consequence()
+    ));
+    ui.label(format!(
+        "Source path: {} | Destination path: {}",
+        item.source_path().display(),
+        item.destination_path().display()
+    ));
+}
+
+fn run_report_status_label(status: RunReportStatus) -> &'static str {
+    match status {
+        RunReportStatus::InProgress => "In progress",
+        RunReportStatus::Completed => "Completed",
+        RunReportStatus::Failed => "Failed",
+        RunReportStatus::Cancelled => "Cancelled",
+        RunReportStatus::Interrupted => "Interrupted",
+        RunReportStatus::Blocked => "Blocked",
+        RunReportStatus::CompletedWithReviewRequired => "Pending review",
+        RunReportStatus::RecoveryReview => "Recovery Review required",
+        RunReportStatus::ReviewCleared => "Review cleared",
+    }
+}
+
+fn run_execution_result_label(result: RunExecutionResult) -> &'static str {
+    match result {
+        RunExecutionResult::NotStarted => "Not started",
+        RunExecutionResult::InProgress => "In progress",
+        RunExecutionResult::Succeeded => "Succeeded",
+        RunExecutionResult::Failed => "Failed",
+        RunExecutionResult::Cancelled => "Cancelled",
+        RunExecutionResult::Interrupted => "Interrupted",
+        RunExecutionResult::Blocked => "Blocked",
+        RunExecutionResult::RecoveryReview => "Recovery Review",
+    }
+}
+
+fn run_execution_result_label_for_report(report: &RunReport) -> &'static str {
+    if report.status() == RunReportStatus::CompletedWithReviewRequired {
+        "Pending review"
+    } else {
+        run_execution_result_label(report.execution_result())
+    }
+}
+
+fn run_lifecycle_label(lifecycle: RunLifecycle) -> &'static str {
+    match lifecycle {
+        RunLifecycle::Open => "Open",
+        RunLifecycle::ReviewRequired => "Review required",
+        RunLifecycle::ReviewCleared => "Review cleared",
+    }
+}
+
+fn sync_mode_label(mode: SyncMode) -> &'static str {
+    match mode {
+        SyncMode::OneWay => "One-Way Sync",
+        SyncMode::Mirror => "Mirror Sync",
+    }
+}
+
+fn plan_action_label(action: syncplus_core::PlanActionKind) -> &'static str {
+    match action {
+        syncplus_core::PlanActionKind::CopyToDestination => "Copy to destination",
+        syncplus_core::PlanActionKind::OverwriteDestination => "Verified destination overwrite",
+        syncplus_core::PlanActionKind::RemoveDestination => "Remove destination item",
+        syncplus_core::PlanActionKind::RemoveSourceAfterVerification => "Verified source removal",
+    }
+}
+
+fn action_outcome_label(outcome: &ActionOutcome) -> String {
+    match outcome {
+        ActionOutcome::InProgress => "In progress".to_owned(),
+        ActionOutcome::Completed => "Completed".to_owned(),
+        ActionOutcome::Failed(reason) => format!("Failed: {reason}"),
+        ActionOutcome::Cancelled => "Cancelled; preserved for review".to_owned(),
+        ActionOutcome::Interrupted => "Interrupted; preserved for review".to_owned(),
+        ActionOutcome::Deferred => "Deferred for review".to_owned(),
+        ActionOutcome::Unresolved(reason) => format!("Unresolved: {reason}"),
+        ActionOutcome::RecoveryReview(reason) => format!("Recovery Review: {reason}"),
+    }
+}
+
+fn run_recovery_message(status: RunReportStatus) -> &'static str {
+    match status {
+        RunReportStatus::Cancelled => "Cancellation was recorded. Unfinished work remains open; affected source items remain preserved when safety cannot prove removal. Inspect the durable action evidence before resuming or discarding it.",
+        RunReportStatus::Interrupted => "The run was interrupted by a crash, disconnect, or process stop. The last durable boundary is shown below and unresolved work requires Recovery Review.",
+        RunReportStatus::RecoveryReview => "Filesystem state crossed an uncertain boundary. The recorded source, destination, and recovery observations must be reviewed before this run can be cleared.",
+        RunReportStatus::CompletedWithReviewRequired => "Actions settled, but completion is withheld because unexplained, failed, unavailable, or otherwise unverified items remain.",
+        RunReportStatus::Failed => "At least one action failed. The report remains open so the failure and preserved state can be reviewed.",
+        RunReportStatus::Blocked => "The run did not start because a safety precheck or scope blocker prevented mutation.",
+        _ => "This run requires review before it can be treated as cleared.",
     }
 }
 
@@ -2150,6 +2599,112 @@ mod tests {
     fn app() -> SyncPlusApp {
         SyncPlusApp::new_with_store(RunEvidenceStore::open_in_memory().expect("database"))
             .expect("app")
+    }
+
+    fn report_store() -> (RunEvidenceStore, syncplus_core::RunId, syncplus_core::RunId) {
+        let mut store = RunEvidenceStore::open_in_memory().expect("database");
+        let profile = SyncProfile::new(
+            "report profile",
+            Peer::new("source", PathBuf::from("/source")),
+            Peer::new("destination", PathBuf::from("/destination")),
+        );
+        let action = || {
+            syncplus_core::PlanRecord::new(
+                1,
+                PathBuf::from("file.txt"),
+                syncplus_core::PlanActionKind::CopyToDestination,
+                syncplus_core::PeerSide::PeerA,
+                Some(42),
+                syncplus_core::PreActionState::new(
+                    syncplus_core::ItemType::RegularFile,
+                    42,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+        };
+        let completed_run = syncplus_core::RunId::new(90);
+        let completed_snapshot = syncplus_core::RunSnapshot::from_profile(
+            completed_run,
+            &profile,
+            syncplus_core::AuthorizationSnapshot::default(),
+        )
+        .expect("completed snapshot");
+        store.begin_run(&completed_snapshot).expect("snapshot");
+        store
+            .append_event(completed_run, syncplus_core::JournalEvent::Planned { action: action() })
+            .expect("plan");
+        store
+            .append_event(completed_run, syncplus_core::JournalEvent::Started { action_id: 1 })
+            .expect("start");
+        store
+            .append_event(completed_run, syncplus_core::JournalEvent::Completed { action_id: 1 })
+            .expect("complete");
+
+        let unresolved_run = syncplus_core::RunId::new(91);
+        let unresolved_snapshot = syncplus_core::RunSnapshot::from_profile(
+            unresolved_run,
+            &profile,
+            syncplus_core::AuthorizationSnapshot::default(),
+        )
+        .expect("unresolved snapshot");
+        store.begin_run(&unresolved_snapshot).expect("snapshot");
+        store
+            .append_event(unresolved_run, syncplus_core::JournalEvent::Planned { action: action() })
+            .expect("plan");
+        store
+            .append_event(unresolved_run, syncplus_core::JournalEvent::Started { action_id: 1 })
+            .expect("start");
+        store
+            .append_event(
+                unresolved_run,
+                syncplus_core::JournalEvent::Unresolved {
+                    action_id: 1,
+                    reason: syncplus_core::ActionReason::PermissionDenied,
+                },
+            )
+            .expect("unresolved");
+        (store, completed_run, unresolved_run)
+    }
+
+    #[test]
+    fn run_report_surface_loads_status_and_guards_metadata_actions() {
+        let (store, completed_run, unresolved_run) = report_store();
+        let mut app = SyncPlusApp::new_with_store(store).expect("app");
+
+        assert_eq!(app.run_reports().len(), 2);
+        assert_eq!(app.run_reports()[0].run_id(), unresolved_run);
+        app.select_run_report(completed_run).expect("select report");
+        assert_eq!(app.selected_run_report().expect("selected report").run_id(), completed_run);
+        assert!(app
+            .remove_completed_report(unresolved_run)
+            .expect_err("unresolved work has a separate discard action")
+            .to_string()
+            .contains("Remove Completed Report"));
+        app.mark_review_cleared(completed_run)
+            .expect("record explicit review acknowledgement");
+        assert_eq!(
+            app.selected_run_report()
+                .expect("selected cleared report")
+                .status(),
+            RunReportStatus::ReviewCleared
+        );
+        app.remove_completed_report(completed_run)
+            .expect("remove completed metadata");
+        assert_eq!(app.run_reports().len(), 1);
+        app.discard_unresolved_run(unresolved_run)
+            .expect("discard unresolved metadata");
+        assert!(app.run_reports().is_empty());
+    }
+
+    #[test]
+    fn pending_review_is_not_presented_as_completed() {
+        assert_eq!(
+            run_report_status_label(RunReportStatus::CompletedWithReviewRequired),
+            "Pending review"
+        );
+        assert!(run_recovery_message(RunReportStatus::Interrupted).contains("Recovery Review"));
     }
 
     struct AvailableSecretStore;

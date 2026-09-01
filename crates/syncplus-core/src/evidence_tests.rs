@@ -7,7 +7,7 @@ use crate::{
     ActionOutcome, ActionReason, AuthorizationSnapshot, DeletionMethod, FileIdentity, ItemType,
     JournalEvent, OneWaySource, Peer, PeerSide, PlanActionKind, PlanRecord, PreActionState, RecoveryEvidence,
     PartialTransferPolicy, RecoveryResolution, RetryPolicy, RunEvidenceStore, RunExecutionResult,
-    RunId, RunLifecycle, RunReportStatus, RunSnapshot, SyncOptions, SyncProfile, SyncRun,
+    RunId, RunLifecycle, RunReport, RunReportStatus, RunSnapshot, SyncOptions, SyncProfile, SyncRun,
     ConflictResolution, MetadataRequirements, MirrorResolutionOutcome, MirrorResolutionReportItem,
     MirrorResolutionReviewState, ResolutionOperation, SpecialistMetadataRequirements, SyncMode,
 };
@@ -170,6 +170,7 @@ fn interrupted_action_is_durable_and_remains_open_for_resume() {
     assert_eq!(report.status(), RunReportStatus::Interrupted);
     assert_eq!(report.execution_result(), RunExecutionResult::Interrupted);
     assert_eq!(report.items()[0].progress_bytes(), 21);
+    assert_eq!(report.items()[0].journal().last_phase(), "interrupted");
     assert!(matches!(
         report.items()[0].outcome(),
         ActionOutcome::Interrupted
@@ -516,6 +517,103 @@ fn recovery_review_can_only_be_cleared_after_explicit_reinspection_resolution() 
     assert_eq!(cleared.status(), RunReportStatus::ReviewCleared);
     assert_eq!(cleared.lifecycle(), RunLifecycle::ReviewCleared);
     assert!(!cleared.can_mark_review_cleared());
+}
+
+#[test]
+fn run_report_metadata_actions_are_status_guarded_and_filesystem_neutral() {
+    let source = tempfile_dir("report-source");
+    let destination = tempfile_dir("report-destination");
+    fs::create_dir_all(&source).expect("source directory");
+    fs::create_dir_all(&destination).expect("destination directory");
+    fs::write(source.join("keep.txt"), b"source fixture").expect("source fixture");
+    fs::write(destination.join("keep.txt"), b"destination fixture").expect("destination fixture");
+
+    let mut store = RunEvidenceStore::open_in_memory().expect("database");
+    let completed_run = RunId::new(30);
+    let completed_snapshot = RunSnapshot::from_profile(
+        completed_run,
+        &SyncProfile::new(
+            "completed report",
+            Peer::new("source", source.clone()),
+            Peer::new("destination", destination.clone()),
+        ),
+        AuthorizationSnapshot::default(),
+    )
+    .expect("completed snapshot");
+    store.begin_run(&completed_snapshot).expect("snapshot");
+    store
+        .append_event(completed_run, JournalEvent::Planned { action: action(1) })
+        .expect("plan");
+    store
+        .append_event(completed_run, JournalEvent::Started { action_id: 1 })
+        .expect("start");
+    store
+        .append_event(completed_run, JournalEvent::Completed { action_id: 1 })
+        .expect("complete");
+
+    let unresolved_run = RunId::new(31);
+    store
+        .begin_run(&snapshot(unresolved_run.value()))
+        .expect("unresolved snapshot");
+    store
+        .append_event(unresolved_run, JournalEvent::Planned { action: action(1) })
+        .expect("unresolved plan");
+    store
+        .append_event(unresolved_run, JournalEvent::Started { action_id: 1 })
+        .expect("unresolved start");
+    store
+        .append_event(
+            unresolved_run,
+            JournalEvent::Unresolved {
+                action_id: 1,
+                reason: ActionReason::PermissionDenied,
+            },
+        )
+        .expect("unresolved outcome");
+
+    let reports = store.list_run_reports().expect("list reports");
+    assert_eq!(reports.iter().map(RunReport::run_id).collect::<Vec<_>>(), vec![unresolved_run, completed_run]);
+    assert!(matches!(
+        store
+            .remove_completed_report(unresolved_run)
+            .expect_err("unresolved work needs its separate discard action"),
+        crate::StorageError::ReportActionNotAllowed {
+            action: "Remove Completed Report",
+            ..
+        }
+    ));
+    assert!(matches!(
+        store
+            .discard_unresolved_run(completed_run)
+            .expect_err("completed reports need their separate remove action"),
+        crate::StorageError::ReportActionNotAllowed {
+            action: "Discard Unresolved Run",
+            ..
+        }
+    ));
+
+    store
+        .remove_completed_report(completed_run)
+        .expect("remove completed metadata");
+    assert!(store.load_report(completed_run).is_err());
+    assert!(source.join("keep.txt").is_file());
+    assert!(destination.join("keep.txt").is_file());
+
+    store
+        .discard_unresolved_run(unresolved_run)
+        .expect("discard unresolved metadata");
+    assert!(store.list_run_reports().expect("list after discard").is_empty());
+    let _ = fs::remove_dir_all(source);
+    let _ = fs::remove_dir_all(destination);
+}
+
+fn tempfile_dir(label: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    std::env::temp_dir().join(format!(
+        "syncplus-{label}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 #[test]
