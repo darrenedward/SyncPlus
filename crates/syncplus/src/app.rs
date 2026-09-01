@@ -818,11 +818,13 @@ impl SyncPlusApp {
                 let (source_peer, destination_peer) = mapped_peers(&review.profile);
                 let source = source_peer.root().display().to_string();
                 let destination = destination_peer.root().display().to_string();
-                ui.label(format!("Selected source folder: {source}"));
-                ui.label(format!("Selected destination folder: {destination}"));
                 if review.profile.mode() == SyncMode::OneWay {
+                    ui.label(format!("Selected source folder: {source}"));
+                    ui.label(format!("Selected destination folder: {destination}"));
                     ui.label("One-Way Sync copies the selected source folder's contents into the selected destination folder.");
                 } else {
+                    ui.label(format!("Peer A folder: {}", review.profile.peer_a().root().display()));
+                    ui.label(format!("Peer B folder: {}", review.profile.peer_b().root().display()));
                     ui.label("Mirror Sync reviews both folder directions independently; neither folder is an implicit winner.");
                 }
                 ui.label("A trailing separator marks the selected path as a folder; it does not select a parent folder or widen the reviewed root. Actions below are relative to these exact selected roots.");
@@ -1079,11 +1081,19 @@ fn stronger_confirmation_satisfied(
 fn draw_confirmation_summary(ui: &mut egui::Ui, review: &PlanReviewState, analysis: &FreshAnalysis) {
     let summary = analysis.plan().summary();
     let (source, destination) = mapped_peers(&review.profile);
-    ui.label(format!(
-        "Exact reviewed mapping: {} → {}",
-        source.root().display(),
-        destination.root().display()
-    ));
+    if review.profile.mode() == SyncMode::OneWay {
+        ui.label(format!(
+            "Exact reviewed mapping: {} → {}",
+            source.root().display(),
+            destination.root().display()
+        ));
+    } else {
+        ui.label(format!(
+            "Exact reviewed roots: Peer A {} and Peer B {}; actions may be in either direction.",
+            review.profile.peer_a().root().display(),
+            review.profile.peer_b().root().display()
+        ));
+    }
     ui.label(format!(
         "Exact reviewed actions: {} total; {} copies ({}), {} overwrites ({}), {} destination removals, {} source removals.",
         analysis.plan().action_count(),
@@ -1095,20 +1105,25 @@ fn draw_confirmation_summary(ui: &mut egui::Ui, review: &PlanReviewState, analys
         summary.source_removal_count()
     ));
     let options = review.profile.options();
-    match (options.safe_delete, options.destination_cleanup, options.deletion_method) {
-        (true, _, Some(DeletionMethod::Trash)) => {
-            ui.label("Consequence: verified source removals move to the selected local Trash; an unavailable Trash blocks the run and is never replaced silently.");
+    if options.safe_delete {
+        match options.deletion_method {
+            Some(DeletionMethod::Trash) => {
+                ui.label("Consequence: verified source removals move to the selected local Trash; an unavailable Trash blocks the run and is never replaced silently.");
+            }
+            Some(DeletionMethod::PermanentRemoval) => {
+                ui.label("Consequence: verified source removals are irreversible Permanent Removal and require this explicit Advanced confirmation.");
+            }
+            None => {
+                ui.label("Consequence: Safe Delete is selected but its deletion method is not valid, so confirmation remains unavailable.");
+            }
         }
-        (true, _, Some(DeletionMethod::PermanentRemoval)) => {
-            ui.label("Consequence: verified source removals are irreversible Permanent Removal and require this explicit Advanced confirmation.");
-        }
-        (_, true, _) => {
-            ui.label("Consequence: Destination Cleanup may remove destination items absent from the authoritative source; each removal remains visible above.");
-        }
-        _ => {
-            ui.label("Consequence: no deletion or cleanup action is enabled; planned copies and overwrites affect only the displayed destination paths.");
-        }
-    };
+    }
+    if options.destination_cleanup {
+        ui.label("Consequence: Destination Cleanup may remove destination items absent from the authoritative source; each removal remains visible above.");
+    }
+    if !options.safe_delete && !options.destination_cleanup {
+        ui.label("Consequence: no deletion or cleanup action is enabled; planned copies and overwrites affect only the displayed destination paths.");
+    }
     if review.profile.mode() == SyncMode::Mirror {
         ui.label("Mirror Sync has no implicit winner; any action direction is shown in the Explainable Actions list above.");
     }
