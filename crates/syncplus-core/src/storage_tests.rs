@@ -195,6 +195,51 @@ fn invalid_unattended_authorizations_are_rejected() {
 }
 
 #[test]
+fn safety_and_endpoint_edits_revoke_unattended_authorization() {
+    let database = database();
+    let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+    let safe_delete_profile = profile().with_options(crate::SyncOptions {
+        safe_delete: true,
+        deletion_method: Some(crate::DeletionMethod::Trash),
+        ..crate::SyncOptions::default()
+    });
+    let persisted = store
+        .create_profile_with_authorizations(
+            &safe_delete_profile,
+            AuthorizationSnapshot::new(true, false),
+        )
+        .expect("create authorized profile");
+
+    let endpoint_changed = SyncProfile::new(
+        "work files",
+        Peer::new("source", PathBuf::from("/changed-source")),
+        safe_delete_profile.peer_b().clone(),
+    )
+    .with_exclusions(safe_delete_profile.exclusions())
+    .with_options(safe_delete_profile.options());
+    let after_endpoint_change = store
+        .update_profile_with_authorizations_if_revision(
+            persisted.id(),
+            &endpoint_changed,
+            AuthorizationSnapshot::new(true, false),
+            persisted.revision(),
+        )
+        .expect("endpoint edit");
+    assert!(!after_endpoint_change.authorizations().allow_unattended_destructive());
+
+    let options_changed = endpoint_changed.clone().with_options(crate::SyncOptions::default());
+    let after_safety_change = store
+        .update_profile_with_authorizations_if_revision(
+            persisted.id(),
+            &options_changed,
+            AuthorizationSnapshot::new(true, false),
+            after_endpoint_change.revision(),
+        )
+        .expect("safety edit");
+    assert!(!after_safety_change.authorizations().allow_unattended_destructive());
+}
+
+#[test]
 fn recurring_schedule_round_trips_and_requires_advanced_mode_to_enable() {
     let database = database();
     let mut store = RunEvidenceStore::open(database.path()).expect("open database");

@@ -269,13 +269,13 @@ impl RunWorkflow {
         F: Fn() -> bool,
     {
         if let Err(error) = validate_unattended_authorizations(profile, authorizations) {
-            store.mark_blocked(run_id, &error.to_string())?;
+            mark_unattended_blocked(store, run_id, profile, &error)?;
             return Err(error);
         }
         let lease = match self.acquire_precheck(run_id, profile, probe) {
             Ok(lease) => lease,
             Err(error) => {
-                store.mark_blocked(run_id, &error.to_string())?;
+                mark_unattended_blocked(store, run_id, profile, &error)?;
                 return Err(error);
             }
         };
@@ -284,14 +284,16 @@ impl RunWorkflow {
         let analysis = match FreshAnalysis::analyze(profile) {
             Ok(analysis) => analysis,
             Err(error) => {
-                store.mark_blocked(run_id, &error.to_string())?;
+                let error = WorkflowError::from(error);
+                mark_unattended_blocked(store, run_id, profile, &error)?;
                 return Err(error.into());
             }
         };
         let confirmed = match analysis.confirm(profile) {
             Ok(confirmed) => confirmed,
             Err(error) => {
-                store.mark_blocked(run_id, &error.to_string())?;
+                let error = WorkflowError::from(error);
+                mark_unattended_blocked(store, run_id, profile, &error)?;
                 return Err(error.into());
             }
         };
@@ -303,7 +305,7 @@ impl RunWorkflow {
             false,
             false,
         ) {
-            store.mark_blocked(run_id, &error.to_string())?;
+            mark_unattended_blocked(store, run_id, profile, &error)?;
             return Err(error);
         }
         let (peer_a_volume_identity, peer_b_volume_identity) = orient_volume_identities(
@@ -332,7 +334,7 @@ impl RunWorkflow {
                     .load_report(run_id)
                     .is_ok_and(|report| report.status() == RunReportStatus::InProgress)
                 {
-                    store.mark_blocked(run_id, &error.to_string())?;
+                    mark_unattended_blocked(store, run_id, profile, &error)?;
                 }
                 return Err(error);
             }
@@ -610,7 +612,128 @@ impl RunWorkflow {
             backend,
             store,
             should_cancel,
+            true,
         )
+    }
+
+    /// Execute a scheduler-claimed SSH run without a hidden credential prompt
+    /// or interactive confirmation. The caller must resolve the selected
+    /// credential in unattended mode and provide the already approved host and
+    /// remote capability permits. Every permit is refreshed before mutation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_ssh_unattended<B, F>(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        authorizations: AuthorizationSnapshot,
+        credential: &crate::ResolvedSshCredential,
+        host_permit: &crate::SshHostTrustPermit,
+        precheck: &crate::RemotePrecheckPermit,
+        backend: &B,
+        store: &mut RunEvidenceStore,
+        should_cancel: F,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        B: SshRunBackend,
+        F: Fn() -> bool,
+    {
+        if let Err(error) = validate_unattended_authorizations(profile, authorizations) {
+            mark_unattended_blocked(store, run_id, profile, &error)?;
+            return Err(error);
+        }
+        if let Err(error) = validate_unattended_ssh_credential(credential) {
+            mark_unattended_blocked(store, run_id, profile, &error)?;
+            return Err(error);
+        }
+        let _scope_lock = match self.acquire_ssh_scope(run_id, profile) {
+            Ok(lock) => lock,
+            Err(error) => {
+                mark_unattended_blocked(store, run_id, profile, &error)?;
+                return Err(error);
+            }
+        };
+        let (_, remote_peer) = match ssh_peer_for_profile(profile) {
+            Ok(peer) => peer,
+            Err(error) => {
+                mark_unattended_blocked(store, run_id, profile, &error)?;
+                return Err(error);
+            }
+        };
+        let (_, remote_request) = match RemotePrecheckRequest::from_profile(profile) {
+            Ok(request) => request,
+            Err(error) => {
+                let error = WorkflowError::InvalidRun(error.to_string());
+                mark_unattended_blocked(store, run_id, profile, &error)?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = validate_ssh_permits(
+            remote_peer,
+            credential,
+            host_permit,
+            precheck,
+            remote_request,
+        ) {
+            mark_unattended_blocked(store, run_id, profile, &error)?;
+            return Err(error);
+        }
+        if let Err(error) = self.refresh_ssh_precheck(profile, credential, host_permit, backend) {
+            mark_unattended_blocked(store, run_id, profile, &error)?;
+            return Err(error);
+        }
+        let analysis = match self.analyze_ssh(profile, credential, host_permit, backend) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                mark_unattended_blocked(store, run_id, profile, &error)?;
+                return Err(error);
+            }
+        };
+        let refreshed = match self.analyze_ssh(profile, credential, host_permit, backend) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                mark_unattended_blocked(store, run_id, profile, &error)?;
+                return Err(error);
+            }
+        };
+        let confirmed = match analysis.confirm_refreshed(profile, &refreshed) {
+            Ok(confirmed) => confirmed,
+            Err(error) => {
+                let error = WorkflowError::from(error);
+                mark_unattended_blocked(store, run_id, profile, &error)?;
+                return Err(error);
+            }
+        };
+        let remote_permit = match self.refresh_ssh_precheck(profile, credential, host_permit, backend) {
+            Ok(permit) => permit,
+            Err(error) => {
+                mark_unattended_blocked(store, run_id, profile, &error)?;
+                return Err(error);
+            }
+        };
+        let report = match self.execute_ssh_confirmed(
+            run_id,
+            &confirmed,
+            authorizations,
+            credential,
+            host_permit,
+            &remote_permit,
+            backend,
+            store,
+            should_cancel,
+            false,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                if store
+                    .load_report(run_id)
+                    .is_ok_and(|report| report.status() == RunReportStatus::InProgress)
+                {
+                    mark_unattended_blocked(store, run_id, profile, &error)?;
+                }
+                return Err(error);
+            }
+        };
+        Ok(report)
     }
 
     /// Resume an incomplete SSH run only after open boundaries are classified
@@ -686,6 +809,7 @@ impl RunWorkflow {
             backend,
             store,
             should_cancel,
+            true,
         )
     }
 
@@ -818,6 +942,7 @@ impl RunWorkflow {
         backend: &B,
         store: &mut RunEvidenceStore,
         should_cancel: F,
+        persist_snapshot: bool,
     ) -> Result<RunReport, WorkflowError>
     where
         B: SshRunBackend,
@@ -835,15 +960,17 @@ impl RunWorkflow {
                     .to_owned(),
             ));
         }
-        let snapshot = RunSnapshot::from_profile_with_volume_identities(
-            run_id,
-            confirmed.profile(),
-            authorizations,
-            None,
-            None,
-        )?;
         store.backup_before_file_change()?;
-        store.begin_run(&snapshot)?;
+        if persist_snapshot {
+            let snapshot = RunSnapshot::from_profile_with_volume_identities(
+                run_id,
+                confirmed.profile(),
+                authorizations,
+                None,
+                None,
+            )?;
+            store.begin_run(&snapshot)?;
+        }
         let inventory = SourceInventorySnapshot::from_inventory(plan.source_inventory());
         let destination_inventory =
             SourceInventorySnapshot::from_inventory(plan.destination_inventory());
@@ -2595,6 +2722,80 @@ fn validate_unattended_authorizations(
     Ok(())
 }
 
+fn validate_unattended_ssh_credential(
+    credential: &crate::ResolvedSshCredential,
+) -> Result<(), WorkflowError> {
+    if matches!(
+        credential,
+        crate::ResolvedSshCredential::Password {
+            source: crate::PasswordSource::InteractiveAskpass,
+            ..
+        }
+    ) {
+        return Err(WorkflowError::InvalidRun(
+            "unattended SSH runs require an explicitly available noninteractive credential; an interactive password prompt is unavailable"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn mark_unattended_blocked(
+    store: &mut RunEvidenceStore,
+    run_id: RunId,
+    profile: &crate::SyncProfile,
+    error: &WorkflowError,
+) -> Result<(), StorageError> {
+    store.mark_blocked(run_id, &unattended_block_reason(profile, error))
+}
+
+fn unattended_block_reason(profile: &crate::SyncProfile, error: &WorkflowError) -> String {
+    let (peer, scope) = match profile.mode() {
+        crate::SyncMode::Mirror => (
+            "Peer A and Peer B",
+            format!(
+                "{:?} and {:?}",
+                profile.peer_a().root(),
+                profile.peer_b().root()
+            ),
+        ),
+        crate::SyncMode::OneWay => {
+            let (peer, _) = match profile.source() {
+                crate::OneWaySource::PeerA => (profile.peer_a(), profile.peer_b()),
+                crate::OneWaySource::PeerB => (profile.peer_b(), profile.peer_a()),
+            };
+            (peer.name(), format!("{:?}", peer.root()))
+        }
+    };
+    format!(
+        "Sync Profile '{}' blocked before mutation for {peer} scope {scope}: {} Next action: {}",
+        profile.name(),
+        error,
+        unattended_next_action(error),
+    )
+}
+
+fn unattended_next_action(error: &WorkflowError) -> String {
+    match error {
+        WorkflowError::Precheck(PrecheckFailure::Blocked(blocked)) => blocked
+            .blockers()
+            .first()
+            .map(|blocker| blocker.remediation().to_owned())
+            .unwrap_or_else(|| "review the Run Precheck result and retry".to_owned()),
+        WorkflowError::Precheck(PrecheckFailure::ScopeLocked(conflict)) => conflict.remediation(),
+        WorkflowError::InvalidRun(_) => {
+            "review the Advanced Mode unattended authorization and configured peer policy, then retry"
+                .to_owned()
+        }
+        WorkflowError::Analysis(_) => "make the configured peers available and retry the precheck".to_owned(),
+        WorkflowError::Ssh(_) => {
+            "review SSH identity, noninteractive credentials, permissions, capabilities, and recovery, then retry"
+                .to_owned()
+        }
+        _ => "review the durable Run Report and correct the named safety failure before retrying".to_owned(),
+    }
+}
+
 fn ssh_peer_for_profile(
     profile: &crate::SyncProfile,
 ) -> Result<(crate::PeerSide, &crate::SshPeer), WorkflowError> {
@@ -3361,6 +3562,83 @@ mod tests {
             fs::create_dir_all(parent).expect("fixture parent should be creatable");
         }
         fs::write(path, contents).expect("fixture file should be writable");
+    }
+
+    #[test]
+    fn unattended_ssh_rejects_interactive_credentials_before_any_backend_work() {
+        let credential = ResolvedSshCredential::Password {
+            source: crate::PasswordSource::InteractiveAskpass,
+            secret: crate::SecretValue::new("must-not-be-used"),
+        };
+
+        let error = super::validate_unattended_ssh_credential(&credential)
+            .expect_err("unattended SSH must reject interactive credentials");
+        assert!(error.to_string().contains("noninteractive credential"));
+        assert!(!error.to_string().contains("must-not-be-used"));
+    }
+
+    #[test]
+    fn unattended_ssh_blocks_a_changed_host_before_remote_inventory_or_mutation() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.source()).expect("source");
+        fs::create_dir_all(fixture.destination()).expect("destination");
+        fs::create_dir_all(fixture.remote()).expect("remote");
+        let (profile, ssh) = ssh_profile(&fixture, false);
+        let credential = ResolvedSshCredential::Agent;
+        let mut trust = SshHostTrustController::new(
+            RunEvidenceStore::open_in_memory().expect("host trust store"),
+        );
+        let approved_fingerprint = SshHostFingerprint::sha256([8; 32]);
+        let host_probe = FixedSshHostProbe(approved_fingerprint);
+        let decision = trust
+            .inspect(&ssh, &host_probe)
+            .expect("host identity inspection");
+        trust
+            .approve(&ssh, &decision, crate::HostTrustMode::Interactive)
+            .expect("host identity approval");
+        let host_permit = trust
+            .pre_mutation_permit(&ssh, &host_probe)
+            .expect("approved host permit");
+        let (_, request) = RemotePrecheckRequest::from_profile(&profile)
+            .expect("remote precheck request");
+        let backend = FakeSshBackend::new(fixture.remote());
+        let precheck = SshRemotePrecheck::check(
+            &ssh,
+            &credential,
+            &host_permit,
+            &request,
+            &backend,
+        )
+        .expect("remote precheck observation")
+        .require_passed()
+        .expect("remote precheck should pass before identity refresh");
+        let mut store = RunEvidenceStore::open_in_memory().expect("store");
+        let run_id = RunId::new(7001);
+        let snapshot = RunSnapshot::from_profile(run_id, &profile, AuthorizationSnapshot::default())
+            .expect("snapshot");
+        store.begin_run(&snapshot).expect("run report");
+
+        let error = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute_ssh_unattended(
+                run_id,
+                &profile,
+                AuthorizationSnapshot::default(),
+                &credential,
+                &host_permit,
+                &precheck,
+                &backend,
+                &mut store,
+                || false,
+            )
+            .expect_err("changed host identity must block unattended SSH");
+        assert!(error.to_string().contains("host fingerprint changed"));
+        let report = store.load_report(run_id).expect("blocked report");
+        assert_eq!(report.status(), RunReportStatus::Blocked);
+        assert!(report
+            .blocked_reason()
+            .expect("blocked reason")
+            .contains("Next action:"));
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
     }
 
     fn ssh_metadata(path: &Path) -> SshMetadataProof {

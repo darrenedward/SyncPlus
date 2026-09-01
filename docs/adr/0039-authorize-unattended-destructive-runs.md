@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Allow explicitly authorized unattended destructive schedules
@@ -11,3 +11,8 @@ Without this authorization, an automatic Scheduled Run may perform only non-dest
 Unattended Permanent Removal requires a separate **Allow unattended permanent removal** authorization. Authorizing Safe Delete, Trash, or other recoverable deletion does not authorize irreversible removal. Each authorization is revocable, recorded with each run, and must not be global. It is invalidated when the user changes the profile's destructive options or endpoints in a safety-relevant way. A schedule that lacks valid authorization must notify the user instead of silently deleting data.
 
 When cloning a profile, any destructive authorization is copied only after a dedicated warning and explicit user choice. It is never inherited silently.
+
+The implementation stores authorizations with the profile, clears them when an
+endpoint, mode, source, option, or exclusion changes, and validates them again
+at the unattended workflow boundary. Blocked scheduled reports retain the
+profile, selected peer scope, reason, and remediation without secret material.

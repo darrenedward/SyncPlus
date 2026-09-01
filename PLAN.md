@@ -240,6 +240,13 @@ Automatic schedules:
 - retry transient actions only within the bounded Retry Policy, defaulting to three attempts with increasing delays;
 - coalesce missed triggers into one catch-up opportunity rather than queueing duplicates.
 
+Unattended destructive authorization is cleared when a profile's endpoints,
+mode, source, options, or exclusions change. SSH schedules resolve only the
+selected noninteractive credential, reject interactive prompts, and refresh
+host identity and remote capability permits before mutation. A blocked
+scheduled report includes the profile, peer scope, reason, and safe next action
+without secrets or file contents.
+
 If a schedule cannot run, SyncPlus records and notifies the reason. The user can choose **Yes, Run Now** or **No, Not Now**. Run Now becomes an Interactive Run with fresh analysis and confirmation. No leaves the event visible.
 
 If the same profile is already active, the schedule is skipped and the user is told why, with **Open Running Sync** and **Dismiss**. Dismissal does not erase the event.
