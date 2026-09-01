@@ -492,6 +492,26 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
 }
 
 #[test]
+fn retry_policy_is_bounded_and_uses_increasing_delays() {
+    let policy = crate::RetryPolicy::default();
+    assert_eq!(policy.max_attempts(), 3);
+    assert_eq!(policy.delay_for_retry(1), std::time::Duration::from_millis(100));
+    assert_eq!(policy.delay_for_retry(2), std::time::Duration::from_millis(200));
+    assert_eq!(policy.delay_for_retry(3), std::time::Duration::from_millis(300));
+
+    let invalid_delay = profile(PathBuf::from("/source"), PathBuf::from("/destination")).with_options(
+        SyncOptions {
+            retry_policy: crate::RetryPolicy::new(3, std::time::Duration::from_millis(3_600_001)),
+            ..SyncOptions::default()
+        },
+    );
+    assert!(matches!(
+        ProcessSpecification::from_profile(&invalid_delay),
+        Err(ProcessSpecError::InvalidRetryDelay { .. })
+    ));
+}
+
+#[test]
 fn preview_and_invocation_come_from_the_same_validated_specification() {
     let specification = ProcessSpecification::from_profile(&profile(
         PathBuf::from("/home/user/source"),

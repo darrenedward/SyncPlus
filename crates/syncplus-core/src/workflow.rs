@@ -1407,10 +1407,7 @@ impl RunWorkflow {
             match result {
                 Ok(evidence) => return Ok(evidence),
                 Err(error) if error.is_retryable() && attempt + 1 < policy.max_attempts() => {
-                    let delay = policy
-                        .initial_delay()
-                        .checked_mul(u32::from(attempt + 1))
-                        .unwrap_or(Duration::MAX);
+                    let delay = policy.delay_for_retry(attempt + 1);
                     if !sleep_interruptibly(delay, should_cancel) {
                         return Err(SshTransferExecutionError::Remote(SshRunError::Cancelled));
                     }
@@ -2569,10 +2566,7 @@ impl RunWorkflow {
             match operation() {
                 Ok(replacement) => return Ok(replacement),
                 Err(error) if error.is_transient() && attempt + 1 < policy.max_attempts() => {
-                    let delay = policy
-                        .initial_delay()
-                        .checked_mul(u32::from(attempt + 1))
-                        .unwrap_or(Duration::MAX);
+                    let delay = policy.delay_for_retry(attempt + 1);
                     if !sleep_interruptibly(delay, should_cancel) {
                         return Err(TransferError::Replacement(ReplacementError::Cancelled));
                     }
@@ -2767,12 +2761,21 @@ fn unattended_block_reason(profile: &crate::SyncProfile, error: &WorkflowError) 
             (peer.name(), format!("{:?}", peer.root()))
         }
     };
-    format!(
-        "Sync Profile '{}' blocked before mutation for {peer} scope {scope}: {} Next action: {}",
-        profile.name(),
-        error,
-        unattended_next_action(error),
-    )
+    if matches!(error, WorkflowError::Precheck(PrecheckFailure::ScopeLocked(_))) {
+        format!(
+            "Scheduled Run skipped before mutation for Sync Profile '{}' for {peer} scope {scope}: {} Next action: {}",
+            profile.name(),
+            error,
+            unattended_next_action(error),
+        )
+    } else {
+        format!(
+            "Sync Profile '{}' blocked before mutation for {peer} scope {scope}: {} Next action: {}",
+            profile.name(),
+            error,
+            unattended_next_action(error),
+        )
+    }
 }
 
 fn unattended_next_action(error: &WorkflowError) -> String {
@@ -3504,6 +3507,7 @@ mod tests {
         AccessSnapshot, RemoteRsyncCapability, RemoteSha256Capability, RemoteTrashCapability,
         ResolvedSshCredential, SshRecoveryBoundary, SshRunBackend, SshRunError,
         SshTransferBoundary,
+        VerificationError,
         WorkflowError,
         SshMetadataProof, SshTransferEvidence, SshTransferRequest,
     };
@@ -5155,6 +5159,33 @@ mod tests {
 
         assert!(matches!(error, crate::TransferError::Process(ProcessError::Io(_))));
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn non_transient_verification_failure_is_not_retried() {
+        let workflow = RunWorkflow::new(RecoveryMethod::permanent_removal());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let operation_attempts = Arc::clone(&attempts);
+        let error = workflow
+            .retry_transfer(
+                RetryPolicy::new(3, std::time::Duration::ZERO),
+                &|| false,
+                move || {
+                    operation_attempts.fetch_add(1, Ordering::Relaxed);
+                    Err(crate::TransferError::Replacement(crate::ReplacementError::Verification(
+                        VerificationError::HashMismatch,
+                    )))
+                },
+            )
+            .expect_err("a verification failure must stop without a transport retry");
+
+        assert!(matches!(
+            error,
+            crate::TransferError::Replacement(crate::ReplacementError::Verification(
+                VerificationError::HashMismatch
+            ))
+        ));
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
     }
 
     #[test]

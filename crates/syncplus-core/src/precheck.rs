@@ -1690,7 +1690,10 @@ impl RunPrecheck {
         let lock = registry
             .acquire(
                 owner,
-                [PeerScope::new(result.source()), PeerScope::new(result.destination())],
+                [
+                    PeerScope::for_peer(profile.peer_a()),
+                    PeerScope::for_peer(profile.peer_b()),
+                ],
             )
             .map_err(|error| match error {
                 crate::ScopeLockError::Conflict(conflict) => PrecheckFailure::ScopeLocked(conflict),

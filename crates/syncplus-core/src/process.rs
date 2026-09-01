@@ -314,6 +314,7 @@ pub enum ProcessSpecError {
     ActionSourceMismatch,
     InvalidTransferPath { path: PathBuf },
     InvalidRetryPolicy { max_attempts: u8 },
+    InvalidRetryDelay { milliseconds: u128 },
     HostTrustPermitMismatch,
 }
 
@@ -360,6 +361,10 @@ impl fmt::Display for ProcessSpecError {
             Self::InvalidRetryPolicy { max_attempts } => {
                 write!(formatter, "retry policy must allow between 1 and 10 attempts, got {max_attempts}")
             }
+            Self::InvalidRetryDelay { milliseconds } => write!(
+                formatter,
+                "retry policy initial delay must be at most 3600000 milliseconds, got {milliseconds}"
+            ),
             Self::HostTrustPermitMismatch => {
                 formatter.write_str("SSH host-trust permit does not match the remote endpoint")
             }
@@ -421,9 +426,14 @@ impl SyncOptions {
             });
         }
 
-        if !(1..=10).contains(&self.retry_policy.max_attempts()) {
+        if !(1..=RetryPolicy::MAX_ATTEMPTS).contains(&self.retry_policy.max_attempts()) {
             return Err(ProcessSpecError::InvalidRetryPolicy {
                 max_attempts: self.retry_policy.max_attempts(),
+            });
+        }
+        if self.retry_policy.initial_delay() > RetryPolicy::MAX_INITIAL_DELAY {
+            return Err(ProcessSpecError::InvalidRetryDelay {
+                milliseconds: self.retry_policy.initial_delay().as_millis(),
             });
         }
 
