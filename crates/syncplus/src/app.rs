@@ -7,8 +7,8 @@ use syncplus_core::{
     ConflictEntry, ConflictEntryKey, ConflictResolution, ConflictReview, DeletionMethod,
     FreshAnalysis, LocalPrecheckProbe, MetadataRequirements, OneWaySource, PartialTransferPolicy,
     Peer, PeerEndpoint, PersistedSyncProfile, PrecheckErrorKind, PrecheckResult, ResolutionRun,
-    RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle, RunPrecheck,
-    RunReport, RunReportStatus, SavedSecretReference, SecretStore, SecretStoreError,
+    RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle, RunPrecheck, RunReport,
+    RunReportStatus, SavedSecretReference, SecretStore, SecretStoreError,
     SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
     SyncProfileId, ThemePreference,
 };
@@ -487,6 +487,305 @@ enum PendingReportAction {
     DiscardUnresolvedRun(RunId),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelpTopic {
+    Modes,
+    OneWaySync,
+    SafeDelete,
+    MirrorSync,
+    ConflictReview,
+    Exclusions,
+    SshAuthentication,
+    Recovery,
+    RunReports,
+    DestructiveActions,
+    PlanAndConfirmation,
+    ProgressAndCancellation,
+    Diagnostics,
+    CloneProfile,
+}
+
+impl HelpTopic {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Modes => "Simple and Advanced Mode",
+            Self::OneWaySync => "One-Way Sync",
+            Self::SafeDelete => "One-Way Safe-Delete Sync",
+            Self::MirrorSync => "Mirror Sync",
+            Self::ConflictReview => "Conflict Review",
+            Self::Exclusions => "Exclusions",
+            Self::SshAuthentication => "SSH authentication",
+            Self::Recovery => "Recovery and Restore",
+            Self::RunReports => "Run Reports",
+            Self::DestructiveActions => "Destructive actions",
+            Self::PlanAndConfirmation => "Plan and confirmation",
+            Self::ProgressAndCancellation => "Progress and cancellation",
+            Self::Diagnostics => "Technical diagnostics",
+            Self::CloneProfile => "Clone Profile safeguards",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HelpEntry {
+    pub topic: HelpTopic,
+    pub title: &'static str,
+    pub what: &'static str,
+    pub why: &'static str,
+    pub how: &'static str,
+    pub when: &'static str,
+    pub consequences: &'static str,
+    pub limitations: &'static str,
+    pub next_action: &'static str,
+}
+
+const HELP_TOPICS: &[HelpTopic] = &[
+    HelpTopic::Modes,
+    HelpTopic::OneWaySync,
+    HelpTopic::SafeDelete,
+    HelpTopic::MirrorSync,
+    HelpTopic::ConflictReview,
+    HelpTopic::Exclusions,
+    HelpTopic::SshAuthentication,
+    HelpTopic::Recovery,
+    HelpTopic::RunReports,
+    HelpTopic::DestructiveActions,
+    HelpTopic::PlanAndConfirmation,
+    HelpTopic::ProgressAndCancellation,
+    HelpTopic::Diagnostics,
+    HelpTopic::CloneProfile,
+];
+
+pub fn help_topics() -> &'static [HelpTopic] {
+    HELP_TOPICS
+}
+
+pub fn help_entry(topic: HelpTopic) -> HelpEntry {
+    match topic {
+        HelpTopic::Modes => HelpEntry {
+            topic,
+            title: "Simple and Advanced Mode",
+            what: "Simple Mode provides the calm default workflow. Advanced Mode reveals named safety, recovery, metadata, retry, and unattended controls.",
+            why: "The default should make safe, non-destructive choices easy while keeping higher-risk decisions deliberate.",
+            how: "Choose the mode in the top bar. Both modes use the same validated core workflow and never accept arbitrary rsync or shell arguments.",
+            when: "Use Simple Mode for ordinary One-Way Sync. Use Advanced Mode when you understand and need Safe Delete, Mirror review, metadata, or unattended authorization.",
+            consequences: "Advanced controls can change more data or run without you present, so they add explicit authorization and review requirements.",
+            limitations: "Advanced Mode does not bypass prechecks, Fresh Analysis, verification, host-identity review, confirmation, or Recovery Review.",
+            next_action: "Start in Simple Mode, create a Sync Profile, and open the related topic before enabling any destructive option.",
+        },
+        HelpTopic::OneWaySync => HelpEntry {
+            topic,
+            title: "One-Way Sync",
+            what: "One-Way Sync copies the selected source into the selected destination; the source is authoritative for differing paths.",
+            why: "A single authority makes ordinary backup-style synchronization understandable and avoids inventing a winner for two changed peers.",
+            how: "Select named source and destination endpoints, review the Fresh Analysis, then confirm the exact mapping and actions.",
+            when: "Use it when one peer is the intended source of truth and the destination should follow it.",
+            consequences: "The destination may receive copies or verified replacements. Safe Delete and Destination Cleanup are separate opt-in actions.",
+            limitations: "A stale plan, changed source, failed verification, excluded item, or unresolved item keeps the affected work from being treated as complete.",
+            next_action: "Review the mapping and approved scope, then run Fresh Analysis immediately before confirmation.",
+        },
+        HelpTopic::SafeDelete => HelpEntry {
+            topic,
+            title: "One-Way Safe-Delete Sync",
+            what: "Safe Delete removes an approved source item only after independent SHA-256 and size checks, source-stability checks, destination verification, and a durable journal boundary.",
+            why: "A successful transfer alone cannot prove that the exact source item was safely installed and recoverable.",
+            how: "Choose a recoverable Trash method where possible, inspect each planned removal, and confirm only after the fresh precheck and analysis pass.",
+            when: "Use it only when the source should be drained and you have reviewed the recovery method and expected consequences.",
+            consequences: "A verified source item is moved to recovery or removed at the proof boundary. Any uncertainty preserves the source and requires review.",
+            limitations: "There is no silent fallback from Trash to Permanent Removal. Excluded, changed, unavailable, or ambiguous items remain at the source.",
+            next_action: "Keep Safe Delete off unless the source authority, recovery method, and final Run Report are understood.",
+        },
+        HelpTopic::MirrorSync => HelpEntry {
+            topic,
+            title: "Mirror Sync",
+            what: "Mirror Sync compares two peers and proposes an approved result without assuming either peer is authoritative.",
+            why: "Two peers can both contain unique or changed data, so absence is not deletion evidence and no implicit winner is safe.",
+            how: "Run Fresh Analysis for both peers, inspect Conflict Review and baseline evidence, choose whole-file decisions, and confirm the reviewed scope.",
+            when: "Use it when both peers matter and you want explicit reconciliation rather than source-to-destination copying.",
+            consequences: "Keep, preserve, rename, or defer decisions remain visible in the Run Report; deferred or unresolved work keeps the run open.",
+            limitations: "SyncPlus does not merge file contents, infer deletion from first-run absence, or silently choose a winner.",
+            next_action: "Open Conflict Review for every proposed conflict and defer the run if the evidence is not clear.",
+        },
+        HelpTopic::ConflictReview => HelpEntry {
+            topic,
+            title: "Conflict Review",
+            what: "Conflict Review is a read-only, whole-file comparison showing safe metadata, classifications, and available hashes for competing peers.",
+            why: "Review keeps both versions protected until you make an explicit decision.",
+            how: "Choose Keep Peer A, Keep Peer B, Preserve Both, Rename/Preserve for Review, or Defer for each entry, then start a fresh Resolution Run.",
+            when: "Use it whenever Mirror Sync finds same-path differences, naming conflicts, or possible duplicate/rename candidates.",
+            consequences: "Keep decisions create reviewed whole-file actions. Preserve Both, rename, and defer choices retain data and keep review open.",
+            limitations: "File contents are not edited or automatically merged; equal hashes at different paths do not authorize a move or deletion.",
+            next_action: "Review the peer evidence and choose one typed whole-file decision, or choose Defer when evidence is insufficient.",
+        },
+        HelpTopic::Exclusions => HelpEntry {
+            topic,
+            title: "Exclusions",
+            what: "Exclusion rules keep matching items outside the Approved Sync Scope.",
+            why: "An excluded item must not be synchronized or deleted accidentally.",
+            how: "Enter one validated pattern per line and inspect the excluded inventory in Fresh Analysis.",
+            when: "Use exclusions for caches, generated data, or other content that must remain outside this Sync Run.",
+            consequences: "Excluded items remain where they are and are listed as outside scope; they do not count as successfully synchronized.",
+            limitations: "Excluded Item Cleanup is a separate reviewed action. Exclusions do not authorize any deletion.",
+            next_action: "Check the excluded inventory and make sure every excluded path is intentionally outside this run.",
+        },
+        HelpTopic::SshAuthentication => HelpEntry {
+            topic,
+            title: "SSH authentication",
+            what: "SSH peers use structured server, account, port, path, and selected key, agent, interactive password, or Saved Secret authentication fields.",
+            why: "Typed authentication keeps remote commands controlled and prevents hidden prompts or credential fallback.",
+            how: "Choose the approved authentication method, review host identity and remote capability prechecks, and keep saved passwords in the desktop keyring.",
+            when: "Use SSH for one local-to-SSH or SSH-to-local peer in V1; unattended runs require a noninteractive credential.",
+            consequences: "Missing credentials, changed fingerprints, unavailable remote hashing, permissions, or recovery block the affected run and preserve source data.",
+            limitations: "SSH-to-SSH and arbitrary remote commands are outside V1. Passwords, passphrases, private keys, and file contents are never report data.",
+            next_action: "Approve a new fingerprint only after independent review; reject changed identity and fix the reported precheck blocker.",
+        },
+        HelpTopic::Recovery => HelpEntry {
+            topic,
+            title: "Recovery and Restore",
+            what: "Recovery preserves source or destination state after interruption, failed verification, disconnect, crash, or an ambiguous filesystem boundary.",
+            why: "SQLite records evidence but cannot make a database commit and filesystem mutation one atomic transaction.",
+            how: "Open the Run Report, perform Fresh Analysis, inspect Recovery Review and provenance, then resume or restore only through the explicit reviewed action.",
+            when: "Use it whenever a run is Interrupted, Recovery Review, pending review, or a recovery item needs restoration.",
+            consequences: "Uncertainty keeps the run open and preserves user files; Restore refuses to overwrite newer or different destination content automatically.",
+            limitations: "Recovery evidence may prove only what was observed. SyncPlus never guesses completion or repeats uncertain deletion.",
+            next_action: "Read the preserved-state evidence and choose Resume, Restore, or a deliberate review decision; do not treat an interruption as completion.",
+        },
+        HelpTopic::RunReports => HelpEntry {
+            topic,
+            title: "Run Reports",
+            what: "A Run Report retains the Profile Snapshot, plan, action outcomes, warnings, reconciliation, verification, and recovery evidence for one Sync Run.",
+            why: "History must remain inspectable so a completed or unresolved result can be understood after restart.",
+            how: "Select a report to inspect its status and explainable actions. Remove completed metadata or discard unresolved metadata only through the separate explicit actions.",
+            when: "Review reports after every manual or unattended run, especially when the status is failed, cancelled, interrupted, blocked, or pending review.",
+            consequences: "Removing metadata does not touch source or destination files. Discarding unresolved metadata loses the report's recovery evidence.",
+            limitations: "Reports contain operational metadata and safe evidence, never passwords, private-key material, or file contents.",
+            next_action: "Resolve every review item before marking Review Cleared; retain unresolved reports until their evidence is no longer needed.",
+        },
+        HelpTopic::DestructiveActions => HelpEntry {
+            topic,
+            title: "Destructive actions",
+            what: "Safe Delete, Destination Cleanup, and Permanent Removal are named, separately reviewed actions that can remove user data.",
+            why: "Deletion needs stronger intent and proof than copying, and Permanent Removal is irreversible.",
+            how: "Enable destructive options only in Advanced Mode, select the recovery method, review the exact scope, and provide the required authorization and confirmation.",
+            when: "Use destructive actions only after checking the source authority, recovery capacity, path warnings, and Run Report consequences.",
+            consequences: "Trash is recoverable only when verified. Permanent Removal cannot be undone and requires separate explicit authorization for unattended use.",
+            limitations: "No safety gate can be bypassed. Unavailable Trash never falls back silently, and uncertain or changed items remain preserved.",
+            next_action: "Prefer recoverable Trash and leave destructive options disabled until the complete plan and proof boundary are understood.",
+        },
+        HelpTopic::PlanAndConfirmation => HelpEntry {
+            topic,
+            title: "Plan and confirmation",
+            what: "Fresh Analysis and Execution Confirmation show the exact typed mapping, approved scope, actions, warnings, and consequences before mutation.",
+            why: "A user should know what will change and why immediately before SyncPlus changes data.",
+            how: "Analyze, inspect the plan and precheck, resolve conflicts or blockers, then confirm the same fresh reviewed scope.",
+            when: "Run it before every file-changing action and again after profile, endpoint, filesystem, or review evidence changes.",
+            consequences: "A stale analysis, required review, failed verification, or precheck blocker disables confirmation and preserves data.",
+            limitations: "The technical preview is diagnostic evidence generated from typed options; it is not an editable command interface.",
+            next_action: "Fix every blocker, inspect the consequences, and confirm only the exact scope that was freshly analyzed.",
+        },
+        HelpTopic::ProgressAndCancellation => HelpEntry {
+            topic,
+            title: "Progress and cancellation",
+            what: "Progress shows the current Explainable Action, phase, bytes, warnings, and cancellation state for an active Sync Run.",
+            why: "A stopped or partial action must not look like a completed transfer.",
+            how: "Watch the active report, cancel to stop launching new actions, and inspect the durable journal before resuming.",
+            when: "Use it during a long run or whenever a disconnect, drive removal, process stop, or cancellation occurs.",
+            consequences: "Cancellation preserves the source and records a Cancelled Action; an unsettled boundary may require Recovery Review.",
+            limitations: "Progress counts are not proof of completion. Only verified journal evidence and Completion Reconciliation can settle a run.",
+            next_action: "Read the latest durable phase and follow the report's resume or Recovery Review action instead of retrying blindly.",
+        },
+        HelpTopic::Diagnostics => HelpEntry {
+            topic,
+            title: "Technical diagnostics",
+            what: "Diagnostics identify the Sync Profile, peer, account when remote, exact scope, safety requirement, reason, and next safe action.",
+            why: "A useful failure explanation should tell you what to inspect or fix without exposing sensitive material.",
+            how: "Read the structured blocker or warning and follow its remediation; inspect the linked Help topic for the underlying safety rule.",
+            when: "Use diagnostics for precheck blockers, identity or credential failures, permissions, capability failures, naming conflicts, and review states.",
+            consequences: "A diagnostic is evidence of why execution is blocked or review-required; it is never permission to bypass the gate.",
+            limitations: "Diagnostics omit passwords, passphrases, private keys, secret values, and file contents. Paths and safe metadata may still be shown.",
+            next_action: "Correct the named requirement or open Recovery Review; do not paste diagnostic text into an arbitrary command.",
+        },
+        HelpTopic::CloneProfile => HelpEntry {
+            topic,
+            title: "Clone Profile safeguards",
+            what: "Clone Profile creates an editable configuration copy while clearing saved credentials and requiring an endpoint change.",
+            why: "A clone must not accidentally share secrets, identity, or unattended deletion authority with its source profile.",
+            how: "Review both endpoint forms, configure authentication intentionally, choose whether eligible unattended authorization is copied, and confirm that choice.",
+            when: "Use cloning when a new profile is related to an existing one but should be independently reviewed and persisted.",
+            consequences: "Permanent Removal authorization is never copied. Changing the clone affects future runs only; active runs keep their Profile Snapshot.",
+            limitations: "Cloning does not bypass validation, Advanced Mode, authorization, precheck, Fresh Analysis, or Execution Confirmation.",
+            next_action: "Change at least one endpoint, reconfigure the intended credential, and review the clone's authorization warning before saving.",
+        },
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpSurface {
+    Profile,
+    Plan,
+    ConflictReview,
+    Progress,
+    Report,
+    Recovery,
+    Clone,
+}
+
+fn help_topic_for_surface(surface: HelpSurface) -> HelpTopic {
+    match surface {
+        HelpSurface::Profile => HelpTopic::Modes,
+        HelpSurface::Plan => HelpTopic::PlanAndConfirmation,
+        HelpSurface::ConflictReview => HelpTopic::ConflictReview,
+        HelpSurface::Progress => HelpTopic::ProgressAndCancellation,
+        HelpSurface::Report => HelpTopic::RunReports,
+        HelpSurface::Recovery => HelpTopic::Recovery,
+        HelpSurface::Clone => HelpTopic::CloneProfile,
+    }
+}
+
+fn single_line(value: impl AsRef<str>) -> String {
+    value.as_ref().replace(['\r', '\n'], " ")
+}
+
+fn peer_for_path<'a>(profile: &'a SyncProfile, path: &std::path::Path) -> &'a Peer {
+    if path == profile.peer_b().root() || path.starts_with(profile.peer_b().root()) {
+        profile.peer_b()
+    } else {
+        profile.peer_a()
+    }
+}
+
+fn peer_diagnostic_label(peer: &Peer) -> String {
+    match peer.endpoint() {
+        syncplus_core::PeerEndpoint::Local { .. } => {
+            format!("{} (local)", single_line(peer.name()))
+        }
+        syncplus_core::PeerEndpoint::Ssh(ssh) => format!(
+            "{} (account {}@{}:{})",
+            single_line(peer.name()),
+            single_line(ssh.username()),
+            single_line(ssh.server()),
+            ssh.port()
+        ),
+    }
+}
+
+fn format_precheck_diagnostic(profile: &SyncProfile, blocker: &syncplus_core::PrecheckBlocker) -> String {
+    let peer = peer_for_path(profile, blocker.path());
+    let account = peer
+        .ssh_peer()
+        .map(|ssh| single_line(ssh.username()))
+        .unwrap_or_else(|| "not applicable (local peer)".to_owned());
+    format!(
+        "Profile: {} | Peer: {} | Account: {} | Scope: {} | Reason: {} | Next action: {}",
+        single_line(profile.name()),
+        peer_diagnostic_label(peer),
+        account,
+        single_line(blocker.path().display().to_string()),
+        single_line(blocker.reason()),
+        single_line(blocker.remediation())
+    )
+}
+
 pub struct SyncPlusApp {
     store: RunEvidenceStore,
     secret_store: Box<dyn SecretStore>,
@@ -498,6 +797,7 @@ pub struct SyncPlusApp {
     run_reports: Vec<RunReport>,
     selected_run_report: Option<RunId>,
     pending_report_action: Option<PendingReportAction>,
+    help_topic: HelpTopic,
 }
 
 impl SyncPlusApp {
@@ -528,6 +828,7 @@ impl SyncPlusApp {
             run_reports,
             selected_run_report,
             pending_report_action: None,
+            help_topic: HelpTopic::Modes,
         })
     }
 
@@ -557,6 +858,18 @@ impl SyncPlusApp {
                 .iter()
                 .find(|report| report.run_id() == run_id)
         })
+    }
+
+    pub fn help_topic(&self) -> HelpTopic {
+        self.help_topic
+    }
+
+    pub fn selected_help_entry(&self) -> HelpEntry {
+        help_entry(self.help_topic)
+    }
+
+    pub fn select_help_topic(&mut self, topic: HelpTopic) {
+        self.help_topic = topic;
     }
 
     pub fn refresh_run_reports(&mut self) -> Result<(), UiValidationError> {
@@ -1297,10 +1610,22 @@ impl SyncPlusApp {
         let form_before_draw = self.form.clone();
         ui.heading("Sync Profile");
         ui.label("Define named endpoints and safety settings. SyncPlus never accepts arbitrary rsync arguments.");
+        draw_contextual_help_link(
+            ui,
+            "Profile guidance",
+            help_topic_for_surface(HelpSurface::Profile),
+            &mut self.help_topic,
+        );
         if let Some(source_id) = self.form.clone_source {
             let clone_authorization_choice_before = self.form.clone_authorization_choice;
             ui.group(|ui| {
                 ui.heading("Clone Profile safeguards");
+                draw_contextual_help_link(
+                    ui,
+                    "Clone safeguards",
+                    help_topic_for_surface(HelpSurface::Clone),
+                    &mut self.help_topic,
+                );
                 ui.label(format!(
                     "This is an editable copy of Sync Profile {source_id:?}. Both endpoint forms below are pre-filled for review. Change at least one endpoint before saving."
                 ));
@@ -1525,6 +1850,12 @@ impl SyncPlusApp {
         let mut request_resolution_confirmation = false;
         ui.separator();
         ui.heading("Plan review and Execution Confirmation");
+        draw_contextual_help_link(
+            ui,
+            "Plan and confirmation",
+            help_topic_for_surface(HelpSurface::Plan),
+            &mut self.help_topic,
+        );
 
         if let Some(review) = self.review.as_mut() {
             ui.label("This is a read-only review of the current profile. No filesystem mutation starts from this view.");
@@ -1561,13 +1892,8 @@ impl SyncPlusApp {
                         "Fresh precheck: blocked"
                     });
                     for blocker in precheck.blockers() {
-                        ui.label(format!(
-                            "BLOCKER [{:?}] {} — {}. Remediation: {}",
-                            blocker.kind(),
-                            blocker.path().display(),
-                            blocker.reason(),
-                            blocker.remediation()
-                        ));
+                        ui.label(format!("BLOCKER [{:?}]", blocker.kind()));
+                        ui.label(format_precheck_diagnostic(&review.profile, blocker));
                         ui.label(format!("Requirement: {}", blocker.requirement()));
                     }
                     for warning in precheck.warnings() {
@@ -1581,9 +1907,9 @@ impl SyncPlusApp {
             }
 
             if let Some(analysis) = review.analysis.clone() {
-                draw_analysis_review(ui, review, &analysis);
+                draw_analysis_review(ui, review, &analysis, &mut self.help_topic);
                 if review.profile.mode() == SyncMode::Mirror {
-                    match draw_conflict_review(ui, review) {
+                    match draw_conflict_review(ui, review, &mut self.help_topic) {
                         ConflictReviewAction::StartResolutionRun => request_resolution_start = true,
                         ConflictReviewAction::ConfirmResolutionRun => {
                             request_resolution_confirmation = true;
@@ -1668,6 +1994,7 @@ impl SyncPlusApp {
         let mut action_to_run = None;
         let mut cancel_pending = false;
         let mut review_to_clear = None;
+        let mut requested_help = None;
         ui.separator();
         ui.heading("Sync Run lifecycle, Run Reports, and Recovery Review");
         ui.label("Run Reports are durable safety evidence. They contain status, progress, paths, outcomes, and recovery facts, never passwords or file contents.");
@@ -1705,7 +2032,7 @@ impl SyncPlusApp {
                 columns[1].label("Select a Run Report to inspect its lifecycle and evidence.");
                 return;
             };
-            draw_run_report_detail(&mut columns[1], report);
+            draw_run_report_detail(&mut columns[1], report, &mut requested_help);
 
             let pending = self
                 .pending_report_action
@@ -1762,6 +2089,10 @@ impl SyncPlusApp {
             }
         });
 
+        if let Some(topic) = requested_help {
+            self.help_topic = topic;
+        }
+
         if cancel_pending {
             self.pending_report_action = None;
         }
@@ -1793,7 +2124,11 @@ enum ConflictReviewAction {
     ConfirmResolutionRun,
 }
 
-fn draw_conflict_review(ui: &mut egui::Ui, review: &mut PlanReviewState) -> ConflictReviewAction {
+fn draw_conflict_review(
+    ui: &mut egui::Ui,
+    review: &mut PlanReviewState,
+    help_topic: &mut HelpTopic,
+) -> ConflictReviewAction {
     let Some(conflicts) = review.conflicts.as_mut() else {
         return ConflictReviewAction::None;
     };
@@ -1803,6 +2138,12 @@ fn draw_conflict_review(ui: &mut egui::Ui, review: &mut PlanReviewState) -> Conf
 
     ui.group(|ui| {
         ui.heading("Conflict Review (read-only)");
+        draw_contextual_help_link(
+            ui,
+            "Conflict Review guidance",
+            help_topic_for_surface(HelpSurface::ConflictReview),
+            help_topic,
+        );
         ui.label("Mirror Sync has no implicit winner. Inspect both peer versions and choose one explicit whole-file decision for every entry.");
         ui.label("This review never edits file content. Preserve Both, Rename/Preserve for Review, and Defer keep the run open for later review.");
         if entries.is_empty() {
@@ -2033,7 +2374,12 @@ fn format_hash(hash: &[u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn draw_analysis_review(ui: &mut egui::Ui, review: &PlanReviewState, analysis: &FreshAnalysis) {
+fn draw_analysis_review(
+    ui: &mut egui::Ui,
+    review: &PlanReviewState,
+    analysis: &FreshAnalysis,
+    help_topic: &mut HelpTopic,
+) {
     let summary = analysis.plan().summary();
     let unsupported_count = analysis
         .source_inventory()
@@ -2050,6 +2396,12 @@ fn draw_analysis_review(ui: &mut egui::Ui, review: &PlanReviewState, analysis: &
 
     ui.group(|ui| {
         ui.label("Fresh Analysis: Explainable Actions");
+        draw_contextual_help_link(
+            ui,
+            "Plan guidance",
+            help_topic_for_surface(HelpSurface::Plan),
+            help_topic,
+        );
         ui.label(format!(
             "Considered: {} | Included: {} | Excluded: {} | Unresolved or unsupported: {}",
             summary.considered_count(),
@@ -2284,14 +2636,25 @@ impl eframe::App for SyncPlusApp {
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_profile_form(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_review(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_run_reports(ui));
+            draw_help(ui, &mut self.help_topic);
             ui.separator();
             ui.label(egui::RichText::new(&self.status).strong());
         });
     }
 }
 
-fn draw_run_report_detail(ui: &mut egui::Ui, report: &RunReport) {
+fn draw_run_report_detail(
+    ui: &mut egui::Ui,
+    report: &RunReport,
+    requested_help: &mut Option<HelpTopic>,
+) {
     ui.heading(format!("Sync Run {}", report.run_id().value()));
+    draw_contextual_help_request(
+        ui,
+        "Run Report guidance",
+        help_topic_for_surface(HelpSurface::Report),
+        requested_help,
+    );
     ui.label(format!(
         "Profile: {} | Mode: {} | Snapshot: {}",
         report.snapshot().profile().name(),
@@ -2312,6 +2675,12 @@ fn draw_run_report_detail(ui: &mut egui::Ui, report: &RunReport) {
     if report.status() == RunReportStatus::InProgress {
         ui.group(|ui| {
             ui.heading("Active Sync Run");
+            draw_contextual_help_request(
+                ui,
+                "Progress and cancellation",
+                help_topic_for_surface(HelpSurface::Progress),
+                requested_help,
+            );
             if let Some(item) = report
                 .items()
                 .iter()
@@ -2338,6 +2707,12 @@ fn draw_run_report_detail(ui: &mut egui::Ui, report: &RunReport) {
     ) {
         ui.group(|ui| {
             ui.heading("Recovery Review");
+            draw_contextual_help_request(
+                ui,
+                "Recovery guidance",
+                help_topic_for_surface(HelpSurface::Recovery),
+                requested_help,
+            );
             ui.label(run_recovery_message(report.status()));
             if let Some(reason) = report.blocked_reason() {
                 ui.label(format!("Blocker: {reason}"));
@@ -2588,6 +2963,53 @@ fn mode_label(mode: ApplicationMode) -> &'static str {
         ApplicationMode::Simple => "Simple",
         ApplicationMode::Advanced => "Advanced",
     }
+}
+
+fn draw_contextual_help_link(
+    ui: &mut egui::Ui,
+    label: &str,
+    topic: HelpTopic,
+    selected_topic: &mut HelpTopic,
+) {
+    if ui.button(format!("Help: {label}")).clicked() {
+        *selected_topic = topic;
+    }
+}
+
+fn draw_contextual_help_request(
+    ui: &mut egui::Ui,
+    label: &str,
+    topic: HelpTopic,
+    requested_topic: &mut Option<HelpTopic>,
+) {
+    if ui.button(format!("Help: {label}")).clicked() {
+        *requested_topic = Some(topic);
+    }
+}
+
+fn draw_help(ui: &mut egui::Ui, selected_topic: &mut HelpTopic) {
+    ui.separator();
+    ui.heading("Help & safe diagnostics");
+    ui.label("Use the text links below to understand what SyncPlus is doing, why a decision is required, and the next safe action. Help never bypasses a safety gate.");
+    ui.horizontal_wrapped(|ui| {
+        for topic in help_topics() {
+            let selected = *selected_topic == *topic;
+            if ui.selectable_label(selected, topic.label()).clicked() {
+                *selected_topic = *topic;
+            }
+        }
+    });
+    let entry = help_entry(*selected_topic);
+    ui.group(|ui| {
+        ui.heading(entry.title);
+        ui.label(format!("What: {}", entry.what));
+        ui.label(format!("Why: {}", entry.why));
+        ui.label(format!("How: {}", entry.how));
+        ui.label(format!("When: {}", entry.when));
+        ui.label(format!("Consequences: {}", entry.consequences));
+        ui.label(format!("Limitations: {}", entry.limitations));
+        ui.label(format!("Next safe action: {}", entry.next_action));
+    });
 }
 
 #[cfg(test)]
@@ -3126,5 +3548,91 @@ mod tests {
         form.retry_attempts = "5".to_owned();
         form.retry_delay_millis = "3600001".to_owned();
         assert_eq!(form.build(), Err(UiValidationError::InvalidRetryDelay));
+    }
+
+    #[test]
+    fn help_catalog_covers_required_topics_with_complete_safe_guidance() {
+        let required_topics = [
+            HelpTopic::Modes,
+            HelpTopic::OneWaySync,
+            HelpTopic::SafeDelete,
+            HelpTopic::MirrorSync,
+            HelpTopic::ConflictReview,
+            HelpTopic::Exclusions,
+            HelpTopic::SshAuthentication,
+            HelpTopic::Recovery,
+            HelpTopic::RunReports,
+            HelpTopic::DestructiveActions,
+        ];
+
+        for topic in required_topics {
+            let entry = help_entry(topic);
+            assert!(!entry.title.is_empty());
+            assert!(!entry.what.is_empty());
+            assert!(!entry.why.is_empty());
+            assert!(!entry.how.is_empty());
+            assert!(!entry.when.is_empty());
+            assert!(!entry.consequences.is_empty());
+            assert!(!entry.limitations.is_empty());
+            assert!(!entry.next_action.is_empty());
+            let content = format!(
+                "{} {} {} {} {} {} {} {}",
+                entry.title,
+                entry.what,
+                entry.why,
+                entry.how,
+                entry.when,
+                entry.consequences,
+                entry.limitations,
+                entry.next_action
+            );
+            assert!(!content.contains("test-only-secret"));
+            assert!(!content.contains("private-key-material"));
+            assert!(!content.contains("file-content-sentinel"));
+        }
+
+        assert!(help_topics().len() >= required_topics.len());
+    }
+
+    #[test]
+    fn contextual_help_maps_every_required_surface_to_text_guidance() {
+        let surfaces = [
+            (HelpSurface::Profile, HelpTopic::Modes),
+            (HelpSurface::Plan, HelpTopic::PlanAndConfirmation),
+            (HelpSurface::ConflictReview, HelpTopic::ConflictReview),
+            (HelpSurface::Progress, HelpTopic::ProgressAndCancellation),
+            (HelpSurface::Report, HelpTopic::RunReports),
+            (HelpSurface::Recovery, HelpTopic::Recovery),
+            (HelpSurface::Clone, HelpTopic::CloneProfile),
+        ];
+
+        for (surface, expected_topic) in surfaces {
+            let topic = help_topic_for_surface(surface);
+            assert_eq!(topic, expected_topic);
+            assert!(!help_entry(topic).next_action.is_empty());
+        }
+    }
+
+    #[test]
+    fn precheck_diagnostic_identifies_scope_and_safe_next_action() {
+        let (mut form, _source, base) = filesystem_form();
+        let missing = base.join("missing-source");
+        form.peer_a.local_path = missing.display().to_string();
+        let profile = form.build().expect("valid profile with unavailable source");
+        let precheck = RunPrecheck::check(&profile, &LocalPrecheckProbe::default())
+            .expect("precheck returns blockers");
+        let blocker = precheck.blockers().first().expect("source blocker");
+
+        let diagnostic = format_precheck_diagnostic(&profile, blocker);
+        assert!(diagnostic.contains("Profile: Filesystem review"));
+        assert!(diagnostic.contains("Peer: Source"));
+        assert!(diagnostic.contains("Account: not applicable (local peer)"));
+        assert!(diagnostic.contains("Scope:"));
+        assert!(diagnostic.contains("Reason:"));
+        assert!(diagnostic.contains("Next action:"));
+        assert!(!diagnostic.contains("test-only-secret"));
+        assert!(!diagnostic.contains("file-content-sentinel"));
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
     }
 }
