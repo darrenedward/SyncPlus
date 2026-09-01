@@ -150,6 +150,10 @@ fn local_to_ssh_profiles_use_structured_transport_and_remote_path_arguments() {
     assert!(invocation.arguments().iter().any(|argument| {
         argument == "--rsh=ssh -p 2222 -o IdentitiesOnly=yes -o IdentityAgent=none -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -i '/home/user/.ssh/id_sync'"
     }));
+    assert!(invocation
+        .arguments()
+        .iter()
+        .any(|argument| argument == std::ffi::OsStr::new("--protect-args")));
     assert_eq!(
         invocation
             .arguments()

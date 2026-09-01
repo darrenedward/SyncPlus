@@ -13,6 +13,7 @@ use crate::{
 pub enum RsyncFlag {
     Archive,
     ItemizeChanges,
+    ProtectArgs,
     Compress,
     DestinationCleanup,
     EndOfOptions,
@@ -25,6 +26,7 @@ impl RsyncFlag {
         match self {
             Self::Archive => "--archive",
             Self::ItemizeChanges => "--itemize-changes",
+            Self::ProtectArgs => "--protect-args",
             Self::Compress => "--compress",
             Self::DestinationCleanup => "--delete",
             Self::EndOfOptions => "--",
@@ -41,6 +43,7 @@ impl TryFrom<&str> for RsyncFlag {
         match value {
             "--archive" => Ok(Self::Archive),
             "--itemize-changes" => Ok(Self::ItemizeChanges),
+            "--protect-args" => Ok(Self::ProtectArgs),
             "--compress" => Ok(Self::Compress),
             "--" => Ok(Self::EndOfOptions),
             "--delete" | "--delete-after" | "--delete-before" | "--delete-during" => {
@@ -488,6 +491,12 @@ impl ProcessSpecification {
             ProcessArgument::Flag(RsyncFlag::ItemizeChanges),
         ];
 
+        // Rsync otherwise lets its remote-shell layer reinterpret apostrophes,
+        // control characters, and shell metacharacters in remote paths.
+        if ssh_transport.is_some() {
+            arguments.push(ProcessArgument::Flag(RsyncFlag::ProtectArgs));
+        }
+
         if options.specialist_metadata().access_control_lists() {
             arguments.push(ProcessArgument::Flag(RsyncFlag::Acls));
         }
@@ -675,6 +684,9 @@ impl ProcessSpecification {
             ProcessArgument::Flag(RsyncFlag::Archive).to_os_string(),
             ProcessArgument::Flag(RsyncFlag::ItemizeChanges).to_os_string(),
         ];
+        // Per-item SSH transfers use the same argument-protection contract as
+        // whole-tree SSH invocations.
+        arguments.push(ProcessArgument::Flag(RsyncFlag::ProtectArgs).to_os_string());
         if self.options.specialist_metadata().access_control_lists() {
             arguments.push(ProcessArgument::Flag(RsyncFlag::Acls).to_os_string());
         }

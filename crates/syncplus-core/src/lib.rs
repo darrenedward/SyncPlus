@@ -168,5 +168,8 @@ mod volume_tests;
 mod removal_tests;
 #[cfg(test)]
 mod restore_tests;
+
+#[cfg(all(test, unix))]
+mod ssh_safety_matrix_tests;
 #[cfg(test)]
 mod release_gate_tests;
