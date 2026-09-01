@@ -23,6 +23,10 @@ use crate::{
 
 const SECRET_FILE_CONTENT: &[u8] = b"private file contents must never become database evidence";
 const SECRET_REFERENCE: &str = "keyring-only-secret-reference";
+const SECRET_PASSWORD: &str = "password-value-must-not-leak";
+const COMPLETED_PHASE: &str = "completed";
+const RECOVERY_REVIEW_PHASE: &str = "recovery_review";
+const REMOVAL_COMPLETED_PHASE: &str = "removal_completed";
 
 struct MissingSecretStore;
 
@@ -147,7 +151,7 @@ fn database_sidecar(database: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn plan(action_id: u64, relative_path: &str) -> PlanRecord {
+fn secret_content_copy_plan(action_id: u64, relative_path: &str) -> PlanRecord {
     PlanRecord::new(
         action_id,
         PathBuf::from(relative_path),
@@ -254,6 +258,9 @@ fn sqlite_recovery_gate_round_trips_all_evidence_and_nonsecret_configuration() {
         missing_credential,
         CredentialResolutionError::SavedSecretUnavailable
     );
+    let secret = SecretValue::new(SECRET_PASSWORD);
+    assert!(!format!("{secret:?}").contains(SECRET_PASSWORD));
+    assert!(!secret.to_string().contains(SECRET_PASSWORD));
 
     let mut trust_store = RunEvidenceStore::open_in_memory().expect("open trust store");
     trust_store
@@ -374,11 +381,19 @@ fn sqlite_recovery_gate_round_trips_all_evidence_and_nonsecret_configuration() {
     );
 
     store
-        .append_event(run_id, JournalEvent::Planned { action: plan(1, "secret.txt") })
+        .append_event(
+            run_id,
+            JournalEvent::Planned {
+                action: secret_content_copy_plan(1, "secret.txt"),
+            },
+        )
         .expect("persist planned boundary");
     store
         .append_event(run_id, JournalEvent::Started { action_id: 1 })
         .expect("persist started boundary");
+    drop(store);
+    let mut store = RunEvidenceStore::open(&fixture.database())
+        .expect("reopen after durable action boundary");
     store
         .append_event(
             run_id,
@@ -405,7 +420,7 @@ fn sqlite_recovery_gate_round_trips_all_evidence_and_nonsecret_configuration() {
     assert!(store.load_reconciliation(run_id).expect("load reconciliation").is_some());
     let journal = store.load_journal(run_id).expect("load journal");
     assert_eq!(journal.len(), 1);
-    assert_eq!(journal[0].last_phase(), "recovery_review");
+    assert_eq!(journal[0].last_phase(), RECOVERY_REVIEW_PHASE);
 
     let exported = store.export_configuration().expect("export configuration");
     assert!(!exported.contains(SECRET_REFERENCE));
@@ -489,7 +504,12 @@ fn sqlite_recovery_gate_quarantines_corruption_and_restores_a_reviewable_databas
     store.create_profile(&profile).expect("save profile");
     store.begin_run(&snapshot).expect("save snapshot");
     store
-        .append_event(run_id, JournalEvent::Planned { action: plan(1, "review.txt") })
+        .append_event(
+            run_id,
+            JournalEvent::Planned {
+                action: secret_content_copy_plan(1, "review.txt"),
+            },
+        )
         .expect("save plan");
     store
         .append_event(run_id, JournalEvent::Started { action_id: 1 })
@@ -621,7 +641,12 @@ fn sqlite_recovery_gate_preserves_concurrent_records_and_filesystem_boundary_unc
             .expect("freeze concurrent snapshot");
             store.begin_run(&snapshot).expect("persist concurrent snapshot");
             store
-                .append_event(run_id, JournalEvent::Planned { action: plan(1, "worker.txt") })
+                .append_event(
+                    run_id,
+                    JournalEvent::Planned {
+                        action: secret_content_copy_plan(1, "worker.txt"),
+                    },
+                )
                 .expect("persist concurrent plan");
             store
                 .append_event(run_id, JournalEvent::Started { action_id: 1 })
@@ -665,7 +690,7 @@ fn sqlite_recovery_gate_preserves_concurrent_records_and_filesystem_boundary_unc
         assert_eq!(report.status(), RunReportStatus::RecoveryReview);
         let journal = store.load_journal(run_id).expect("load concurrent journal");
         assert_eq!(journal.len(), 1);
-        assert_eq!(journal[0].last_phase(), "recovery_review");
+        assert_eq!(journal[0].last_phase(), RECOVERY_REVIEW_PHASE);
         assert!(report.items()[0].journal().recovery_evidence().is_some());
     }
     drop(store);
@@ -682,7 +707,7 @@ fn sqlite_recovery_gate_preserves_concurrent_records_and_filesystem_boundary_unc
     let boundary_run = RunId::new(8510);
     let mut boundary_store = RunEvidenceStore::open(&fixture.database())
         .expect("open boundary database");
-    boundary_store.fail_next_event_phase_for_test("completed");
+    boundary_store.fail_next_event_phase_for_test(COMPLETED_PHASE);
     let error = crate::RunWorkflow::new(RecoveryMethod::trash(fixture.recovery()))
         .execute(
             boundary_run,
@@ -720,7 +745,7 @@ fn sqlite_recovery_gate_preserves_concurrent_records_and_filesystem_boundary_unc
     let safe_delete_run = RunId::new(8511);
     let mut safe_delete_store = RunEvidenceStore::open(&safe_fixture.database())
         .expect("open Safe Delete boundary database");
-    safe_delete_store.fail_next_event_phase_for_test("removal_completed");
+    safe_delete_store.fail_next_event_phase_for_test(REMOVAL_COMPLETED_PHASE);
     let safe_delete_report = crate::RunWorkflow::new(RecoveryMethod::trash(safe_fixture.recovery()))
         .execute(
             safe_delete_run,
