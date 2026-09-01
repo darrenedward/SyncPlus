@@ -502,27 +502,13 @@ pub enum HelpTopic {
     PlanAndConfirmation,
     ProgressAndCancellation,
     Diagnostics,
+    PrecheckBlockers,
     CloneProfile,
 }
 
 impl HelpTopic {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Modes => "Simple and Advanced Mode",
-            Self::OneWaySync => "One-Way Sync",
-            Self::SafeDelete => "One-Way Safe-Delete Sync",
-            Self::MirrorSync => "Mirror Sync",
-            Self::ConflictReview => "Conflict Review",
-            Self::Exclusions => "Exclusions",
-            Self::SshAuthentication => "SSH authentication",
-            Self::Recovery => "Recovery and Restore",
-            Self::RunReports => "Run Reports",
-            Self::DestructiveActions => "Destructive actions",
-            Self::PlanAndConfirmation => "Plan and confirmation",
-            Self::ProgressAndCancellation => "Progress and cancellation",
-            Self::Diagnostics => "Technical diagnostics",
-            Self::CloneProfile => "Clone Profile safeguards",
-        }
+    pub fn label(self) -> &'static str {
+        help_entry(self).title
     }
 }
 
@@ -553,6 +539,7 @@ const HELP_TOPICS: &[HelpTopic] = &[
     HelpTopic::PlanAndConfirmation,
     HelpTopic::ProgressAndCancellation,
     HelpTopic::Diagnostics,
+    HelpTopic::PrecheckBlockers,
     HelpTopic::CloneProfile,
 ];
 
@@ -644,11 +631,11 @@ pub fn help_entry(topic: HelpTopic) -> HelpEntry {
             title: "Recovery and Restore",
             what: "Recovery preserves source or destination state after interruption, failed verification, disconnect, crash, or an ambiguous filesystem boundary.",
             why: "SQLite records evidence but cannot make a database commit and filesystem mutation one atomic transaction.",
-            how: "Open the Run Report, perform Fresh Analysis, inspect Recovery Review and provenance, then resume or restore only through the explicit reviewed action.",
+            how: "Open the Run Report, perform Fresh Analysis where the workflow provides it, and inspect Recovery Review and provenance before taking any explicit metadata action.",
             when: "Use it whenever a run is Interrupted, Recovery Review, pending review, or a recovery item needs restoration.",
             consequences: "Uncertainty keeps the run open and preserves user files; Restore refuses to overwrite newer or different destination content automatically.",
             limitations: "Recovery evidence may prove only what was observed. SyncPlus never guesses completion or repeats uncertain deletion.",
-            next_action: "Read the preserved-state evidence and choose Resume, Restore, or a deliberate review decision; do not treat an interruption as completion.",
+            next_action: "Read the preserved-state evidence, keep unresolved metadata available for review, and do not treat an interruption as completion.",
         },
         HelpTopic::RunReports => HelpEntry {
             topic,
@@ -705,6 +692,17 @@ pub fn help_entry(topic: HelpTopic) -> HelpEntry {
             limitations: "Diagnostics omit passwords, passphrases, private keys, secret values, and file contents. Paths and safe metadata may still be shown.",
             next_action: "Correct the named requirement or open Recovery Review; do not paste diagnostic text into an arbitrary command.",
         },
+        HelpTopic::PrecheckBlockers => HelpEntry {
+            topic,
+            title: "Precheck blockers and review states",
+            what: "A blocker or review state explains why a Sync Run cannot safely continue or be treated as complete.",
+            why: "Prechecks protect user data by stopping before mutation when a required peer, permission, identity, capability, scope, or recovery condition is not proven.",
+            how: "Read the named peer, account when remote, exact scope, requirement, reason, and next action; fix the requirement and run Fresh Analysis again.",
+            when: "Use this guidance for unavailable peers, unreadable sources, unwritable destinations, permission failures, identity changes, naming conflicts, stale reviews, and unresolved items.",
+            consequences: "Confirmation remains unavailable and affected source data stays preserved until the blocker or review item is resolved.",
+            limitations: "A blocker is not permission to bypass verification, host-identity review, confirmation, or Recovery Review. Progress or transfer counts do not override it.",
+            next_action: "Follow the displayed remediation, re-run the fresh precheck and analysis, or leave the run open for Recovery Review when the state is uncertain.",
+        },
         HelpTopic::CloneProfile => HelpEntry {
             topic,
             title: "Clone Profile safeguards",
@@ -739,6 +737,20 @@ fn help_topic_for_surface(surface: HelpSurface) -> HelpTopic {
         HelpSurface::Report => HelpTopic::RunReports,
         HelpSurface::Recovery => HelpTopic::Recovery,
         HelpSurface::Clone => HelpTopic::CloneProfile,
+    }
+}
+
+fn help_topic_for_report_status(status: RunReportStatus) -> HelpTopic {
+    match status {
+        RunReportStatus::InProgress => HelpTopic::ProgressAndCancellation,
+        RunReportStatus::Failed | RunReportStatus::Blocked => HelpTopic::PrecheckBlockers,
+        RunReportStatus::Cancelled
+        | RunReportStatus::Interrupted
+        | RunReportStatus::RecoveryReview
+        | RunReportStatus::CompletedWithReviewRequired => HelpTopic::Recovery,
+        RunReportStatus::Completed | RunReportStatus::ReviewCleared => {
+            help_topic_for_surface(HelpSurface::Report)
+        }
     }
 }
 
@@ -1498,9 +1510,21 @@ impl SyncPlusApp {
 
     fn fresh_local_precheck(profile: &SyncProfile) -> Result<PrecheckResult, String> {
         if profile.peer_a().is_ssh() || profile.peer_b().is_ssh() {
-            return Err(
-                "SSH review is blocked until the typed SSH host-identity, credential, remote capability, and recovery precheck is supplied by the SSH workflow.".to_owned(),
-            );
+            let peer = [profile.peer_a(), profile.peer_b()]
+                .into_iter()
+                .find(|peer| peer.is_ssh())
+                .unwrap_or_else(|| profile.peer_a());
+            let account = peer
+                .ssh_peer()
+                .map(|ssh| single_line(ssh.username()))
+                .unwrap_or_else(|| "not available".to_owned());
+            return Err(format!(
+                "Profile: {} | Peer: {} | Account: {} | Scope: {} | Reason: typed SSH host-identity, credential, remote capability, and recovery precheck is required | Next action: run the SSH workflow precheck and review its result before confirmation.",
+                single_line(profile.name()),
+                peer_diagnostic_label(peer),
+                account,
+                single_line(peer.root().display().to_string())
+            ));
         }
         RunPrecheck::check(profile, &LocalPrecheckProbe::default())
             .map_err(|error| format_precheck_error(&error))
@@ -1880,12 +1904,24 @@ impl SyncPlusApp {
             if let Some(error) = &review.error {
                 ui.group(|ui| {
                     ui.label("Review status: not ready");
+                    draw_contextual_help_link(
+                        ui,
+                        "Blocked-state guidance",
+                        HelpTopic::PrecheckBlockers,
+                        &mut self.help_topic,
+                    );
                     ui.label(error);
                 });
             }
 
             if let Some(precheck) = &review.precheck {
                 ui.group(|ui| {
+                    draw_contextual_help_link(
+                        ui,
+                        "Precheck blocker guidance",
+                        HelpTopic::PrecheckBlockers,
+                        &mut self.help_topic,
+                    );
                     ui.label(if precheck.can_execute() {
                         "Fresh precheck: passed (no blockers)"
                     } else {
@@ -2630,13 +2666,16 @@ impl eframe::App for SyncPlusApp {
         if let Err(error) = self.refresh_run_reports() {
             self.status = format!("Run Reports are unavailable: {error}");
         }
+        egui::Panel::right("help")
+            .resizable(true)
+            .default_size(360.0)
+            .show(ui, |ui| draw_help(ui, &mut self.help_topic));
         egui::Panel::top("settings").show(ui, |ui| self.draw_settings(ui));
         egui::Panel::left("profiles").show(ui, |ui| self.draw_profile_list(ui));
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_profile_form(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_review(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_run_reports(ui));
-            draw_help(ui, &mut self.help_topic);
             ui.separator();
             ui.label(egui::RichText::new(&self.status).strong());
         });
@@ -2652,7 +2691,7 @@ fn draw_run_report_detail(
     draw_contextual_help_request(
         ui,
         "Run Report guidance",
-        help_topic_for_surface(HelpSurface::Report),
+        help_topic_for_report_status(report.status()),
         requested_help,
     );
     ui.label(format!(
@@ -2971,7 +3010,7 @@ fn draw_contextual_help_link(
     topic: HelpTopic,
     selected_topic: &mut HelpTopic,
 ) {
-    if ui.button(format!("Help: {label}")).clicked() {
+    if help_link_clicked(ui, label, topic) {
         *selected_topic = topic;
     }
 }
@@ -2982,33 +3021,40 @@ fn draw_contextual_help_request(
     topic: HelpTopic,
     requested_topic: &mut Option<HelpTopic>,
 ) {
-    if ui.button(format!("Help: {label}")).clicked() {
+    if help_link_clicked(ui, label, topic) {
         *requested_topic = Some(topic);
     }
 }
 
+fn help_link_clicked(ui: &mut egui::Ui, label: &str, topic: HelpTopic) -> bool {
+    ui.button(format!("Help: {label}"))
+        .on_hover_text(format!("Open {} guidance", topic.label()))
+        .clicked()
+}
+
 fn draw_help(ui: &mut egui::Ui, selected_topic: &mut HelpTopic) {
-    ui.separator();
-    ui.heading("Help & safe diagnostics");
-    ui.label("Use the text links below to understand what SyncPlus is doing, why a decision is required, and the next safe action. Help never bypasses a safety gate.");
-    ui.horizontal_wrapped(|ui| {
-        for topic in help_topics() {
-            let selected = *selected_topic == *topic;
-            if ui.selectable_label(selected, topic.label()).clicked() {
-                *selected_topic = *topic;
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        ui.heading("Help & safe diagnostics");
+        ui.label("Use the text links below to understand what SyncPlus is doing, why a decision is required, and the next safe action. Help never bypasses a safety gate.");
+        ui.horizontal_wrapped(|ui| {
+            for topic in help_topics() {
+                let selected = *selected_topic == *topic;
+                if ui.selectable_label(selected, topic.label()).clicked() {
+                    *selected_topic = *topic;
+                }
             }
-        }
-    });
-    let entry = help_entry(*selected_topic);
-    ui.group(|ui| {
-        ui.heading(entry.title);
-        ui.label(format!("What: {}", entry.what));
-        ui.label(format!("Why: {}", entry.why));
-        ui.label(format!("How: {}", entry.how));
-        ui.label(format!("When: {}", entry.when));
-        ui.label(format!("Consequences: {}", entry.consequences));
-        ui.label(format!("Limitations: {}", entry.limitations));
-        ui.label(format!("Next safe action: {}", entry.next_action));
+        });
+        let entry = help_entry(*selected_topic);
+        ui.group(|ui| {
+            ui.heading(entry.title);
+            ui.label(format!("What: {}", entry.what));
+            ui.label(format!("Why: {}", entry.why));
+            ui.label(format!("How: {}", entry.how));
+            ui.label(format!("When: {}", entry.when));
+            ui.label(format!("Consequences: {}", entry.consequences));
+            ui.label(format!("Limitations: {}", entry.limitations));
+            ui.label(format!("Next safe action: {}", entry.next_action));
+        });
     });
 }
 
@@ -3634,5 +3680,28 @@ mod tests {
         assert!(!diagnostic.contains("file-content-sentinel"));
 
         fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn ssh_precheck_message_identifies_peer_account_scope_and_next_action() {
+        let mut form = valid_form();
+        form.peer_b.kind = EndpointKind::Ssh;
+        form.peer_b.server = "backup.example.com".to_owned();
+        form.peer_b.username = "sync-user".to_owned();
+        form.peer_b.remote_path = "/srv/backup".to_owned();
+        form.peer_b.authentication = AuthenticationForm::Agent;
+        let profile = form.build().expect("valid SSH profile");
+
+        let message = SyncPlusApp::fresh_local_precheck(&profile)
+            .expect_err("SSH precheck requires the typed SSH workflow");
+        assert!(message.contains("Profile: Documents backup"));
+        assert!(message.contains("Peer: Backup disk (account sync-user@backup.example.com:22)"));
+        assert!(message.contains("Account: sync-user"));
+        assert!(message.contains("Scope: /srv/backup"));
+        assert!(message.contains("Reason:"));
+        assert!(message.contains("Next action:"));
+        assert!(!message.contains("test-only-secret"));
+        assert!(!message.contains("private-key-material"));
+        assert!(!message.contains("file-content-sentinel"));
     }
 }

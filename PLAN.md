@@ -442,6 +442,14 @@ At every milestone run configured formatting, compiler checks, `cargo clippy -- 
 
 Help must explain exactly what each mode and option does, why it matters, when to use it, what it may remove, what recovery costs, and what limitations apply. Important messages must identify the path, peer, account, reason, and next action.
 
+The desktop Help catalog is the shared text source for these explanations and
+exposes a visible, keyboard-addressable topic pane. Contextual links from the
+profile, plan, Conflict Review, progress, Run Report, Recovery Review, and
+Clone Profile surfaces select their corresponding topic. Structured precheck
+diagnostics include the profile, peer, remote account when applicable, scope,
+reason, requirement, and next safe action without carrying secrets or file
+contents. Help and diagnostics describe safety gates; they never bypass them.
+
 Examples of required messages:
 
 - “SyncPlus cannot read `/home/name/public_html` as the current user. Check ownership, group membership, and permissions, then retry.”
