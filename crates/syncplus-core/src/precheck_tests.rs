@@ -187,6 +187,16 @@ fn remote_precheck_requires_trusted_authentication_and_all_requested_capabilitie
         .expect("all remote capabilities should yield a precheck permit");
     assert_eq!(permit.host(), host_permit.host());
     assert_eq!(permit.trash_location(), Some(std::path::Path::new("/srv/.syncplus-trash")));
+    assert_eq!(permit.access(), request.access());
+    assert!(matches!(
+        permit.validate_for(
+            &peer,
+            &ResolvedSshCredential::Agent,
+            &host_permit,
+            RemotePrecheckRequest::new(RemoteAccessRequirements::new(true, false, false), false),
+        ),
+        Err(crate::RemotePrecheckError::RequestMismatch)
+    ));
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 

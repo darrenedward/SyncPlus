@@ -22,7 +22,8 @@ use crate::{
     RunEvidenceStore, RunId, RunPrecheck, RunReport, RunReportStatus, RunSnapshot,
     SafeDeleteError, ScopeLockOwner,
     SourceInventorySnapshot, StorageError, SyncBaseline, TransferError, VerificationError,
-    VerifiedReplacement, PeerScopeLockRegistry,
+    VerifiedReplacement, PeerScope, PeerScopeLock, PeerScopeLockRegistry, SshRunBackend,
+    SshRunError, SshRemotePrecheck, RemotePrecheckRequest,
 };
 
 #[derive(Debug)]
@@ -35,6 +36,7 @@ pub enum WorkflowError {
     InvalidRun(String),
     Io(String),
     Resolution(ResolutionRunError),
+    Ssh(SshRunError),
 }
 
 impl std::fmt::Display for WorkflowError {
@@ -50,6 +52,7 @@ impl std::fmt::Display for WorkflowError {
             Self::InvalidRun(reason) => write!(formatter, "invalid Sync Run: {reason}"),
             Self::Io(reason) => write!(formatter, "Sync Run filesystem operation failed: {reason}"),
             Self::Resolution(error) => write!(formatter, "Resolution Run failed: {error}"),
+            Self::Ssh(error) => write!(formatter, "SSH Sync Run failed: {error}"),
         }
     }
 }
@@ -77,6 +80,12 @@ impl From<ResolutionRunError> for WorkflowError {
 impl From<VerificationError> for WorkflowError {
     fn from(error: VerificationError) -> Self {
         Self::Verification(error)
+    }
+}
+
+impl From<SshRunError> for WorkflowError {
+    fn from(error: SshRunError) -> Self {
+        Self::Ssh(error)
     }
 }
 
@@ -349,6 +358,582 @@ impl RunWorkflow {
         )?;
         self.cleanup_partials_after_resolution(profile, &report)?;
         Ok(report)
+    }
+
+    /// Execute a Sync Run with exactly one SSH peer. Remote probing and
+    /// transfer are injected so the core remains independent of a network
+    /// runtime, while the safety lifecycle stays centralized here.
+    pub fn execute_ssh<B, C, F>(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        credential: &crate::ResolvedSshCredential,
+        host_permit: &crate::SshHostTrustPermit,
+        precheck: &crate::RemotePrecheckPermit,
+        backend: &B,
+        confirm: C,
+        store: &mut RunEvidenceStore,
+        should_cancel: F,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        B: SshRunBackend,
+        C: FnOnce(&ConfirmedPlan) -> bool,
+        F: Fn() -> bool,
+    {
+        let _scope_lock = self.acquire_ssh_scope(run_id, profile)?;
+        let (_remote_side, remote_peer) = ssh_peer_for_profile(profile)?;
+        let (_, remote_request) = RemotePrecheckRequest::from_profile(profile)
+            .map_err(|error| WorkflowError::InvalidRun(error.to_string()))?;
+        validate_ssh_permits(remote_peer, credential, host_permit, precheck, remote_request)?;
+        let _initial_remote_permit =
+            self.refresh_ssh_precheck(profile, credential, host_permit, backend)?;
+        let analysis = self.analyze_ssh(profile, credential, host_permit, backend)?;
+        let refreshed = self.analyze_ssh(profile, credential, host_permit, backend)?;
+        let confirmed = analysis.confirm_refreshed(profile, &refreshed)?;
+        if !confirm(&confirmed) {
+            return Err(WorkflowError::ConfirmationRequired);
+        }
+        let remote_permit = self.refresh_ssh_precheck(profile, credential, host_permit, backend)?;
+        self.execute_ssh_confirmed(
+            run_id,
+            &confirmed,
+            credential,
+            host_permit,
+            &remote_permit,
+            backend,
+            store,
+            should_cancel,
+        )
+    }
+
+    /// Resume an incomplete SSH run only after open boundaries are classified
+    /// and both remote Fresh Analysis and explicit confirmation succeed again.
+    pub fn resume_ssh<B, C, F>(
+        &self,
+        run_id: RunId,
+        credential: &crate::ResolvedSshCredential,
+        host_permit: &crate::SshHostTrustPermit,
+        precheck: &crate::RemotePrecheckPermit,
+        backend: &B,
+        confirm: C,
+        store: &mut RunEvidenceStore,
+        should_cancel: F,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        B: SshRunBackend,
+        C: FnOnce(&ConfirmedPlan) -> bool,
+        F: Fn() -> bool,
+    {
+        let report = store.load_report(run_id)?;
+        if matches!(report.status(), RunReportStatus::Completed | RunReportStatus::ReviewCleared)
+        {
+            return Err(WorkflowError::InvalidRun(
+                "only an incomplete SSH run can be resumed".to_owned(),
+            ));
+        }
+        if report.status() == RunReportStatus::RecoveryReview {
+            return Err(WorkflowError::InvalidRun(
+                "Recovery Review must be explicitly resolved before an SSH run can resume"
+                    .to_owned(),
+            ));
+        }
+        let profile = report.snapshot().profile().clone();
+        let next_run_id = store.next_run_id()?;
+        let _scope_lock = self.acquire_ssh_scope(next_run_id, &profile)?;
+        let (_remote_side, remote_peer) = ssh_peer_for_profile(&profile)?;
+        let (_, remote_request) = RemotePrecheckRequest::from_profile(&profile)
+            .map_err(|error| WorkflowError::InvalidRun(error.to_string()))?;
+        validate_ssh_permits(
+            remote_peer,
+            credential,
+            host_permit,
+            precheck,
+            remote_request,
+        )?;
+        self.classify_ssh_open_actions(run_id, &report, store)?;
+        let reopened = store.load_report(run_id)?;
+        if reopened.status() == RunReportStatus::RecoveryReview {
+            return Err(WorkflowError::InvalidRun(
+                "Recovery Review must be explicitly resolved before an SSH run can resume"
+                    .to_owned(),
+            ));
+        }
+        let profile = reopened.snapshot().profile().clone();
+        let _initial_remote_permit =
+            self.refresh_ssh_precheck(&profile, credential, host_permit, backend)?;
+        let analysis = self.analyze_ssh(&profile, credential, host_permit, backend)?;
+        let refreshed = self.analyze_ssh(&profile, credential, host_permit, backend)?;
+        let confirmed = analysis.confirm_refreshed(&profile, &refreshed)?;
+        if !confirm(&confirmed) {
+            return Err(WorkflowError::ConfirmationRequired);
+        }
+        let remote_permit = self.refresh_ssh_precheck(&profile, credential, host_permit, backend)?;
+        self.execute_ssh_confirmed(
+            next_run_id,
+            &confirmed,
+            credential,
+            host_permit,
+            &remote_permit,
+            backend,
+            store,
+            should_cancel,
+        )
+    }
+
+    fn acquire_ssh_scope(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+    ) -> Result<PeerScopeLock, WorkflowError> {
+        self.scope_locks
+            .acquire(
+                ScopeLockOwner::new(profile.name(), run_id),
+                [
+                    PeerScope::for_peer(profile.peer_a()),
+                    PeerScope::for_peer(profile.peer_b()),
+                ],
+            )
+            .map_err(|error| {
+                WorkflowError::InvalidRun(format!("could not acquire peer scope lock: {error:?}"))
+            })
+    }
+
+    fn analyze_ssh<B>(
+        &self,
+        profile: &crate::SyncProfile,
+        credential: &crate::ResolvedSshCredential,
+        host_permit: &crate::SshHostTrustPermit,
+        backend: &B,
+    ) -> Result<FreshAnalysis, WorkflowError>
+    where
+        B: SshRunBackend,
+    {
+        let specification = ProcessSpecification::from_profile(profile)
+            .map_err(|error| WorkflowError::InvalidRun(error.to_string()))?;
+        let exclusions: Vec<String> = specification
+            .exclusions()
+            .map(ToOwned::to_owned)
+            .collect();
+        let (source_side, destination_side) = if profile.mode() == crate::SyncMode::Mirror {
+            (crate::PeerSide::PeerA, crate::PeerSide::PeerB)
+        } else {
+            let source_side = crate::PeerSide::from(profile.source());
+            (source_side, source_side.opposite())
+        };
+        let source_inventory = self.ssh_inventory(
+            peer_for_side(profile, source_side),
+            credential,
+            host_permit,
+            &exclusions,
+            backend,
+        )?;
+        let destination_inventory = self.ssh_inventory(
+            peer_for_side(profile, destination_side),
+            credential,
+            host_permit,
+            &exclusions,
+            backend,
+        )?;
+        FreshAnalysis::from_inventories(
+            profile,
+            specification,
+            source_inventory,
+            destination_inventory,
+        )
+        .map_err(WorkflowError::from)
+    }
+
+    fn refresh_ssh_precheck<B>(
+        &self,
+        profile: &crate::SyncProfile,
+        credential: &crate::ResolvedSshCredential,
+        host_permit: &crate::SshHostTrustPermit,
+        backend: &B,
+    ) -> Result<crate::RemotePrecheckPermit, WorkflowError>
+    where
+        B: SshRunBackend,
+    {
+        let (peer, request) = RemotePrecheckRequest::from_profile(profile)
+            .map_err(|error| WorkflowError::InvalidRun(error.to_string()))?;
+        let observed = crate::SshHostIdentityProbe::probe(backend, &peer).map_err(|error| {
+            WorkflowError::Ssh(SshRunError::Precheck(format!(
+                "SSH host identity could not be reverified: {error}"
+            )))
+        })?;
+        if &observed != host_permit.fingerprint() {
+            return Err(WorkflowError::Ssh(SshRunError::Precheck(
+                "SSH host fingerprint changed; review the server identity before continuing"
+                    .to_owned(),
+            )));
+        }
+        SshRemotePrecheck::check(&peer, credential, host_permit, &request, backend)
+            .map_err(|error| WorkflowError::Ssh(SshRunError::Precheck(error.to_string())))?
+            .require_passed()
+            .map_err(|blocked| {
+                WorkflowError::Ssh(SshRunError::Precheck(format!(
+                    "remote precheck remained blocked: {:?}",
+                    blocked.blockers()
+                )))
+            })
+    }
+
+    fn ssh_inventory<B>(
+        &self,
+        peer: &crate::Peer,
+        credential: &crate::ResolvedSshCredential,
+        host_permit: &crate::SshHostTrustPermit,
+        exclusions: &[String],
+        backend: &B,
+    ) -> Result<crate::SourceInventory, WorkflowError>
+    where
+        B: SshRunBackend,
+    {
+        if let Some(ssh_peer) = peer.ssh_peer() {
+            backend
+                .inventory(ssh_peer, credential, host_permit, exclusions)
+                .map_err(WorkflowError::Ssh)
+        } else {
+            FreshAnalysis::collect_local_inventory(peer, exclusions).map_err(WorkflowError::from)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_ssh_confirmed<B, F>(
+        &self,
+        run_id: RunId,
+        confirmed: &ConfirmedPlan,
+        credential: &crate::ResolvedSshCredential,
+        host_permit: &crate::SshHostTrustPermit,
+        precheck: &crate::RemotePrecheckPermit,
+        backend: &B,
+        store: &mut RunEvidenceStore,
+        should_cancel: F,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        B: SshRunBackend,
+        F: Fn() -> bool,
+    {
+        let plan = confirmed.plan();
+        plan.validate()
+            .map_err(|error| WorkflowError::InvalidRun(error.to_string()))?;
+        let snapshot = RunSnapshot::from_profile_with_volume_identities(
+            run_id,
+            confirmed.profile(),
+            crate::AuthorizationSnapshot::default(),
+            None,
+            None,
+        )?;
+        store.begin_run(&snapshot)?;
+        let inventory = SourceInventorySnapshot::from_inventory(plan.source_inventory());
+        let destination_inventory =
+            SourceInventorySnapshot::from_inventory(plan.destination_inventory());
+        store.record_source_inventory(run_id, &inventory)?;
+        if confirmed.profile().mode() == crate::SyncMode::Mirror {
+            store.record_destination_inventory(run_id, &destination_inventory)?;
+        }
+        for action in plan.actions() {
+            store.append_event(
+                run_id,
+                JournalEvent::Planned {
+                    action: ssh_plan_record(plan, action)?,
+                },
+            )?;
+        }
+
+        let cancel = &should_cancel as &dyn Fn() -> bool;
+        for (index, action) in plan.actions().iter().enumerate() {
+            if cancel() {
+                self.cancel_remaining(run_id, &plan.actions()[index..], store)?;
+                break;
+            }
+            if matches!(
+                self.execute_ssh_action(
+                    run_id,
+                    confirmed.profile(),
+                    plan,
+                    action,
+                    credential,
+                    host_permit,
+                    precheck,
+                    backend,
+                    store,
+                    cancel,
+                )?,
+                ActionDisposition::Stop
+            ) {
+                self.cancel_remaining(run_id, &plan.actions()[index + 1..], store)?;
+                break;
+            }
+        }
+
+        self.reconcile_ssh_run(
+            run_id,
+            confirmed.profile(),
+            &inventory,
+            &destination_inventory,
+            credential,
+            host_permit,
+            backend,
+            store,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_ssh_action<B>(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        plan: &OneWayPlan,
+        action: &PlanAction,
+        credential: &crate::ResolvedSshCredential,
+        host_permit: &crate::SshHostTrustPermit,
+        precheck: &crate::RemotePrecheckPermit,
+        backend: &B,
+        store: &mut RunEvidenceStore,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<ActionDisposition, WorkflowError>
+    where
+        B: SshRunBackend,
+    {
+        store.append_event(
+            run_id,
+            JournalEvent::Started {
+                action_id: action.action_id(),
+            },
+        )?;
+        store.append_event(
+            run_id,
+            JournalEvent::Progress {
+                action_id: action.action_id(),
+                completed_bytes: 0,
+            },
+        )?;
+        if !matches!(
+            action.kind(),
+            PlanActionKind::CopyToDestination | PlanActionKind::OverwriteDestination
+        ) {
+            store.append_event(
+                run_id,
+                JournalEvent::Deferred {
+                    action_id: action.action_id(),
+                },
+            )?;
+            return Ok(ActionDisposition::Continue);
+        }
+
+        let source_peer = peer_for_side(profile, action.source_side());
+        let destination_peer = peer_for_side(profile, action.source_side().opposite());
+        let remote_peer = source_peer
+            .ssh_peer()
+            .or_else(|| destination_peer.ssh_peer())
+            .ok_or_else(|| WorkflowError::InvalidRun("SSH action has no remote endpoint".to_owned()))?;
+        let request = crate::SshTransferRequest::new(
+            run_id,
+            plan.specification(),
+            action,
+            source_peer,
+            destination_peer,
+            remote_peer,
+            credential,
+            host_permit,
+            precheck,
+            self.transfer.supervisor(),
+        );
+        let policy = plan.specification().options().retry_policy();
+        let mut attempt = 0u8;
+        let evidence = loop {
+            if should_cancel() {
+                store.append_event(
+                    run_id,
+                    JournalEvent::Cancelled {
+                        action_id: action.action_id(),
+                    },
+                )?;
+                return Ok(ActionDisposition::Stop);
+            }
+            let mut progress = Vec::new();
+            let mut report_progress = |bytes| progress.push(bytes);
+            let result = backend.transfer(&request, should_cancel, &mut report_progress);
+            self.persist_progress(run_id, action.action_id(), progress, store)?;
+            match result {
+                Ok(evidence) => break evidence,
+                Err(error) if error.is_retryable() && attempt + 1 < policy.max_attempts() => {
+                    attempt = attempt.saturating_add(1);
+                    let delay = policy
+                        .initial_delay()
+                        .checked_mul(u32::from(attempt))
+                        .unwrap_or(Duration::MAX);
+                    if !sleep_interruptibly(delay, should_cancel) {
+                        store.append_event(
+                            run_id,
+                            JournalEvent::Cancelled {
+                                action_id: action.action_id(),
+                            },
+                        )?;
+                        return Ok(ActionDisposition::Stop);
+                    }
+                }
+                Err(error) => return self.record_ssh_failure(run_id, action, error, store),
+            }
+        };
+
+        let item = ssh_source_item(plan, action)?;
+        if !evidence.matches_request(&request)
+            || !evidence.matches_inventory(item, plan.specification().options().metadata())
+        {
+            store.append_event(
+                run_id,
+                JournalEvent::Unresolved {
+                    action_id: action.action_id(),
+                    reason: ActionReason::VerificationMismatch,
+                },
+            )?;
+            return Ok(ActionDisposition::Continue);
+        }
+        if item.item_type() == crate::ItemType::RegularFile {
+            let proof = evidence.recovery_evidence(current_unix_nanos()).ok_or_else(|| {
+                WorkflowError::InvalidRun(
+                    "a verified regular-file SSH transfer has no content evidence".to_owned(),
+                )
+            })?;
+            store.append_event(
+                run_id,
+                JournalEvent::TransferVerified {
+                    action_id: action.action_id(),
+                    evidence: proof,
+                    metadata_verified: evidence.metadata_verified(),
+                },
+            )?;
+        }
+        store.append_event(
+            run_id,
+            JournalEvent::Completed {
+                action_id: action.action_id(),
+            },
+        )?;
+        Ok(ActionDisposition::Continue)
+    }
+
+    fn record_ssh_failure(
+        &self,
+        run_id: RunId,
+        action: &PlanAction,
+        error: SshRunError,
+        store: &mut RunEvidenceStore,
+    ) -> Result<ActionDisposition, WorkflowError> {
+        if matches!(error, SshRunError::Cancelled) {
+            store.append_event(
+                run_id,
+                JournalEvent::Cancelled {
+                    action_id: action.action_id(),
+                },
+            )?;
+            return Ok(ActionDisposition::Stop);
+        }
+        if error.requires_recovery_review() {
+            store.append_event(
+                run_id,
+                JournalEvent::RecoveryReview {
+                    action_id: action.action_id(),
+                    reason: error.action_reason(),
+                    evidence: empty_recovery_evidence(),
+                },
+            )?;
+            return Ok(ActionDisposition::Stop);
+        }
+        let unresolved = matches!(
+            error,
+            SshRunError::RemoteVerificationUnavailable { .. }
+                | SshRunError::RemoteVerificationMismatch { .. }
+                | SshRunError::SourceChanged
+                | SshRunError::MetadataMismatch
+        );
+        let event = if unresolved {
+            JournalEvent::Unresolved {
+                action_id: action.action_id(),
+                reason: error.action_reason(),
+            }
+        } else {
+            JournalEvent::Failed {
+                action_id: action.action_id(),
+                reason: error.action_reason(),
+            }
+        };
+        store.append_event(run_id, event)?;
+        Ok(ActionDisposition::Continue)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_ssh_run<B>(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        inventory: &SourceInventorySnapshot,
+        destination_inventory: &SourceInventorySnapshot,
+        credential: &crate::ResolvedSshCredential,
+        host_permit: &crate::SshHostTrustPermit,
+        backend: &B,
+        store: &mut RunEvidenceStore,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        B: SshRunBackend,
+    {
+        let journal = store.load_journal(run_id)?;
+        let current = self.analyze_ssh(profile, credential, host_permit, backend);
+        let reconciliation = match current {
+            Ok(current) if profile.mode() == crate::SyncMode::Mirror => {
+                CompletionReconciliation::reconcile_mirror(
+                    profile,
+                    inventory,
+                    destination_inventory,
+                    &current,
+                    &journal,
+                )
+            }
+            Ok(current) => CompletionReconciliation::reconcile(profile, inventory, &current, &journal),
+            Err(_) => CompletionReconciliation::unavailable(
+                profile,
+                inventory,
+                &journal,
+                &AnalysisError::RootUnavailable {
+                    peer: "SSH peer".to_owned(),
+                    path: profile.peer_a().root().to_path_buf(),
+                },
+            ),
+        };
+        store.record_reconciliation(run_id, &reconciliation)?;
+        Ok(store.load_report(run_id)?)
+    }
+
+    fn classify_ssh_open_actions(
+        &self,
+        run_id: RunId,
+        report: &RunReport,
+        store: &mut RunEvidenceStore,
+    ) -> Result<(), WorkflowError> {
+        for item in report.items() {
+            if !matches!(item.outcome(), ActionOutcome::InProgress) {
+                continue;
+            }
+            if let Some(evidence) = item.journal().transfer_evidence() {
+                store.append_event(
+                    run_id,
+                    JournalEvent::RecoveryReview {
+                        action_id: item.action_id(),
+                        reason: ActionReason::InterruptedBoundary,
+                        evidence: evidence.clone(),
+                    },
+                )?;
+            } else {
+                store.append_event(
+                    run_id,
+                    JournalEvent::Interrupted {
+                        action_id: item.action_id(),
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Execute only a plan that has passed the Fresh Analysis confirmation
@@ -1339,6 +1924,93 @@ impl RunWorkflow {
     }
 }
 
+fn ssh_peer_for_profile(
+    profile: &crate::SyncProfile,
+) -> Result<(crate::PeerSide, &crate::SshPeer), WorkflowError> {
+    match (profile.peer_a().ssh_peer(), profile.peer_b().ssh_peer()) {
+        (Some(peer), None) => Ok((crate::PeerSide::PeerA, peer)),
+        (None, Some(peer)) => Ok((crate::PeerSide::PeerB, peer)),
+        (None, None) => Err(WorkflowError::InvalidRun(
+            "SSH workflow requires one SSH peer".to_owned(),
+        )),
+        (Some(_), Some(_)) => Err(WorkflowError::InvalidRun(
+            "SSH workflow does not support two SSH peers".to_owned(),
+        )),
+    }
+}
+
+fn peer_for_side(profile: &crate::SyncProfile, side: crate::PeerSide) -> &crate::Peer {
+    match side {
+        crate::PeerSide::PeerA => profile.peer_a(),
+        crate::PeerSide::PeerB => profile.peer_b(),
+    }
+}
+
+fn validate_ssh_permits(
+    peer: &crate::SshPeer,
+    credential: &crate::ResolvedSshCredential,
+    host_permit: &crate::SshHostTrustPermit,
+    precheck: &crate::RemotePrecheckPermit,
+    request: RemotePrecheckRequest,
+) -> Result<(), WorkflowError> {
+    precheck
+        .validate_for(peer, credential, host_permit, request)
+        .map_err(|error| WorkflowError::InvalidRun(format!("SSH precheck permit is invalid: {error}")))
+}
+
+fn ssh_source_item<'a>(
+    plan: &'a OneWayPlan,
+    action: &PlanAction,
+) -> Result<&'a crate::InventoryItem, WorkflowError> {
+    let inventory = if plan.specification().mode() == crate::SyncMode::Mirror {
+        match action.source_side() {
+            crate::PeerSide::PeerA => plan.source_inventory(),
+            crate::PeerSide::PeerB => plan.destination_inventory(),
+        }
+    } else {
+        plan.source_inventory()
+    };
+    inventory.item(action.relative_path()).ok_or_else(|| {
+        WorkflowError::InvalidRun(format!(
+            "SSH action {:?} is outside the frozen source inventory",
+            action.relative_path()
+        ))
+    })
+}
+
+fn ssh_plan_record(plan: &OneWayPlan, action: &PlanAction) -> Result<PlanRecord, WorkflowError> {
+    let inventory = if action.kind() == PlanActionKind::RemoveDestination {
+        plan.destination_inventory()
+    } else if plan.specification().mode() == crate::SyncMode::Mirror {
+        match action.source_side() {
+            crate::PeerSide::PeerA => plan.source_inventory(),
+            crate::PeerSide::PeerB => plan.destination_inventory(),
+        }
+    } else {
+        plan.source_inventory()
+    };
+    let item = inventory.item(action.relative_path()).ok_or_else(|| {
+        WorkflowError::InvalidRun(format!(
+            "SSH action {:?} is outside the frozen inventory",
+            action.relative_path()
+        ))
+    })?;
+    Ok(PlanRecord::new(
+        action.action_id(),
+        action.relative_path().to_path_buf(),
+        action.kind(),
+        action.source_side(),
+        action.size(),
+        PreActionState::new(
+            item.item_type(),
+            item.metadata().size(),
+            unix_nanos(item.metadata().modified_at()),
+            None,
+            item.content_fingerprint().copied(),
+        ),
+    ))
+}
+
 fn resolution_report_items<F>(
     confirmed: &crate::ConfirmedResolutionRun,
     execution: &crate::ResolutionExecutionReport,
@@ -1852,7 +2524,7 @@ mod tests {
         fs,
         path::{Path, PathBuf},
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
     };
@@ -1865,15 +2537,20 @@ mod tests {
 
     use super::RunWorkflow;
     use crate::{
-        ActionOutcome, AuthorizationSnapshot, ContentProof, DeletionMethod,
-        DestinationNamingPolicy, FreshAnalysis,
+        ActionOutcome, ActionReason, AuthorizationSnapshot, ContentProof, DeletionMethod,
+        DestinationNamingPolicy, FreshAnalysis, ItemMetadata,
         ItemType, JournalEvent, OneWaySource, Peer, PeerSide, PlanActionKind, PlanRecord,
         PreActionState, ProcessError, RecoveryEvidence, RecoveryMethod, RetryPolicy,
         LocalPrecheckProbe, PartialTransferPolicy, PeerScope, PeerScopeLockRegistry,
         PrecheckFailure, PrecheckProbe,
         MirrorDeletionChoice, MirrorDeletionDecision, RunEvidenceStore, RunId, RunReportStatus,
         RunSnapshot, ScopeLockOwner, SourceInventorySnapshot, SyncMode, SyncOptions,
-        SyncProfile,
+        SyncProfile, SshAuthentication, SshHostFingerprint, SshHostIdentityError,
+        SshHostIdentityProbe, SshHostTrustController, SshPeer, SshRemotePrecheck,
+        SshRemotePrecheckProbe, RemotePrecheckObservation, RemotePrecheckRequest,
+        AccessSnapshot, RemoteRsyncCapability, RemoteSha256Capability, RemoteTrashCapability,
+        ResolvedSshCredential, SshRunBackend, SshRunError, SshTransferBoundary,
+        SshMetadataProof, SshTransferEvidence, SshTransferRequest,
     };
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(1);
@@ -1901,6 +2578,10 @@ mod tests {
             self.root.join("destination")
         }
 
+        fn remote(&self) -> PathBuf {
+            self.root.join("remote")
+        }
+
         fn database(&self) -> PathBuf {
             self.root.join("evidence.sqlite")
         }
@@ -1926,6 +2607,314 @@ mod tests {
             fs::create_dir_all(parent).expect("fixture parent should be creatable");
         }
         fs::write(path, contents).expect("fixture file should be writable");
+    }
+
+    fn ssh_metadata(path: &Path) -> SshMetadataProof {
+        let metadata = fs::symlink_metadata(path).expect("SSH metadata should be readable");
+        let item_type = if metadata.file_type().is_file() {
+            ItemType::RegularFile
+        } else if metadata.file_type().is_dir() {
+            ItemType::Directory
+        } else if metadata.file_type().is_symlink() {
+            ItemType::Symlink
+        } else {
+            ItemType::Unsupported
+        };
+        #[cfg(unix)]
+        let permissions = Some(metadata.permissions().mode());
+        #[cfg(not(unix))]
+        let permissions = None;
+        SshMetadataProof::new(
+            item_type,
+            ItemMetadata::new(
+                metadata.len(),
+                metadata.modified().ok(),
+                metadata.permissions().readonly(),
+                permissions,
+                if item_type == ItemType::Symlink {
+                    fs::read_link(path).ok()
+                } else {
+                    None
+                },
+            ),
+        )
+    }
+
+    struct FixedSshHostProbe(SshHostFingerprint);
+
+    impl SshHostIdentityProbe for FixedSshHostProbe {
+        fn probe(&self, _peer: &SshPeer) -> Result<SshHostFingerprint, SshHostIdentityError> {
+            Ok(self.0)
+        }
+    }
+
+    struct FakeSshBackend {
+        remote_root: PathBuf,
+        calls: AtomicUsize,
+        prechecks: AtomicUsize,
+        fail_first: AtomicBool,
+        mismatch: bool,
+    }
+
+    impl FakeSshBackend {
+        fn new(remote_root: PathBuf) -> Self {
+            Self {
+                remote_root,
+                calls: AtomicUsize::new(0),
+                prechecks: AtomicUsize::new(0),
+                fail_first: AtomicBool::new(false),
+                mismatch: false,
+            }
+        }
+
+        fn with_retry_on_first_call(self) -> Self {
+            self.fail_first.store(true, Ordering::Relaxed);
+            self
+        }
+
+        fn with_mismatched_destination(mut self) -> Self {
+            self.mismatch = true;
+            self
+        }
+
+        fn remote_path(&self, relative: &Path) -> PathBuf {
+            self.remote_root.join(relative)
+        }
+    }
+
+    impl SshRemotePrecheckProbe for FakeSshBackend {
+        fn probe(
+            &self,
+            _peer: &SshPeer,
+            _credential: &ResolvedSshCredential,
+            _host_permit: &crate::SshHostTrustPermit,
+            _request: &RemotePrecheckRequest,
+        ) -> Result<RemotePrecheckObservation, crate::PrecheckError> {
+            self.prechecks.fetch_add(1, Ordering::Relaxed);
+            Ok(RemotePrecheckObservation::new(
+                true,
+                AccessSnapshot::new(true, true, true),
+                RemoteRsyncCapability::Compatible,
+                RemoteSha256Capability::Available,
+                RemoteTrashCapability::unavailable(),
+            ))
+        }
+    }
+
+    impl SshHostIdentityProbe for FakeSshBackend {
+        fn probe(&self, _peer: &SshPeer) -> Result<SshHostFingerprint, SshHostIdentityError> {
+            Ok(SshHostFingerprint::sha256([9; 32]))
+        }
+    }
+
+    impl SshRunBackend for FakeSshBackend {
+        fn inventory(
+            &self,
+            peer: &SshPeer,
+            _credential: &ResolvedSshCredential,
+            _host_permit: &crate::SshHostTrustPermit,
+            exclusions: &[String],
+        ) -> Result<crate::SourceInventory, SshRunError> {
+            let backing_peer = Peer::new("remote backing", self.remote_root.clone());
+            let inventory = FreshAnalysis::collect_local_inventory(&backing_peer, exclusions)
+                .map_err(|_| SshRunError::RemoteUnavailable)?;
+            Ok(crate::SourceInventory::from_items(
+                "SSH peer",
+                peer.remote_path().to_path_buf(),
+                inventory.items().to_vec(),
+            ))
+        }
+
+        fn transfer(
+            &self,
+            request: &SshTransferRequest<'_>,
+            should_cancel: &dyn Fn() -> bool,
+            progress: &mut dyn FnMut(u64),
+        ) -> Result<SshTransferEvidence, SshRunError> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail_first.load(Ordering::Relaxed) && call == 0 {
+                return Err(SshRunError::Disconnected {
+                    boundary: SshTransferBoundary::BeforeTransfer,
+                });
+            }
+            if should_cancel() {
+                return Err(SshRunError::Cancelled);
+            }
+            let _rsync = request
+                .rsync_invocation()
+                .map_err(|_| SshRunError::InvalidOperation)?;
+            if !_rsync.arguments().iter().any(|argument| {
+                argument.to_string_lossy().starts_with("--rsh=ssh ")
+            }) {
+                return Err(SshRunError::InvalidOperation);
+            }
+            if !_rsync.arguments().iter().any(|argument| {
+                argument
+                    .to_string_lossy()
+                    .contains(".syncplus-temporary-")
+            }) {
+                return Err(SshRunError::InvalidOperation);
+            }
+            let _helper = request
+                .remote_sha256_invocation(
+                    &request
+                        .remote_peer()
+                        .remote_path()
+                        .join(request.action().relative_path()),
+                )
+                .map_err(|_| SshRunError::InvalidOperation)?;
+
+            let source = if request.source_peer().is_ssh() {
+                self.remote_path(request.action().relative_path())
+            } else {
+                request
+                    .source_peer()
+                    .root()
+                    .join(request.action().relative_path())
+            };
+            let destination = if request.destination_peer().is_ssh() {
+                self.remote_path(request.action().relative_path())
+            } else {
+                request
+                    .destination_peer()
+                    .root()
+                    .join(request.action().relative_path())
+            };
+            let temporary = if request.destination_peer().is_ssh() {
+                let relative = request
+                    .temporary_destination()
+                    .strip_prefix(request.remote_peer().remote_path())
+                    .map_err(|_| SshRunError::InvalidOperation)?;
+                self.remote_root.join(relative)
+            } else {
+                request.temporary_destination().to_path_buf()
+            };
+            let previous = if request.destination_peer().is_ssh() {
+                let relative = request
+                    .previous_destination()
+                    .strip_prefix(request.remote_peer().remote_path())
+                    .map_err(|_| SshRunError::InvalidOperation)?;
+                self.remote_root.join(relative)
+            } else {
+                request.previous_destination().to_path_buf()
+            };
+            let source_proof = ContentProof::from_path(&source)
+                .map_err(|_| SshRunError::SourceChanged)?;
+            if let Some(parent) = temporary.parent() {
+                fs::create_dir_all(parent).map_err(|_| SshRunError::RemoteUnavailable)?;
+            }
+            fs::copy(&source, &temporary).map_err(|_| SshRunError::RemoteUnavailable)?;
+            let temporary_proof = ContentProof::from_path(&temporary)
+                .map_err(|_| SshRunError::RemoteVerificationUnavailable {
+                    boundary: SshTransferBoundary::TemporaryDestination,
+                })?;
+            if destination.exists() {
+                fs::rename(&destination, &previous).map_err(|_| SshRunError::Disconnected {
+                    boundary: SshTransferBoundary::DestinationInstalled,
+                })?;
+            }
+            fs::rename(&temporary, &destination).map_err(|_| SshRunError::Disconnected {
+                boundary: SshTransferBoundary::DestinationInstalled,
+            })?;
+            let destination_proof = ContentProof::from_path(&destination)
+                .map_err(|_| SshRunError::RemoteVerificationUnavailable {
+                    boundary: SshTransferBoundary::DestinationInstalled,
+                })?;
+            progress(source_proof.size());
+            let destination_proof = if self.mismatch {
+                ContentProof::new(destination_proof.size(), [0; 32])
+            } else {
+                destination_proof
+            };
+            Ok(SshTransferEvidence::with_paths(
+                request
+                    .source_peer()
+                    .root()
+                    .join(request.action().relative_path()),
+                request.destination().to_path_buf(),
+                Some(ssh_metadata(&source)),
+                Some(ssh_metadata(&destination)),
+                Some(source_proof),
+                Some(destination_proof),
+                true,
+                temporary_proof.size(),
+            ))
+        }
+    }
+
+    fn ssh_profile(fixture: &Fixture, source_is_remote: bool) -> (SyncProfile, SshPeer) {
+        let ssh = SshPeer::new(
+            "backup.example.test",
+            "sync-user",
+            2222,
+            None,
+            SshAuthentication::Agent,
+            "/srv/sync",
+        )
+        .expect("SSH fixture should be valid");
+        let profile = SyncProfile::new(
+            if source_is_remote { "SSH pull" } else { "SSH push" },
+            Peer::new("local", if source_is_remote { fixture.destination() } else { fixture.source() }),
+            Peer::from_ssh("SSH peer", ssh.clone()),
+        )
+        .with_source(if source_is_remote {
+            OneWaySource::PeerB
+        } else {
+            OneWaySource::PeerA
+        });
+        (profile, ssh)
+    }
+
+    fn ssh_permits(
+        profile: &SyncProfile,
+        ssh: &SshPeer,
+    ) -> (ResolvedSshCredential, crate::SshHostTrustPermit, crate::RemotePrecheckPermit) {
+        let credential = ResolvedSshCredential::Agent;
+        let mut controller = SshHostTrustController::new(
+            RunEvidenceStore::open_in_memory().expect("host trust store"),
+        );
+        let host_probe = FixedSshHostProbe(SshHostFingerprint::sha256([9; 32]));
+        let decision = controller
+            .inspect(ssh, &host_probe)
+            .expect("host identity inspection");
+        controller
+            .approve(ssh, &decision, crate::HostTrustMode::Interactive)
+            .expect("host identity approval");
+        let host_permit = controller
+            .pre_mutation_permit(ssh, &host_probe)
+            .expect("approved host permit");
+        let (_, request) = RemotePrecheckRequest::from_profile(profile)
+            .expect("SSH profile should derive remote precheck");
+        let observation = RemotePrecheckObservation::new(
+            true,
+            AccessSnapshot::new(true, true, true),
+            RemoteRsyncCapability::Compatible,
+            RemoteSha256Capability::Available,
+            RemoteTrashCapability::unavailable(),
+        );
+        struct PassingRemoteProbe(RemotePrecheckObservation);
+        impl SshRemotePrecheckProbe for PassingRemoteProbe {
+            fn probe(
+                &self,
+                _peer: &SshPeer,
+                _credential: &ResolvedSshCredential,
+                _host_permit: &crate::SshHostTrustPermit,
+                _request: &RemotePrecheckRequest,
+            ) -> Result<RemotePrecheckObservation, crate::PrecheckError> {
+                Ok(self.0.clone())
+            }
+        }
+        let permit = SshRemotePrecheck::check(
+            ssh,
+            &credential,
+            &host_permit,
+            &request,
+            &PassingRemoteProbe(observation),
+        )
+        .expect("remote precheck should complete")
+        .require_passed()
+        .expect("remote precheck should pass");
+        (credential, host_permit, permit)
     }
 
     #[test]
@@ -3018,5 +4007,155 @@ mod tests {
             RunReportStatus::Interrupted
         ));
         assert_eq!(fs::read(fixture.destination().join("b.txt")).expect("b destination"), b"remaining work");
+    }
+
+    #[test]
+    fn ssh_push_retries_transport_and_persists_verified_remote_content() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.source()).expect("local source");
+        fs::create_dir_all(fixture.remote()).expect("remote backing");
+        write_file(&fixture.source().join("report.txt"), b"remote-safe transfer");
+        let (profile, ssh) = ssh_profile(&fixture, false);
+        let (credential, host_permit, precheck) = ssh_permits(&profile, &ssh);
+        let backend = FakeSshBackend::new(fixture.remote()).with_retry_on_first_call();
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute_ssh(
+                RunId::new(1),
+                &profile,
+                &credential,
+                &host_permit,
+                &precheck,
+                &backend,
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("SSH push should complete");
+
+        assert_eq!(report.status(), RunReportStatus::Completed, "report: {report:?}");
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(backend.prechecks.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            fs::read(fixture.remote().join("report.txt")).expect("remote destination"),
+            b"remote-safe transfer"
+        );
+        assert!(fixture.source().join("report.txt").exists());
+        assert!(report.snapshot().profile().peer_b().is_ssh());
+        assert!(report.items()[0].journal().transfer_evidence().is_some());
+    }
+
+    #[test]
+    fn ssh_pull_uses_the_same_confirmed_workflow_and_preserves_remote_source() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.destination()).expect("local destination");
+        fs::create_dir_all(fixture.remote()).expect("remote backing");
+        write_file(&fixture.remote().join("report.txt"), b"remote source");
+        let (profile, ssh) = ssh_profile(&fixture, true);
+        let (credential, host_permit, precheck) = ssh_permits(&profile, &ssh);
+        let backend = FakeSshBackend::new(fixture.remote());
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute_ssh(
+                RunId::new(1),
+                &profile,
+                &credential,
+                &host_permit,
+                &precheck,
+                &backend,
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("SSH pull should complete");
+
+        assert_eq!(report.status(), RunReportStatus::Completed, "report: {report:?}");
+        assert_eq!(backend.prechecks.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            fs::read(fixture.destination().join("report.txt")).expect("local destination"),
+            b"remote source"
+        );
+        assert!(fixture.remote().join("report.txt").exists());
+        assert!(report.snapshot().profile().peer_b().is_ssh());
+    }
+
+    #[test]
+    fn ssh_destination_digest_mismatch_keeps_the_action_unresolved_and_source_present() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.source()).expect("local source");
+        fs::create_dir_all(fixture.remote()).expect("remote backing");
+        write_file(&fixture.source().join("report.txt"), b"must remain");
+        let (profile, ssh) = ssh_profile(&fixture, false);
+        let (credential, host_permit, precheck) = ssh_permits(&profile, &ssh);
+        let backend = FakeSshBackend::new(fixture.remote()).with_mismatched_destination();
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute_ssh(
+                RunId::new(1),
+                &profile,
+                &credential,
+                &host_permit,
+                &precheck,
+                &backend,
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("a mismatch should return a reviewable report");
+
+        assert_eq!(report.status(), RunReportStatus::CompletedWithReviewRequired);
+        assert!(matches!(
+            report.items()[0].outcome(),
+            ActionOutcome::Unresolved(ActionReason::VerificationMismatch)
+        ));
+        assert!(fixture.source().join("report.txt").exists());
+    }
+
+    #[test]
+    fn ssh_resume_reanalyzes_after_cancellation_before_starting_new_transfer() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.source()).expect("local source");
+        fs::create_dir_all(fixture.remote()).expect("remote backing");
+        write_file(&fixture.source().join("report.txt"), b"resume me");
+        let (profile, ssh) = ssh_profile(&fixture, false);
+        let (credential, host_permit, precheck) = ssh_permits(&profile, &ssh);
+        let backend = FakeSshBackend::new(fixture.remote());
+        let workflow = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")));
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let cancelled = workflow
+            .execute_ssh(
+                RunId::new(1),
+                &profile,
+                &credential,
+                &host_permit,
+                &precheck,
+                &backend,
+                |_| true,
+                &mut store,
+                || true,
+            )
+            .expect("cancellation should produce a report");
+        assert_eq!(cancelled.status(), RunReportStatus::Cancelled);
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
+
+        let resumed = workflow
+            .resume_ssh(
+                RunId::new(1),
+                &credential,
+                &host_permit,
+                &precheck,
+                &backend,
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("resume should repeat SSH Fresh Analysis and transfer");
+        assert_eq!(resumed.run_id(), RunId::new(2));
+        assert_eq!(resumed.status(), RunReportStatus::Completed, "report: {resumed:?}");
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
     }
 }

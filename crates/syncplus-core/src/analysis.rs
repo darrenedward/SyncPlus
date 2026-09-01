@@ -28,6 +28,22 @@ pub struct ItemMetadata {
 }
 
 impl ItemMetadata {
+    pub fn new(
+        size: u64,
+        modified_at: Option<SystemTime>,
+        readonly: bool,
+        permissions: Option<u32>,
+        symlink_target: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            size,
+            modified_at,
+            readonly,
+            permissions,
+            symlink_target,
+        }
+    }
+
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -77,6 +93,22 @@ pub struct InventoryItem {
 }
 
 impl InventoryItem {
+    pub fn new(
+        relative_path: impl Into<PathBuf>,
+        item_type: ItemType,
+        metadata: ItemMetadata,
+        outcome: AnalysisOutcome,
+        content_fingerprint: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            relative_path: relative_path.into(),
+            item_type,
+            metadata,
+            outcome,
+            content_fingerprint,
+        }
+    }
+
     pub fn relative_path(&self) -> &Path {
         &self.relative_path
     }
@@ -154,6 +186,33 @@ pub struct SourceInventory {
 pub type PeerInventory = SourceInventory;
 
 impl SourceInventory {
+    pub fn from_items(
+        peer_name: impl Into<String>,
+        root: impl Into<PathBuf>,
+        mut items: Vec<InventoryItem>,
+    ) -> Self {
+        items.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        let included_paths = items
+            .iter()
+            .filter(|item| item.outcome == AnalysisOutcome::Included)
+            .map(|item| item.relative_path.clone())
+            .collect();
+        let excluded_paths = items
+            .iter()
+            .filter(|item| item.outcome == AnalysisOutcome::Excluded)
+            .map(|item| item.relative_path.clone())
+            .collect();
+        Self {
+            peer_name: peer_name.into(),
+            root: root.into(),
+            items,
+            approved_scope: ApprovedSyncScope {
+                included_paths,
+                excluded_paths,
+            },
+        }
+    }
+
     pub fn peer_name(&self) -> &str {
         &self.peer_name
     }
@@ -589,13 +648,21 @@ impl FreshAnalysis {
             .collect();
         let source_inventory = collect_inventory(source, &exclusions)?;
         let destination_inventory = collect_inventory(destination, &exclusions)?;
+        Self::from_inventories(profile, specification, source_inventory, destination_inventory)
+    }
+
+    pub(crate) fn from_inventories(
+        profile: &SyncProfile,
+        specification: ProcessSpecification,
+        source_inventory: SourceInventory,
+        destination_inventory: PeerInventory,
+    ) -> Result<Self, AnalysisError> {
         let plan = build_plan(
             specification.clone(),
             source_inventory.clone(),
             destination_inventory.clone(),
         )?;
         let revision = AnalysisRevision::from_inventories(&source_inventory, &destination_inventory);
-
         Ok(Self {
             profile: profile.clone(),
             specification,
@@ -604,6 +671,13 @@ impl FreshAnalysis {
             plan,
             revision,
         })
+    }
+
+    pub(crate) fn collect_local_inventory(
+        peer: &crate::Peer,
+        exclusions: &[String],
+    ) -> Result<SourceInventory, AnalysisError> {
+        collect_inventory(peer, exclusions)
     }
 
     pub fn specification(&self) -> &ProcessSpecification {
@@ -714,6 +788,18 @@ impl FreshAnalysis {
         }
 
         let refreshed = Self::analyze(current_profile)?;
+        self.confirm_refreshed(current_profile, &refreshed)
+    }
+
+    pub(crate) fn confirm_refreshed(
+        &self,
+        current_profile: &SyncProfile,
+        refreshed: &FreshAnalysis,
+    ) -> Result<ConfirmedPlan, AnalysisError> {
+        if self.profile != *current_profile {
+            return Err(AnalysisError::ProfileChanged);
+        }
+
         let mut changed_paths = self.revision.changed_paths(&refreshed.revision);
         if self.plan.actions != refreshed.plan.actions {
             changed_paths.extend(

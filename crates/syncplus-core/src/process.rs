@@ -80,6 +80,22 @@ impl SshTarget {
         }
     }
 
+    fn from_peer_at(peer: &SshPeer, relative_path: &Path) -> Result<Self, ProcessSpecError> {
+        validate_relative_transfer_path(relative_path)?;
+        let mut remote_path = peer.remote_path().to_path_buf();
+        remote_path.push(relative_path);
+        Self::from_peer_path(peer, remote_path)
+    }
+
+    fn from_peer_path(peer: &SshPeer, remote_path: PathBuf) -> Result<Self, ProcessSpecError> {
+        validate_peer_path("remote target", &remote_path)?;
+        Ok(Self {
+            username: peer.username().to_owned(),
+            server: peer.server().to_owned(),
+            remote_path,
+        })
+    }
+
     pub fn username(&self) -> &str {
         &self.username
     }
@@ -140,6 +156,118 @@ pub struct ProcessInvocation {
     secret_bindings: Vec<EnvironmentBinding>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteHelperKind {
+    Sha256,
+}
+
+/// A fixed SSH helper invocation. The remote command is selected by this
+/// enum, never supplied by a caller; the only user-controlled value is the
+/// safely shell-encoded path passed to that fixed helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteHelperInvocation {
+    kind: RemoteHelperKind,
+    path: PathBuf,
+    invocation: ProcessInvocation,
+}
+
+impl RemoteHelperInvocation {
+    pub fn sha256_with_permit(
+        peer: &SshPeer,
+        permit: &crate::SshHostTrustPermit,
+        path: impl Into<PathBuf>,
+    ) -> Result<Self, ProcessSpecError> {
+        if permit.host() != &crate::SshHost::from_peer(peer) {
+            return Err(ProcessSpecError::HostTrustPermitMismatch);
+        }
+        Self::sha256(peer, path)
+    }
+
+    pub fn sha256(peer: &SshPeer, path: impl Into<PathBuf>) -> Result<Self, ProcessSpecError> {
+        let path = path.into();
+        validate_peer_path("remote helper path", &path)?;
+        let mut arguments = Vec::new();
+        arguments.extend([OsString::from("-p"), OsString::from(peer.port().to_string())]);
+        match peer.authentication() {
+            crate::SshAuthentication::Key => {
+                arguments.extend([
+                    OsString::from("-o"),
+                    OsString::from("IdentitiesOnly=yes"),
+                    OsString::from("-o"),
+                    OsString::from("IdentityAgent=none"),
+                    OsString::from("-o"),
+                    OsString::from("PreferredAuthentications=publickey"),
+                    OsString::from("-o"),
+                    OsString::from("PasswordAuthentication=no"),
+                    OsString::from("-o"),
+                    OsString::from("KbdInteractiveAuthentication=no"),
+                ]);
+                let identity = peer
+                    .identity()
+                    .ok_or(ProcessSpecError::UnsupportedSshTopology)?;
+                arguments.extend([OsString::from("-i"), identity.as_os_str().to_os_string()]);
+            }
+            crate::SshAuthentication::Agent => {
+                arguments.extend([
+                    OsString::from("-o"),
+                    OsString::from("IdentityFile=none"),
+                    OsString::from("-o"),
+                    OsString::from("PreferredAuthentications=publickey"),
+                    OsString::from("-o"),
+                    OsString::from("PasswordAuthentication=no"),
+                    OsString::from("-o"),
+                    OsString::from("KbdInteractiveAuthentication=no"),
+                ]);
+            }
+            crate::SshAuthentication::InteractivePassword
+            | crate::SshAuthentication::SavedPassword(_) => {
+                arguments.extend([
+                    OsString::from("-o"),
+                    OsString::from("IdentityFile=none"),
+                    OsString::from("-o"),
+                    OsString::from("IdentityAgent=none"),
+                    OsString::from("-o"),
+                    OsString::from("PreferredAuthentications=keyboard-interactive,password"),
+                    OsString::from("-o"),
+                    OsString::from("PasswordAuthentication=yes"),
+                    OsString::from("-o"),
+                    OsString::from("KbdInteractiveAuthentication=yes"),
+                ]);
+            }
+        }
+        arguments.push(OsString::from(format!(
+            "{}@{}",
+            peer.username(),
+            peer.server()
+        )));
+        arguments.push(OsString::from(format!(
+            "sha256sum -- {}",
+            encode_remote_shell_word(&path)
+        )));
+        Ok(Self {
+            kind: RemoteHelperKind::Sha256,
+            path,
+            invocation: ProcessInvocation {
+                program: OsString::from("ssh"),
+                arguments,
+                secret_bindings: Vec::new(),
+            },
+        })
+    }
+
+    pub const fn kind(&self) -> RemoteHelperKind {
+        self.kind
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn invocation(&self) -> &ProcessInvocation {
+        &self.invocation
+    }
+}
+
 impl ProcessInvocation {
     pub fn program(&self) -> &OsStr {
         &self.program
@@ -183,6 +311,7 @@ pub enum ProcessSpecError {
     ActionSourceMismatch,
     InvalidTransferPath { path: PathBuf },
     InvalidRetryPolicy { max_attempts: u8 },
+    HostTrustPermitMismatch,
 }
 
 impl fmt::Display for ProcessSpecError {
@@ -227,6 +356,9 @@ impl fmt::Display for ProcessSpecError {
             }
             Self::InvalidRetryPolicy { max_attempts } => {
                 write!(formatter, "retry policy must allow between 1 and 10 attempts, got {max_attempts}")
+            }
+            Self::HostTrustPermitMismatch => {
+                formatter.write_str("SSH host-trust permit does not match the remote endpoint")
             }
         }
     }
@@ -315,6 +447,8 @@ pub struct ProcessSpecification {
     peer_a_root: PathBuf,
     peer_b_root: PathBuf,
     ssh_transport: Option<SshTransport>,
+    peer_a_ssh: Option<SshPeer>,
+    peer_b_ssh: Option<SshPeer>,
 }
 
 impl ProcessSpecification {
@@ -389,6 +523,8 @@ impl ProcessSpecification {
             peer_a_root: profile.peer_a().root().to_path_buf(),
             peer_b_root: profile.peer_b().root().to_path_buf(),
             ssh_transport,
+            peer_a_ssh: profile.peer_a().ssh_peer().cloned(),
+            peer_b_ssh: profile.peer_b().ssh_peer().cloned(),
         })
     }
 
@@ -488,6 +624,120 @@ impl ProcessSpecification {
             },
             secret_bindings: Vec::new(),
         })
+    }
+
+    /// Build the per-item rsync invocation for one local/SSH direction. The
+    /// remote endpoint remains one typed rsync target argument; no shell or
+    /// arbitrary remote command is introduced at this boundary.
+    pub fn ssh_item_invocation(
+        &self,
+        action: &PlanAction,
+    ) -> Result<ProcessInvocation, ProcessSpecError> {
+        let destination_side = action.source_side().opposite();
+        let destination_root = match destination_side {
+            PeerSide::PeerA => &self.peer_a_root,
+            PeerSide::PeerB => &self.peer_b_root,
+        };
+        let destination = destination_root.join(action.relative_path());
+        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        let name = destination
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed("item"));
+        let staging = parent.join(format!(
+            ".syncplus-temporary-0-{}-{name}",
+            action.action_id()
+        ));
+        self.ssh_item_invocation_to(action, &staging)
+    }
+
+    /// Build a typed SSH rsync invocation whose destination is an explicitly
+    /// selected staging path. The caller must use the same validated plan
+    /// action and only install the final destination after independent proof.
+    pub fn ssh_item_invocation_to(
+        &self,
+        action: &PlanAction,
+        destination: &Path,
+    ) -> Result<ProcessInvocation, ProcessSpecError> {
+        if self.ssh_transport.is_none() {
+            return Err(ProcessSpecError::UnsupportedSshFilesystemOperation);
+        }
+        if !matches!(
+            action.kind(),
+            PlanActionKind::CopyToDestination | PlanActionKind::OverwriteDestination
+        ) {
+            return Err(ProcessSpecError::ActionNotAllowed {
+                kind: action.kind(),
+            });
+        }
+        validate_relative_transfer_path(action.relative_path())?;
+        let mut arguments = vec![
+            ProcessArgument::Flag(RsyncFlag::Archive).to_os_string(),
+            ProcessArgument::Flag(RsyncFlag::ItemizeChanges).to_os_string(),
+        ];
+        if self.options.specialist_metadata().access_control_lists() {
+            arguments.push(ProcessArgument::Flag(RsyncFlag::Acls).to_os_string());
+        }
+        if self.options.specialist_metadata().extended_attributes() {
+            arguments.push(ProcessArgument::Flag(RsyncFlag::Xattrs).to_os_string());
+        }
+        if let Some(transport) = &self.ssh_transport {
+            arguments.push(ProcessArgument::SshTransport(transport.clone()).to_os_string());
+        }
+        arguments.push(ProcessArgument::Flag(RsyncFlag::EndOfOptions).to_os_string());
+        arguments.push(
+            self.peer_argument_at(action.source_side(), action.relative_path())?
+                .to_os_string(),
+        );
+        arguments.push(
+            self.peer_argument_at_path(action.source_side().opposite(), destination)?
+                .to_os_string(),
+        );
+        Ok(ProcessInvocation {
+            program: OsString::from("rsync"),
+            arguments,
+            secret_bindings: self.secret_bindings.clone(),
+        })
+    }
+
+    fn peer_argument_at(
+        &self,
+        side: PeerSide,
+        relative_path: &Path,
+    ) -> Result<ProcessArgument, ProcessSpecError> {
+        validate_relative_transfer_path(relative_path)?;
+        let root = match side {
+            PeerSide::PeerA => &self.peer_a_root,
+            PeerSide::PeerB => &self.peer_b_root,
+        };
+        let ssh_peer = match side {
+            PeerSide::PeerA => self.peer_a_ssh.as_ref(),
+            PeerSide::PeerB => self.peer_b_ssh.as_ref(),
+        };
+        match ssh_peer {
+            Some(peer) => Ok(ProcessArgument::RemotePeerPath(
+                SshTarget::from_peer_at(peer, relative_path)?,
+            )),
+            None => Ok(ProcessArgument::PeerPath(root.join(relative_path))),
+        }
+    }
+
+    fn peer_argument_at_path(
+        &self,
+        side: PeerSide,
+        path: &Path,
+    ) -> Result<ProcessArgument, ProcessSpecError> {
+        validate_peer_path("transfer destination", path)?;
+        let ssh_peer = match side {
+            PeerSide::PeerA => self.peer_a_ssh.as_ref(),
+            PeerSide::PeerB => self.peer_b_ssh.as_ref(),
+        };
+        match ssh_peer {
+            Some(peer) => Ok(ProcessArgument::RemotePeerPath(
+                SshTarget::from_peer_path(peer, path.to_path_buf())?,
+            )),
+            None => Ok(ProcessArgument::PeerPath(path.to_path_buf())),
+        }
     }
 
     pub(crate) fn transfer_paths(

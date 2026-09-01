@@ -102,6 +102,10 @@ impl ControlledTransfer {
         Self { supervisor }
     }
 
+    pub(crate) const fn supervisor(&self) -> &ProcessSupervisor {
+        &self.supervisor
+    }
+
     pub fn execute<F>(
         &self,
         plan: &OneWayPlan,
