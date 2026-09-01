@@ -104,6 +104,12 @@ enum ActionDisposition {
     Stop,
 }
 
+#[derive(Debug)]
+enum SshTransferExecutionError {
+    Remote(SshRunError),
+    Journal(StorageError),
+}
+
 impl RunWorkflow {
     pub fn new(recovery_method: RecoveryMethod) -> Self {
         Self {
@@ -876,17 +882,25 @@ impl RunWorkflow {
         match action.kind() {
             PlanActionKind::CopyToDestination | PlanActionKind::OverwriteDestination => {
                 let evidence = match self.run_ssh_transfer(
+                    run_id,
+                    action.action_id(),
                     plan.specification().options().retry_policy(),
                     &request,
                     backend,
                     should_cancel,
+                    store,
                 ) {
-                    Ok((evidence, progress)) => {
-                        self.persist_progress(run_id, action.action_id(), progress, store)?;
-                        evidence
+                    Ok(evidence) => evidence,
+                    Err(SshTransferExecutionError::Journal(error)) => {
+                        return self.record_journal_failure(
+                            run_id,
+                            plan,
+                            action,
+                            WorkflowError::Storage(error),
+                            store,
+                        );
                     }
-                    Err((error, progress)) => {
-                        self.persist_progress(run_id, action.action_id(), progress, store)?;
+                    Err(SshTransferExecutionError::Remote(error)) => {
                         return self.record_ssh_failure(run_id, action, error, store);
                     }
                 };
@@ -894,38 +908,69 @@ impl RunWorkflow {
                 if !evidence.matches_request(&request)
                     || !evidence.matches_inventory(item, plan.specification().options().metadata())
                 {
-                    store.append_event(
+                    if let Err(error) = store.append_event(
                         run_id,
                         JournalEvent::Unresolved {
                             action_id: action.action_id(),
                             reason: ActionReason::VerificationMismatch,
                         },
-                    )?;
+                    ) {
+                        return self.record_journal_failure(
+                            run_id,
+                            plan,
+                            action,
+                            WorkflowError::Storage(error),
+                            store,
+                        );
+                    }
                     return Ok(ActionDisposition::Continue);
                 }
-                if item.item_type() == crate::ItemType::RegularFile {
-                    let proof = evidence.recovery_evidence(current_unix_nanos()).ok_or_else(|| {
-                        WorkflowError::InvalidRun(
-                            "a verified regular-file SSH transfer has no content evidence"
-                                .to_owned(),
+                let proof = match evidence.recovery_evidence(current_unix_nanos()) {
+                    Some(proof) => proof,
+                    None => {
+                        return self.record_journal_failure(
+                            run_id,
+                            plan,
+                            action,
+                            WorkflowError::InvalidRun(
+                                "a verified SSH transfer has no metadata or content evidence"
+                                    .to_owned(),
+                            ),
+                            store,
                         )
-                    })?;
-                    store.append_event(
+                    }
+                };
+                if let Err(error) = store.append_event(
+                    run_id,
+                    JournalEvent::TransferVerified {
+                        action_id: action.action_id(),
+                        evidence: proof,
+                        metadata_verified: evidence.metadata_verified(),
+                    },
+                ) {
+                    return self.record_journal_failure(
                         run_id,
-                        JournalEvent::TransferVerified {
-                            action_id: action.action_id(),
-                            evidence: proof,
-                            metadata_verified: evidence.metadata_verified(),
-                        },
-                    )?;
+                        plan,
+                        action,
+                        WorkflowError::Storage(error),
+                        store,
+                    );
                 }
                 verified_transfers.insert(action.relative_path().to_path_buf(), evidence);
-                store.append_event(
+                if let Err(error) = store.append_event(
                     run_id,
                     JournalEvent::Completed {
                         action_id: action.action_id(),
                     },
-                )?;
+                ) {
+                    return self.record_journal_failure(
+                        run_id,
+                        plan,
+                        action,
+                        WorkflowError::Storage(error),
+                        store,
+                    );
+                }
                 Ok(ActionDisposition::Continue)
             }
             PlanActionKind::RemoveSourceAfterVerification => {
@@ -935,17 +980,25 @@ impl RunWorkflow {
                     evidence
                 } else {
                     match self.run_ssh_transfer(
+                        run_id,
+                        action.action_id(),
                         plan.specification().options().retry_policy(),
                         &request,
                         backend,
                         should_cancel,
+                        store,
                     ) {
-                        Ok((evidence, progress)) => {
-                            self.persist_progress(run_id, action.action_id(), progress, store)?;
-                            evidence
+                        Ok(evidence) => evidence,
+                        Err(SshTransferExecutionError::Journal(error)) => {
+                            return self.record_journal_failure(
+                                run_id,
+                                plan,
+                                action,
+                                WorkflowError::Storage(error),
+                                store,
+                            );
                         }
-                        Err((error, progress)) => {
-                            self.persist_progress(run_id, action.action_id(), progress, store)?;
+                        Err(SshTransferExecutionError::Remote(error)) => {
                             return self.record_ssh_failure(run_id, action, error, store);
                         }
                     }
@@ -954,28 +1007,54 @@ impl RunWorkflow {
                 if !evidence.matches_request(&request)
                     || !evidence.matches_inventory(item, plan.specification().options().metadata())
                 {
-                    store.append_event(
+                    if let Err(error) = store.append_event(
                         run_id,
                         JournalEvent::Unresolved {
                             action_id: action.action_id(),
                             reason: ActionReason::VerificationMismatch,
                         },
-                    )?;
+                    ) {
+                        return self.record_journal_failure(
+                            run_id,
+                            plan,
+                            action,
+                            WorkflowError::Storage(error),
+                            store,
+                        );
+                    }
                     return Ok(ActionDisposition::Continue);
                 }
-                let proof = evidence.recovery_evidence(current_unix_nanos()).ok_or_else(|| {
-                    WorkflowError::InvalidRun(
-                        "a verified SSH removal has no source or destination evidence".to_owned(),
-                    )
-                })?;
-                store.append_event(
+                let proof = match evidence.recovery_evidence(current_unix_nanos()) {
+                    Some(proof) => proof,
+                    None => {
+                        return self.record_journal_failure(
+                            run_id,
+                            plan,
+                            action,
+                            WorkflowError::InvalidRun(
+                                "a verified SSH removal has no source or destination evidence"
+                                    .to_owned(),
+                            ),
+                            store,
+                        )
+                    }
+                };
+                if let Err(error) = store.append_event(
                     run_id,
                     JournalEvent::TransferVerified {
                         action_id: action.action_id(),
                         evidence: proof.clone(),
                         metadata_verified: evidence.metadata_verified(),
                     },
-                )?;
+                ) {
+                    return self.record_journal_failure(
+                        run_id,
+                        plan,
+                        action,
+                        WorkflowError::Storage(error),
+                        store,
+                    );
+                }
                 let Some(DeletionMethod::Trash) = request.deletion_method() else {
                     store.append_event(
                         run_id,
@@ -994,7 +1073,7 @@ impl RunWorkflow {
                         store,
                     );
                 }
-                store.append_event(
+                if let Err(error) = store.append_event(
                     run_id,
                     JournalEvent::ProofBoundary {
                         action_id: action.action_id(),
@@ -1002,7 +1081,15 @@ impl RunWorkflow {
                         evidence: proof,
                         metadata_verified: evidence.metadata_verified(),
                     },
-                )?;
+                ) {
+                    return self.record_journal_failure(
+                        run_id,
+                        plan,
+                        action,
+                        WorkflowError::Storage(error),
+                        store,
+                    );
+                }
                 if should_cancel() {
                     store.append_event(
                         run_id,
@@ -1022,7 +1109,7 @@ impl RunWorkflow {
                 match backend.recover_source(&request, &evidence, should_cancel) {
                     Ok(recovery) => {
                         if Self::validate_remote_recovery(&request, &evidence, &recovery) {
-                            store.append_event(
+                            if let Err(error) = store.append_event(
                                 run_id,
                                 JournalEvent::RemovalCompleted {
                                     action_id: action.action_id(),
@@ -1031,7 +1118,15 @@ impl RunWorkflow {
                                         recovery,
                                     ),
                                 },
-                            )?;
+                            ) {
+                                return self.record_journal_failure(
+                                    run_id,
+                                    plan,
+                                    action,
+                                    WorkflowError::Storage(error),
+                                    store,
+                                );
+                            }
                             Ok(ActionDisposition::Continue)
                         } else {
                             self.record_ssh_failure(
@@ -1054,32 +1149,51 @@ impl RunWorkflow {
 
     fn run_ssh_transfer<B>(
         &self,
+        run_id: RunId,
+        action_id: crate::ActionId,
         policy: RetryPolicy,
         request: &crate::SshTransferRequest<'_>,
         backend: &B,
         should_cancel: &dyn Fn() -> bool,
-    ) -> Result<(SshTransferEvidence, Vec<u64>), (SshRunError, Vec<u64>)>
+        store: &mut RunEvidenceStore,
+    ) -> Result<SshTransferEvidence, SshTransferExecutionError>
     where
         B: SshRunBackend,
     {
-        let mut progress = Vec::new();
         for attempt in 0..policy.max_attempts() {
             if should_cancel() {
-                return Err((SshRunError::Cancelled, progress));
+                return Err(SshTransferExecutionError::Remote(SshRunError::Cancelled));
             }
-            let mut report_progress = |bytes| progress.push(bytes);
-            match backend.transfer(request, should_cancel, &mut report_progress) {
-                Ok(evidence) => return Ok((evidence, progress)),
+            let mut journal_error = None;
+            let mut report_progress = |bytes| {
+                if journal_error.is_none() {
+                    journal_error = store
+                        .append_event(
+                            run_id,
+                            JournalEvent::Progress {
+                                action_id,
+                                completed_bytes: bytes,
+                            },
+                        )
+                        .err();
+                }
+            };
+            let result = backend.transfer(request, should_cancel, &mut report_progress);
+            if let Some(error) = journal_error {
+                return Err(SshTransferExecutionError::Journal(error));
+            }
+            match result {
+                Ok(evidence) => return Ok(evidence),
                 Err(error) if error.is_retryable() && attempt + 1 < policy.max_attempts() => {
                     let delay = policy
                         .initial_delay()
                         .checked_mul(u32::from(attempt + 1))
                         .unwrap_or(Duration::MAX);
                     if !sleep_interruptibly(delay, should_cancel) {
-                        return Err((SshRunError::Cancelled, progress));
+                        return Err(SshTransferExecutionError::Remote(SshRunError::Cancelled));
                     }
                 }
-                Err(error) => return Err((error, progress)),
+                Err(error) => return Err(SshTransferExecutionError::Remote(error)),
             }
         }
         unreachable!("a validated retry policy always has at least one attempt")
@@ -1993,7 +2107,7 @@ impl RunWorkflow {
 
         match action.kind() {
             PlanActionKind::CopyToDestination | PlanActionKind::OverwriteDestination => {
-                let mut progress = Vec::new();
+                let mut progress_error = None;
                 let result = self.retry_transfer(
                     plan.specification().options().retry_policy(),
                     should_cancel,
@@ -2002,24 +2116,76 @@ impl RunWorkflow {
                             plan,
                             action,
                             should_cancel,
-                            |bytes| progress.push(bytes),
+                            |bytes| {
+                                if progress_error.is_none() {
+                                    progress_error = store
+                                        .append_event(
+                                            run_id,
+                                            JournalEvent::Progress {
+                                                action_id: action.action_id(),
+                                                completed_bytes: bytes,
+                                            },
+                                        )
+                                        .err();
+                                }
+                            },
                         )
                     },
                 );
-                self.persist_progress(run_id, action.action_id(), progress, store)?;
+                if let Some(error) = progress_error {
+                    return self.record_journal_failure(
+                        run_id,
+                        plan,
+                        action,
+                        WorkflowError::Storage(error),
+                        store,
+                    );
+                }
                 match result {
                     Ok(replacement) => {
+                        let evidence = match local_transfer_evidence(&replacement) {
+                            Ok(evidence) => evidence,
+                            Err(error) => {
+                                return self.record_journal_failure(
+                                    run_id, plan, action, error, store,
+                                )
+                            }
+                        };
+                        if let Err(error) = store.append_event(
+                            run_id,
+                            JournalEvent::TransferVerified {
+                                action_id: action.action_id(),
+                                evidence,
+                                metadata_verified: true,
+                            },
+                        ) {
+                            return self.record_journal_failure(
+                                run_id,
+                                plan,
+                                action,
+                                WorkflowError::Storage(error),
+                                store,
+                            );
+                        }
                         if action.kind() == PlanActionKind::CopyToDestination
                             || plan.specification().options().safe_delete()
                         {
                             replacements.insert(action.relative_path().to_path_buf(), replacement);
                         }
-                        store.append_event(
+                        if let Err(error) = store.append_event(
                             run_id,
                             JournalEvent::Completed {
                                 action_id: action.action_id(),
                             },
-                        )?;
+                        ) {
+                            return self.record_journal_failure(
+                                run_id,
+                                plan,
+                                action,
+                                WorkflowError::Storage(error),
+                                store,
+                            );
+                        }
                         Ok(ActionDisposition::Continue)
                     }
                     Err(error) => self.record_transfer_failure(
@@ -2042,7 +2208,7 @@ impl RunWorkflow {
                         store,
                     );
                 }
-                let mut progress = Vec::new();
+                let mut progress_error = None;
                 let result = self.retry_transfer(
                     plan.specification().options().retry_policy(),
                     should_cancel,
@@ -2051,11 +2217,31 @@ impl RunWorkflow {
                             plan,
                             action,
                             should_cancel,
-                            |bytes| progress.push(bytes),
+                            |bytes| {
+                                if progress_error.is_none() {
+                                    progress_error = store
+                                        .append_event(
+                                            run_id,
+                                            JournalEvent::Progress {
+                                                action_id: action.action_id(),
+                                                completed_bytes: bytes,
+                                            },
+                                        )
+                                        .err();
+                                }
+                            },
                         )
                     },
                 );
-                self.persist_progress(run_id, action.action_id(), progress, store)?;
+                if let Some(error) = progress_error {
+                    return self.record_journal_failure(
+                        run_id,
+                        plan,
+                        action,
+                        WorkflowError::Storage(error),
+                        store,
+                    );
+                }
                 match result {
                     Ok(replacement) => {
                         self.settle_source_removal(
@@ -2170,23 +2356,26 @@ impl RunWorkflow {
         unreachable!("a validated retry policy always has at least one attempt")
     }
 
-    fn persist_progress(
+    fn record_journal_failure(
         &self,
         run_id: RunId,
-        action_id: u64,
-        progress: Vec<u64>,
+        plan: &OneWayPlan,
+        action: &PlanAction,
+        error: WorkflowError,
         store: &mut RunEvidenceStore,
-    ) -> Result<(), WorkflowError> {
-        for completed_bytes in progress {
-            store.append_event(
-                run_id,
-                JournalEvent::Progress {
-                    action_id,
-                    completed_bytes,
-                },
-            )?;
+    ) -> Result<ActionDisposition, WorkflowError> {
+        let review = store.append_event(
+            run_id,
+            JournalEvent::RecoveryReview {
+                action_id: action.action_id(),
+                reason: ActionReason::InterruptedBoundary,
+                evidence: observe_action_boundary(plan, action),
+            },
+        );
+        match review {
+            Ok(()) => Err(error),
+            Err(review_error) => Err(WorkflowError::Storage(review_error)),
         }
-        Ok(())
     }
 
     fn record_transfer_failure(
@@ -2260,9 +2449,8 @@ impl RunWorkflow {
                 continue;
             }
             let action = item.journal().plan();
-            if action.operation() == PlanActionKind::RemoveSourceAfterVerification
-                && (item.journal().transfer_evidence().is_some()
-                    || item.journal().proof_boundary().is_some())
+            if item.journal().transfer_evidence().is_some()
+                || item.journal().proof_boundary().is_some()
             {
                 store.append_event(
                     run_id,
@@ -2512,6 +2700,46 @@ where
             .expect("every resolution action has a journal id")
     }
 
+    fn boundary_evidence(
+        &self,
+        action: &ConflictResolutionAction,
+        analysis: &FreshAnalysis,
+    ) -> RecoveryEvidence {
+        let (Some(source_side), Some(target_side)) = (action.source_side(), action.target_side())
+        else {
+            return empty_recovery_evidence();
+        };
+        let source_root = match source_side {
+            crate::PeerSide::PeerA => analysis.profile().peer_a().root(),
+            crate::PeerSide::PeerB => analysis.profile().peer_b().root(),
+        };
+        let destination_root = match target_side {
+            crate::PeerSide::PeerA => analysis.profile().peer_a().root(),
+            crate::PeerSide::PeerB => analysis.profile().peer_b().root(),
+        };
+        observe_paths(
+            &source_root.join(action.relative_path()),
+            &destination_root.join(action.relative_path()),
+        )
+    }
+
+    fn record_recovery_review(
+        &mut self,
+        action: &ConflictResolutionAction,
+        analysis: &FreshAnalysis,
+    ) -> Result<(), ActionReason> {
+        self.store
+            .append_event(
+                self.run_id,
+                JournalEvent::RecoveryReview {
+                    action_id: self.action_id(action),
+                    reason: ActionReason::InterruptedBoundary,
+                    evidence: self.boundary_evidence(action, analysis),
+                },
+            )
+            .map_err(|_| ActionReason::InterruptedBoundary)
+    }
+
     fn start(&mut self, action: &ConflictResolutionAction) -> Result<crate::ActionId, ActionReason> {
         let action_id = self.action_id(action);
         self.store
@@ -2525,6 +2753,8 @@ where
 
     fn finish(
         &mut self,
+        action: &ConflictResolutionAction,
+        analysis: &FreshAnalysis,
         action_id: crate::ActionId,
         outcome: &Result<(), ActionReason>,
     ) -> Result<(), ActionReason> {
@@ -2535,9 +2765,10 @@ where
                 reason: *reason,
             },
         };
-        self.store
-            .append_event(self.run_id, event)
-            .map_err(|_| ActionReason::InterruptedBoundary)
+        if self.store.append_event(self.run_id, event).is_ok() {
+            return Ok(());
+        }
+        self.record_recovery_review(action, analysis)
     }
 }
 
@@ -2552,7 +2783,25 @@ where
     ) -> Result<(), ActionReason> {
         let action_id = self.start(action)?;
         let result = self.inner.execute(action, analysis);
-        if self.finish(action_id, &result).is_err() {
+        if result.is_ok() && action.operation() == crate::ResolutionOperation::CopyWholeFile {
+            let evidence = self.boundary_evidence(action, analysis);
+            if self
+                .store
+                .append_event(
+                    self.run_id,
+                    JournalEvent::TransferVerified {
+                        action_id,
+                        evidence,
+                        metadata_verified: true,
+                    },
+                )
+                .is_err()
+            {
+                let _ = self.record_recovery_review(action, analysis);
+                return Err(ActionReason::InterruptedBoundary);
+            }
+        }
+        if self.finish(action, analysis, action_id, &result).is_err() {
             return Err(ActionReason::InterruptedBoundary);
         }
         result
@@ -2760,6 +3009,26 @@ fn observe_journal_boundary(
     let source = source_root.join(action.relative_path());
     let destination = destination_root.join(action.relative_path());
     observe_paths(&source, &destination)
+}
+
+fn local_transfer_evidence(
+    replacement: &VerifiedReplacement,
+) -> Result<RecoveryEvidence, WorkflowError> {
+    let proof = replacement.proof();
+    let source_after = proof.source_after();
+    let destination = FileMetadataProof::capture(replacement.destination())?;
+    let installed_destination = proof.installed_destination_proof();
+    Ok(RecoveryEvidence::new(
+        current_unix_nanos(),
+        None,
+        true,
+        true,
+        false,
+        Some(source_after.metadata().size()),
+        Some(installed_destination.map_or(destination.size(), |proof| proof.size())),
+        source_after.content_proof().map(|proof| *proof.sha256()),
+        installed_destination.map(|proof| *proof.sha256()),
+    ))
 }
 
 fn observe_action_boundary(plan: &OneWayPlan, action: &PlanAction) -> RecoveryEvidence {
@@ -3890,6 +4159,182 @@ mod tests {
         drop(held);
     }
 
+    #[test]
+    fn local_transfer_persists_verified_evidence_in_the_run_report() {
+        let fixture = Fixture::new();
+        let source = fixture.source().join("verified.txt");
+        let destination = fixture.destination().join("verified.txt");
+        write_file(&source, b"verified local transfer");
+        fs::create_dir_all(fixture.destination()).expect("destination should be creatable");
+        let expected = ContentProof::from_path(&source).expect("source proof");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute(
+                RunId::new(1),
+                &fixture.profile(),
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("local transfer should complete");
+
+        let item = report
+            .items()
+            .first()
+            .expect("verified action should be reported");
+        let evidence = item
+            .journal()
+            .transfer_evidence()
+            .expect("ordinary local transfers must persist verification evidence");
+        assert_eq!(evidence.source_size(), Some(expected.size()));
+        assert_eq!(evidence.source_sha256(), Some(expected.sha256()));
+        assert_eq!(evidence.destination_size(), Some(expected.size()));
+        assert_eq!(evidence.destination_sha256(), Some(expected.sha256()));
+        assert!(destination.is_file());
+
+        drop(store);
+        let reopened = RunEvidenceStore::open(&fixture.database()).expect("reopen evidence store");
+        let persisted = reopened.load_report(RunId::new(1)).expect("persisted report");
+        assert!(persisted.items()[0].journal().transfer_evidence().is_some());
+    }
+
+    #[test]
+    fn local_completion_journal_failure_becomes_recovery_review() {
+        let fixture = Fixture::new();
+        let source = fixture.source().join("journal-boundary.txt");
+        let destination = fixture.destination().join("journal-boundary.txt");
+        write_file(&source, b"filesystem changed before journal failure");
+        fs::create_dir_all(fixture.destination()).expect("destination should be creatable");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+        store.fail_next_event_phase_for_test("completed");
+
+        let error = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute(
+                RunId::new(1),
+                &fixture.profile(),
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect_err("the injected journal failure must be surfaced");
+        assert!(matches!(error, super::WorkflowError::Storage(_)));
+        assert!(destination.is_file(), "the filesystem operation already happened");
+        assert!(source.is_file(), "the source must remain preserved");
+
+        let report = store
+            .load_report(RunId::new(1))
+            .expect("ambiguous report should remain readable");
+        assert_eq!(report.status(), RunReportStatus::RecoveryReview);
+        assert!(matches!(
+            report.items()[0].outcome(),
+            ActionOutcome::RecoveryReview(ActionReason::InterruptedBoundary)
+        ));
+    }
+
+    #[test]
+    fn an_open_verified_local_transfer_boundary_requires_recovery_review() {
+        let fixture = Fixture::new();
+        let source = fixture.source().join("open-boundary.txt");
+        let destination = fixture.destination().join("open-boundary.txt");
+        write_file(&source, b"open boundary");
+        write_file(&destination, b"open boundary");
+        let source_proof = ContentProof::from_path(&source).expect("source proof");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+        let run_id = RunId::new(1);
+        let plan = fixture.profile();
+        let snapshot = RunSnapshot::from_profile(run_id, &plan, AuthorizationSnapshot::default())
+            .expect("snapshot");
+        store.begin_run(&snapshot).expect("persist snapshot");
+        store
+            .append_event(
+                run_id,
+                JournalEvent::Planned {
+                    action: plan_record_for_source(1, &source, "open-boundary.txt"),
+                },
+            )
+            .expect("persist plan");
+        store
+            .append_event(run_id, JournalEvent::Started { action_id: 1 })
+            .expect("persist start");
+        store
+            .append_event(
+                run_id,
+                JournalEvent::TransferVerified {
+                    action_id: 1,
+                    evidence: RecoveryEvidence::new(
+                        1,
+                        None,
+                        true,
+                        true,
+                        false,
+                        Some(source_proof.size()),
+                        Some(source_proof.size()),
+                        Some(*source_proof.sha256()),
+                        Some(*source_proof.sha256()),
+                    ),
+                    metadata_verified: true,
+                },
+            )
+            .expect("persist verified boundary");
+
+        let report = store.load_report(run_id).expect("open boundary report");
+        RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .classify_open_actions(run_id, &plan, &report, &mut store)
+            .expect("classify open boundary");
+        let classified = store.load_report(run_id).expect("classified report");
+        assert_eq!(classified.status(), RunReportStatus::RecoveryReview);
+        assert!(matches!(
+            classified.items()[0].outcome(),
+            ActionOutcome::RecoveryReview(ActionReason::InterruptedBoundary)
+        ));
+    }
+
+    #[test]
+    fn sqlite_abort_after_local_install_keeps_the_run_in_recovery_review() {
+        let fixture = Fixture::new();
+        let source = fixture.source().join("sqlite-boundary.txt");
+        let destination = fixture.destination().join("sqlite-boundary.txt");
+        write_file(&source, b"SQLite boundary");
+        fs::create_dir_all(fixture.destination()).expect("destination should be creatable");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+        store
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER abort_completed_event
+                 BEFORE INSERT ON action_events
+                 WHEN NEW.phase = 'completed'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'simulated SQLite boundary failure');
+                 END;",
+            )
+            .expect("install SQLite failure trigger");
+
+        let error = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute(
+                RunId::new(1),
+                &fixture.profile(),
+                &LocalPrecheckProbe::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect_err("the SQLite boundary failure must be surfaced");
+        assert!(matches!(error, super::WorkflowError::Storage(_)));
+        assert!(destination.is_file(), "the filesystem operation already happened");
+
+        let report = store
+            .load_report(RunId::new(1))
+            .expect("SQLite rollback must leave readable evidence");
+        assert_eq!(report.status(), RunReportStatus::RecoveryReview);
+        assert!(matches!(
+            report.items()[0].outcome(),
+            ActionOutcome::RecoveryReview(ActionReason::InterruptedBoundary)
+        ));
+    }
+
     fn plan_record_for_source(action_id: u64, path: &Path, relative: &str) -> PlanRecord {
         let metadata = crate::FileMetadataProof::capture(path).expect("source metadata");
         let content = ContentProof::from_path(path).expect("source content");
@@ -4006,6 +4451,46 @@ mod tests {
         let persisted = reopened.load_report(RunId::new(1)).expect("load report");
         assert_eq!(persisted.mirror_resolutions(), report.mirror_resolutions());
         assert_eq!(persisted.status(), RunReportStatus::Completed);
+        assert!(persisted.items()[0].journal().transfer_evidence().is_some());
+    }
+
+    #[test]
+    fn resolution_journal_failure_after_transfer_requires_recovery_review() {
+        let fixture = Fixture::new();
+        write_file(&fixture.source().join("conflict.txt"), b"peer A");
+        write_file(&fixture.destination().join("conflict.txt"), b"peer B");
+        let profile = fixture.profile().with_mode(SyncMode::Mirror);
+        let resolution = crate::ResolutionRun::start(
+            &profile,
+            [crate::ConflictDecision::new(
+                "conflict.txt",
+                crate::ConflictResolution::KeepPeerA,
+            )],
+            None,
+        )
+        .expect("resolution review should start");
+        let mut store = RunEvidenceStore::open(&fixture.database()).expect("evidence store");
+        store.fail_next_event_phase_for_test("completed");
+
+        let report = RunWorkflow::new(RecoveryMethod::trash(fixture.root.join("trash")))
+            .execute_resolution_run(
+                RunId::new(1),
+                &resolution,
+                &profile,
+                None,
+                &LocalPrecheckProbe::default(),
+                |_, _| true,
+                &mut store,
+                || false,
+            )
+            .expect("ambiguous resolution should return its durable report");
+
+        assert_eq!(fs::read(fixture.destination().join("conflict.txt")).unwrap(), b"peer A");
+        assert_eq!(report.status(), RunReportStatus::RecoveryReview);
+        assert!(matches!(
+            report.items()[0].outcome(),
+            ActionOutcome::RecoveryReview(ActionReason::InterruptedBoundary)
+        ));
     }
 
     #[test]
