@@ -149,10 +149,20 @@ impl RunEvidenceStore {
         &mut self,
         profile: &SyncProfile,
     ) -> Result<PersistedSyncProfile, StorageError> {
+        self.create_profile_with_authorizations(profile, AuthorizationSnapshot::default())
+    }
+
+    pub fn create_profile_with_authorizations(
+        &mut self,
+        profile: &SyncProfile,
+        authorizations: AuthorizationSnapshot,
+    ) -> Result<PersistedSyncProfile, StorageError> {
         validate_profile(profile)?;
+        validate_authorizations(profile, authorizations)?;
+        self.reject_duplicate_endpoint_pair(profile, None)?;
         let values = ProfileValues::from_profile(profile);
         let transaction = self.connection_mut().transaction()?;
-        let id = insert_profile(&transaction, &values)?;
+        let id = insert_profile(&transaction, &values, authorizations)?;
         insert_exclusions(&transaction, id, profile)?;
         transaction.commit()?;
         let id = SyncProfileId::new(
@@ -162,7 +172,7 @@ impl RunEvidenceStore {
             id,
             profile: profile.clone(),
             schedule_enabled: false,
-            authorizations: AuthorizationSnapshot::default(),
+            authorizations,
         })
     }
 
@@ -171,13 +181,27 @@ impl RunEvidenceStore {
         id: SyncProfileId,
         profile: &SyncProfile,
     ) -> Result<PersistedSyncProfile, StorageError> {
+        let existing = self
+            .load_profile(id)?
+            .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
+        self.update_profile_with_authorizations(id, profile, existing.authorizations())
+    }
+
+    pub fn update_profile_with_authorizations(
+        &mut self,
+        id: SyncProfileId,
+        profile: &SyncProfile,
+        authorizations: AuthorizationSnapshot,
+    ) -> Result<PersistedSyncProfile, StorageError> {
         validate_profile(profile)?;
         let existing = self
             .load_profile(id)?
             .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
+        validate_authorizations(profile, authorizations)?;
+        self.reject_duplicate_endpoint_pair(profile, Some(id))?;
         let values = ProfileValues::from_profile(profile);
         let transaction = self.connection_mut().transaction()?;
-        let changed = update_profile_row(&transaction, id, &values)?;
+        let changed = update_profile_row(&transaction, id, &values, authorizations)?;
         if changed != 1 {
             return Err(StorageError::ProfileNotFound { id: id.value() });
         }
@@ -191,7 +215,7 @@ impl RunEvidenceStore {
             id,
             profile: profile.clone(),
             schedule_enabled: existing.schedule_enabled,
-            authorizations: existing.authorizations,
+            authorizations,
         })
     }
 
@@ -231,6 +255,22 @@ impl RunEvidenceStore {
         Ok(changed == 1)
     }
 
+    fn reject_duplicate_endpoint_pair(
+        &self,
+        profile: &SyncProfile,
+        excluded_id: Option<SyncProfileId>,
+    ) -> Result<(), StorageError> {
+        let duplicate = self.list_profiles()?.into_iter().any(|persisted| {
+            Some(persisted.id()) != excluded_id
+                && persisted.profile().peer_a().same_endpoint(profile.peer_a())
+                && persisted.profile().peer_b().same_endpoint(profile.peer_b())
+        });
+        if duplicate {
+            return Err(StorageError::DuplicateEndpointPair);
+        }
+        Ok(())
+    }
+
     fn materialize_profile(&self, raw: RawProfile) -> Result<PersistedSyncProfile, StorageError> {
         let exclusions = self.load_exclusions(raw.id)?;
         let id = SyncProfileId::new(
@@ -243,6 +283,7 @@ impl RunEvidenceStore {
             decode_profile_bool(raw.allow_unattended_permanent_removal)?,
         );
         let profile = raw.into_profile(exclusions)?;
+        validate_authorizations(&profile, authorizations)?;
         Ok(PersistedSyncProfile {
             id,
             profile,
@@ -378,7 +419,14 @@ impl PersistedPeer {
     }
 }
 
-fn insert_profile(transaction: &Transaction<'_>, values: &ProfileValues) -> Result<i64, StorageError> {
+fn insert_profile(
+    transaction: &Transaction<'_>,
+    values: &ProfileValues,
+    authorizations: AuthorizationSnapshot,
+) -> Result<i64, StorageError> {
+    let mut parameters = profile_params(values);
+    parameters.push(Box::new(i64::from(authorizations.allow_unattended_destructive())));
+    parameters.push(Box::new(i64::from(authorizations.allow_unattended_permanent_removal())));
     transaction.execute(
         "INSERT INTO sync_profiles (
             name, mode, source,
@@ -397,9 +445,9 @@ fn insert_profile(transaction: &Transaction<'_>, values: &ProfileValues) -> Resu
             ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
             ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
             ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-            ?30, ?31, ?32, 0, 0, 0
+            ?30, ?31, ?32, 0, ?33, ?34
         )",
-        rusqlite::params_from_iter(profile_params(values).iter().map(|value| value.as_ref())),
+        rusqlite::params_from_iter(parameters.iter().map(|value| value.as_ref())),
     )?;
     Ok(transaction.last_insert_rowid())
 }
@@ -408,8 +456,11 @@ fn update_profile_row(
     transaction: &Transaction<'_>,
     id: SyncProfileId,
     values: &ProfileValues,
+    authorizations: AuthorizationSnapshot,
 ) -> Result<usize, StorageError> {
     let mut parameters = profile_params(values);
+    parameters.push(Box::new(i64::from(authorizations.allow_unattended_destructive())));
+    parameters.push(Box::new(i64::from(authorizations.allow_unattended_permanent_removal())));
     parameters.push(Box::new(id.value_as_i64()?));
     Ok(transaction.execute(
         "UPDATE sync_profiles SET
@@ -425,8 +476,10 @@ fn update_profile_row(
             metadata_symlink_targets = ?25, metadata_timestamps = ?26,
             metadata_ownership = ?27, metadata_access_control_lists = ?28,
             metadata_extended_attributes = ?29, partial_transfer_policy = ?30,
-            retry_max_attempts = ?31, retry_initial_delay_millis = ?32
-        WHERE profile_id = ?33",
+            retry_max_attempts = ?31, retry_initial_delay_millis = ?32,
+            allow_unattended_destructive = ?33,
+            allow_unattended_permanent_removal = ?34
+        WHERE profile_id = ?35",
         rusqlite::params_from_iter(parameters.iter().map(|value| value.as_ref())),
     )?)
 }
@@ -496,6 +549,29 @@ fn validate_profile(profile: &SyncProfile) -> Result<(), StorageError> {
         }
     }
     ProcessSpecification::from_profile(profile).map_err(StorageError::InvalidProfile)?;
+    Ok(())
+}
+
+fn validate_authorizations(
+    profile: &SyncProfile,
+    authorizations: AuthorizationSnapshot,
+) -> Result<(), StorageError> {
+    let options = profile.options();
+    if authorizations.allow_unattended_destructive()
+        && !options.safe_delete
+        && !options.destination_cleanup
+    {
+        return Err(StorageError::InvalidAuthorization(
+            "unattended destructive authorization requires Safe Delete or Destination Cleanup".to_owned(),
+        ));
+    }
+    if authorizations.allow_unattended_permanent_removal()
+        && (!options.safe_delete || options.deletion_method != Some(DeletionMethod::PermanentRemoval))
+    {
+        return Err(StorageError::InvalidAuthorization(
+            "unattended Permanent Removal requires Safe Delete with Permanent Removal selected".to_owned(),
+        ));
+    }
     Ok(())
 }
 

@@ -5,7 +5,7 @@ use rusqlite::params;
 use crate::{
     ApplicationMode, ApplicationSettings, AuthorizationSnapshot, Peer, RunEvidenceStore, RunId,
     RunSnapshot, SavedSecretReference, SshAuthentication, SyncMode, SyncProfile,
-    ThemePreference,
+    StorageError, ThemePreference,
 };
 
 fn profile() -> SyncProfile {
@@ -106,6 +106,86 @@ fn invalid_profiles_are_rejected_before_persistence() {
 
     assert!(store.create_profile(&invalid).is_err());
     assert!(store.list_profiles().expect("list profiles").is_empty());
+}
+
+#[test]
+fn duplicate_endpoint_pairs_are_rejected_independently_of_profile_name() {
+    let database = database();
+    let first = profile();
+    let second = SyncProfile::new(
+        "another name",
+        Peer::new("different source label", PathBuf::from("/source")),
+        Peer::ssh(
+            "different remote label",
+            "backup.example.com",
+            "sync-user",
+            22,
+            Some(PathBuf::from("/different/identity")),
+            SshAuthentication::Agent,
+            "/srv/backup",
+        )
+        .expect("valid SSH peer"),
+    );
+    let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+    store.create_profile(&first).expect("first profile");
+
+    assert!(matches!(
+        store.create_profile(&second),
+        Err(StorageError::DuplicateEndpointPair)
+    ));
+}
+
+#[test]
+fn explicitly_created_authorizations_round_trip_separately_from_profile_fields() {
+    let database = database();
+    let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+    let profile = profile().with_options(crate::SyncOptions {
+        safe_delete: true,
+        deletion_method: Some(crate::DeletionMethod::PermanentRemoval),
+        ..crate::SyncOptions::default()
+    });
+    let id = store
+        .create_profile_with_authorizations(
+            &profile,
+            AuthorizationSnapshot::new(true, true),
+        )
+        .expect("create profile")
+        .id();
+
+    let loaded = store
+        .load_profile(id)
+        .expect("load profile")
+        .expect("profile exists");
+    assert!(loaded.authorizations().allow_unattended_destructive());
+    assert!(loaded.authorizations().allow_unattended_permanent_removal());
+    assert_eq!(loaded.profile().name(), "work files");
+}
+
+#[test]
+fn invalid_unattended_authorizations_are_rejected() {
+    let database = database();
+    let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+
+    assert!(matches!(
+        store.create_profile_with_authorizations(
+            &profile(),
+            AuthorizationSnapshot::new(true, false),
+        ),
+        Err(StorageError::InvalidAuthorization(_))
+    ));
+
+    let safe_delete_profile = profile().with_options(crate::SyncOptions {
+        safe_delete: true,
+        deletion_method: Some(crate::DeletionMethod::Trash),
+        ..crate::SyncOptions::default()
+    });
+    assert!(matches!(
+        store.create_profile_with_authorizations(
+            &safe_delete_profile,
+            AuthorizationSnapshot::new(false, true),
+        ),
+        Err(StorageError::InvalidAuthorization(_))
+    ));
 }
 
 #[test]

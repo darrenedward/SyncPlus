@@ -41,7 +41,7 @@ Explicitly outside v1:
 
 ### Sync Profile
 
-A saved configuration containing two peer endpoints, mode, validated options, exclusions, and optional schedule/authorization settings. A Clone Profile action opens an editable copy, displays both endpoints, and requires at least one endpoint to differ before saving. Destructive unattended authorizations are copied only after a dedicated warning and explicit user choice.
+A saved configuration containing two peer endpoints, mode, validated options, exclusions, and optional schedule/authorization settings. A Clone Profile action opens an editable copy, displays both endpoints, clears saved credential references for intentional reconfiguration, and requires at least one endpoint to differ before saving. Non-permanent destructive unattended authorization may be copied only after a dedicated warning and explicit Advanced Mode choice; Permanent Removal authorization is never copied.
 
 ### Sync Run
 

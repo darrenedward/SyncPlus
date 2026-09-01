@@ -803,6 +803,8 @@ pub enum StorageError {
     InvalidProfile(ProcessSpecError),
     InvalidProfileName,
     InvalidPeerName,
+    DuplicateEndpointPair,
+    InvalidAuthorization(String),
     ProfileNotFound { id: u64 },
     UnsafeDatabasePath,
     UnsupportedRemotePeer,
@@ -819,6 +821,12 @@ impl fmt::Display for StorageError {
             Self::InvalidProfile(error) => write!(formatter, "invalid profile: {error}"),
             Self::InvalidProfileName => formatter.write_str("invalid Sync Profile name"),
             Self::InvalidPeerName => formatter.write_str("invalid Sync Profile peer name"),
+            Self::DuplicateEndpointPair => {
+                formatter.write_str("the source and destination endpoint pair is already used by another Sync Profile")
+            }
+            Self::InvalidAuthorization(reason) => {
+                write!(formatter, "invalid unattended authorization: {reason}")
+            }
             Self::ProfileNotFound { id } => write!(formatter, "Sync Profile {id} was not found"),
             Self::UnsafeDatabasePath => formatter.write_str("the canonical database path is unsafe"),
             Self::UnsupportedRemotePeer => write!(

@@ -276,6 +276,13 @@ impl Peer {
         matches!(self.endpoint, PeerEndpoint::Ssh(_))
     }
 
+    /// Compare normalized endpoint identity without considering display names
+    /// or credentials. Credentials select how an endpoint is accessed; they do
+    /// not make the same local folder or remote location a different pair.
+    pub fn same_endpoint(&self, other: &Self) -> bool {
+        crate::PeerScope::for_peer(self) == crate::PeerScope::for_peer(other)
+    }
+
     pub fn ssh_peer(&self) -> Option<&SshPeer> {
         match &self.endpoint {
             PeerEndpoint::Local { .. } => None,
