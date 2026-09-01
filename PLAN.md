@@ -215,6 +215,7 @@ V1 supports one local peer and one SSH peer in either direction. SSH-to-SSH is n
 - After transfer, SyncPlus verifies the actual remote destination digest. If it cannot obtain or match the digest, the source remains preserved.
 - The shared core SSH workflow re-runs the typed remote precheck around confirmation, freezes endpoint-specific staging paths, and accepts only path-bound source/destination metadata and content proofs from the platform SSH adapter.
 - Remote Trash requires a verified recovery location and access for the remote account. Otherwise deletion stops or requires the separately authorized Permanent Removal option.
+- Remote source recovery is a typed backend operation after the journaled Safe Delete proof boundary; successful results must prove source absence, recovery presence, destination continuity, and peer/path/run/type/digest provenance. Failed or ambiguous recovery remains in Recovery Review and preserves the source.
 - Server, username, port, identity, and remote path are structured fields. User values are safely encoded into controlled process arguments; no arbitrary remote command is accepted.
 - The core owns validated SSH endpoint fields and the typed Process Specification used by both preview and execution; credential handling, host trust, capability checks, and remote recovery remain mandatory pre-mutation gates.
 
