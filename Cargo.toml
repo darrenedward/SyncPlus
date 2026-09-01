@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/syncplus-core"]
+members = ["crates/syncplus-core", "crates/syncplus"]
 resolver = "3"
 
 [workspace.package]
