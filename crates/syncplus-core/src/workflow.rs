@@ -345,6 +345,7 @@ impl RunWorkflow {
             peer_a_volume_identity,
             peer_b_volume_identity,
         )?;
+        store.backup_before_file_change()?;
         store.begin_run(&snapshot)?;
         let inventory = SourceInventorySnapshot::from_inventory(
             confirmed.fresh_analysis().source_inventory(),
@@ -748,6 +749,7 @@ impl RunWorkflow {
             None,
             None,
         )?;
+        store.backup_before_file_change()?;
         store.begin_run(&snapshot)?;
         let inventory = SourceInventorySnapshot::from_inventory(plan.source_inventory());
         let destination_inventory =
@@ -1434,6 +1436,7 @@ impl RunWorkflow {
             peer_a_volume_identity,
             peer_b_volume_identity,
         )?;
+        store.backup_before_file_change()?;
         store.begin_run(&snapshot)?;
         let inventory = SourceInventorySnapshot::from_inventory(plan.source_inventory());
         let destination_inventory = SourceInventorySnapshot::from_inventory(plan.destination_inventory());

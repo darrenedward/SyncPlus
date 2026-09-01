@@ -8,6 +8,7 @@ mod preserved_copy;
 mod baseline;
 mod mirror_deletion;
 mod evidence;
+mod backup;
 mod precheck;
 mod scope_lock;
 mod parser;
@@ -88,6 +89,7 @@ pub use evidence::{
     MirrorResolutionOutcome, MirrorResolutionReportItem, MirrorResolutionReviewState,
     RunReportStatus, RunSnapshot, StorageError,
 };
+pub use backup::{BackupError, DatabaseBackupManager, ValidatedBackup};
 pub use storage::{
     ApplicationMode, ApplicationSettings, PersistedSyncProfile, ScheduleDefinition, SyncProfileId,
     ThemePreference,
