@@ -801,6 +801,10 @@ pub enum StorageError {
     Sqlite(rusqlite::Error),
     Io(io::Error),
     InvalidProfile(ProcessSpecError),
+    InvalidProfileName,
+    InvalidPeerName,
+    ProfileNotFound { id: u64 },
+    UnsafeDatabasePath,
     UnsupportedRemotePeer,
     InvalidSnapshot(String),
     InvalidEvent(String),
@@ -813,6 +817,10 @@ impl fmt::Display for StorageError {
             Self::Sqlite(error) => write!(formatter, "SQLite error: {error}"),
             Self::Io(error) => write!(formatter, "storage filesystem error: {error}"),
             Self::InvalidProfile(error) => write!(formatter, "invalid profile: {error}"),
+            Self::InvalidProfileName => formatter.write_str("invalid Sync Profile name"),
+            Self::InvalidPeerName => formatter.write_str("invalid Sync Profile peer name"),
+            Self::ProfileNotFound { id } => write!(formatter, "Sync Profile {id} was not found"),
+            Self::UnsafeDatabasePath => formatter.write_str("the canonical database path is unsafe"),
             Self::UnsupportedRemotePeer => write!(
                 formatter,
                 "remote peers cannot be persisted in a local filesystem run snapshot yet"
@@ -844,6 +852,10 @@ pub struct RunEvidenceStore {
     fail_event_phase: Option<&'static str>,
 }
 
+/// The canonical SQLite Application Database. The historical name is kept so
+/// existing evidence callers continue to use the same connection and schema.
+pub type ApplicationDatabase = RunEvidenceStore;
+
 impl RunEvidenceStore {
     /// Resolve the one canonical live database for the current OS user.
     pub fn canonical_path() -> Result<PathBuf, StorageError> {
@@ -859,11 +871,19 @@ impl RunEvidenceStore {
                     "XDG_DATA_HOME or HOME is required for the canonical database".to_owned(),
                 )
             })?;
-        Ok(data_home.join("syncplus/syncplus.db"))
+        if !data_home.is_absolute() || data_home.as_os_str().is_empty() {
+            return Err(StorageError::UnsafeDatabasePath);
+        }
+        Ok(Self::canonical_path_for_data_home(&data_home))
     }
 
     pub fn open_canonical() -> Result<Self, StorageError> {
         let path = Self::canonical_path()?;
+        Self::open_canonical_path(&path)
+    }
+
+    fn open_canonical_path(path: &Path) -> Result<Self, StorageError> {
+        validate_canonical_parent(path)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
             #[cfg(unix)]
@@ -872,7 +892,13 @@ impl RunEvidenceStore {
                 fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
             }
         }
-        let store = Self::open(&path)?;
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(StorageError::UnsafeDatabasePath);
+            }
+        }
+        let connection = open_canonical_connection(path)?;
+        let store = Self::from_connection(connection)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -881,11 +907,35 @@ impl RunEvidenceStore {
         Ok(store)
     }
 
+    pub(crate) fn canonical_path_for_data_home(data_home: &Path) -> PathBuf {
+        data_home.join("syncplus/syncplus.db")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_at_data_home(data_home: &Path) -> Result<Self, StorageError> {
+        let path = Self::canonical_path_for_data_home(data_home);
+        Self::open_canonical_path(&path)
+    }
+
     /// Open an explicitly supplied database path. Production callers should
     /// use `open_canonical`; this path form exists for controlled test and
     /// migration locations and never derives a path from a selected peer.
+    #[cfg(test)]
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::from_connection(Connection::open(path)?)
+        Self::open_path(path)
+    }
+
+    #[cfg(test)]
+    fn open_path(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::from_connection(Self::open_connection(path)?)
+    }
+
+    #[cfg(any(test, not(target_os = "linux")))]
+    fn open_connection(path: impl AsRef<Path>) -> Result<Connection, StorageError> {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        Ok(Connection::open_with_flags(path, flags)?)
     }
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
@@ -896,11 +946,12 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 14 {
+        if version > 15 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
         }
+        verify_integrity(&connection)?;
         if version == 0 {
             let transaction = connection.transaction()?;
             transaction.execute_batch(
@@ -1294,6 +1345,70 @@ impl RunEvidenceStore {
             }
             transaction.pragma_update(None, "user_version", 14)?;
             transaction.commit()?;
+            version = 14;
+        }
+        if version == 14 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                CREATE TABLE application_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    CHECK (key IN ('ui_mode', 'theme')),
+                    CHECK (length(value) > 0)
+                );
+                CREATE TABLE sync_profiles (
+                    profile_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    mode TEXT NOT NULL CHECK (mode IN ('one_way', 'mirror')),
+                    source TEXT NOT NULL CHECK (source IN ('peer_a', 'peer_b')),
+                    peer_a_name TEXT NOT NULL,
+                    peer_a_endpoint_kind TEXT NOT NULL CHECK (peer_a_endpoint_kind IN ('local', 'ssh')),
+                    peer_a_root BLOB NOT NULL,
+                    peer_a_server TEXT,
+                    peer_a_username TEXT,
+                    peer_a_port INTEGER,
+                    peer_a_identity BLOB,
+                    peer_a_authentication TEXT,
+                    peer_b_name TEXT NOT NULL,
+                    peer_b_endpoint_kind TEXT NOT NULL CHECK (peer_b_endpoint_kind IN ('local', 'ssh')),
+                    peer_b_root BLOB NOT NULL,
+                    peer_b_server TEXT,
+                    peer_b_username TEXT,
+                    peer_b_port INTEGER,
+                    peer_b_identity BLOB,
+                    peer_b_authentication TEXT,
+                    safe_delete INTEGER NOT NULL CHECK (safe_delete IN (0, 1)),
+                    destination_cleanup INTEGER NOT NULL CHECK (destination_cleanup IN (0, 1)),
+                    deletion_method TEXT CHECK (deletion_method IS NULL OR deletion_method IN ('trash', 'permanent_removal')),
+                    metadata_file_type INTEGER NOT NULL CHECK (metadata_file_type IN (0, 1)),
+                    metadata_executable_permissions INTEGER NOT NULL CHECK (metadata_executable_permissions IN (0, 1)),
+                    metadata_symlink_targets INTEGER NOT NULL CHECK (metadata_symlink_targets IN (0, 1)),
+                    metadata_timestamps INTEGER NOT NULL CHECK (metadata_timestamps IN (0, 1)),
+                    metadata_ownership INTEGER NOT NULL CHECK (metadata_ownership IN (0, 1)),
+                    metadata_access_control_lists INTEGER NOT NULL CHECK (metadata_access_control_lists IN (0, 1)),
+                    metadata_extended_attributes INTEGER NOT NULL CHECK (metadata_extended_attributes IN (0, 1)),
+                    partial_transfer_policy TEXT NOT NULL CHECK (partial_transfer_policy IN ('cleanup', 'keep_partial_for_resume')),
+                    retry_max_attempts INTEGER NOT NULL,
+                    retry_initial_delay_millis INTEGER NOT NULL,
+                    schedule_enabled INTEGER NOT NULL DEFAULT 0 CHECK (schedule_enabled IN (0, 1)),
+                    allow_unattended_destructive INTEGER NOT NULL DEFAULT 0 CHECK (allow_unattended_destructive IN (0, 1)),
+                    allow_unattended_permanent_removal INTEGER NOT NULL DEFAULT 0 CHECK (allow_unattended_permanent_removal IN (0, 1))
+                );
+                CREATE TABLE sync_profile_exclusions (
+                    profile_id INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    pattern TEXT NOT NULL,
+                    PRIMARY KEY (profile_id, ordinal),
+                    UNIQUE (profile_id, pattern),
+                    FOREIGN KEY (profile_id) REFERENCES sync_profiles(profile_id) ON DELETE CASCADE
+                );
+                CREATE INDEX sync_profiles_by_name ON sync_profiles(name);
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 15)?;
+            verify_integrity(&transaction)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -1301,6 +1416,14 @@ impl RunEvidenceStore {
             #[cfg(test)]
             fail_event_phase: None,
         })
+    }
+
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    pub(crate) fn connection_mut(&mut self) -> &mut Connection {
+        &mut self.connection
     }
 
     /// Persist the immutable snapshot before any filesystem action starts.
@@ -2590,6 +2713,103 @@ impl RunEvidenceStore {
         )?;
         Ok(())
     }
+}
+
+fn validate_canonical_parent(path: &Path) -> Result<(), StorageError> {
+    if !path.is_absolute() {
+        return Err(StorageError::UnsafeDatabasePath);
+    }
+    let parent = path.parent().ok_or(StorageError::UnsafeDatabasePath)?;
+    let mut current = PathBuf::new();
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(StorageError::UnsafeDatabasePath);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StorageError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_canonical_connection(path: &Path) -> Result<Connection, StorageError> {
+    use std::{
+        ffi::CString,
+        os::{fd::AsRawFd, unix::ffi::OsStrExt},
+    };
+
+    let parent = path.parent().ok_or(StorageError::UnsafeDatabasePath)?;
+    let name = path.file_name().ok_or(StorageError::UnsafeDatabasePath)?;
+    let parent = CString::new(parent.as_os_str().as_bytes())
+        .map_err(|_| StorageError::UnsafeDatabasePath)?;
+    let name = CString::new(name.as_bytes()).map_err(|_| StorageError::UnsafeDatabasePath)?;
+    let mut parent_how: libc::open_how = unsafe { std::mem::zeroed() };
+    parent_how.flags = (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+    parent_how.resolve = libc::RESOLVE_NO_SYMLINKS as u64;
+    let parent_fd = openat2(
+        libc::AT_FDCWD,
+        parent.as_ptr(),
+        &parent_how,
+    )?;
+    let mut database_how: libc::open_how = unsafe { std::mem::zeroed() };
+    database_how.flags = (libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC) as u64;
+    database_how.mode = 0o600;
+    database_how.resolve = libc::RESOLVE_NO_SYMLINKS as u64;
+    let database_fd = openat2(parent_fd.as_raw_fd(), name.as_ptr(), &database_how)?;
+    let database_path = format!("/proc/self/fd/{}", database_fd.as_raw_fd());
+    let connection = Connection::open_with_flags(
+        database_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    drop(database_fd);
+    Ok(connection)
+}
+
+#[cfg(target_os = "linux")]
+fn openat2(
+    directory_fd: libc::c_int,
+    path: *const libc::c_char,
+    how: &libc::open_how,
+) -> Result<std::os::fd::OwnedFd, StorageError> {
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            directory_fd,
+            path,
+            how as *const libc::open_how,
+            std::mem::size_of::<libc::open_how>(),
+        ) as libc::c_int
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return Err(StorageError::UnsafeDatabasePath);
+        }
+        return Err(StorageError::Io(error));
+    }
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_canonical_connection(path: &Path) -> Result<Connection, StorageError> {
+    let connection = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    let resolved_path = fs::canonicalize(path)?;
+    if resolved_path != path {
+        return Err(StorageError::UnsafeDatabasePath);
+    }
+    Ok(connection)
 }
 
 impl RunEvidenceStore {
@@ -4727,7 +4947,10 @@ mod tests {
         store
             .connection
             .execute_batch(
-                "DROP TABLE ssh_host_fingerprints;
+                "DROP TABLE sync_profile_exclusions;
+                 DROP TABLE sync_profiles;
+                 DROP TABLE application_settings;
+                 DROP TABLE ssh_host_fingerprints;
                  PRAGMA user_version = 10;",
             )
             .expect("fixture should represent a version ten database");
@@ -4739,7 +4962,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         assert!(
             migrated
                 .connection
@@ -4753,5 +4976,156 @@ mod tests {
                 .expect("host trust table lookup should succeed")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn existing_version_fourteen_database_migrates_application_storage() {
+        let directory = TestDatabaseDirectory::new("syncplus-migration-v14");
+        let path = directory.path().join("syncplus.db");
+        {
+            let mut store = RunEvidenceStore::open(&path).expect("SQLite store should open");
+            let profile = SyncProfile::new(
+                "legacy profile",
+                Peer::new("source", PathBuf::from("/source")),
+                Peer::new("destination", PathBuf::from("/destination")),
+            );
+            let run = RunSnapshot::from_profile(
+                RunId::new(314),
+                &profile,
+                AuthorizationSnapshot::default(),
+            )
+            .expect("legacy run should be valid");
+            store.begin_run(&run).expect("legacy evidence should persist");
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE sync_profile_exclusions;
+                     DROP TABLE sync_profiles;
+                     DROP TABLE application_settings;
+                     PRAGMA user_version = 14;",
+                )
+                .expect("fixture should represent a version fourteen database");
+        }
+
+        let migrated = RunEvidenceStore::open(&path).expect("version fourteen database should migrate");
+        let version: i64 = migrated
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("schema version should be readable");
+
+        assert_eq!(version, 15);
+        for table in ["application_settings", "sync_profiles", "sync_profile_exclusions"] {
+            assert!(
+                migrated
+                    .connection
+                    .query_row(
+                        "SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = ?1",
+                        [table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .expect("table lookup should succeed")
+                    .is_some(),
+                "expected migrated table {table}"
+            );
+        }
+        assert_eq!(
+            migrated
+                .load_snapshot(RunId::new(314))
+                .expect("legacy evidence should remain readable")
+                .profile()
+                .name(),
+            "legacy profile"
+        );
+    }
+
+    #[test]
+    fn failed_application_storage_migration_rolls_back_its_schema_changes() {
+        let directory = TestDatabaseDirectory::new("syncplus-migration-rollback");
+        let path = directory.path().join("syncplus.db");
+        {
+            let store = RunEvidenceStore::open(&path).expect("SQLite store should open");
+            store
+                .connection
+                .execute_batch(
+                    "DROP TABLE sync_profile_exclusions;
+                     DROP TABLE sync_profiles;
+                     DROP TABLE application_settings;
+                     CREATE TABLE application_settings (sentinel INTEGER);
+                     PRAGMA user_version = 14;",
+                )
+                .expect("fixture should represent a migration conflict");
+        }
+
+        assert!(RunEvidenceStore::open(&path).is_err());
+        let connection = Connection::open(&path).expect("failed migration database should reopen");
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("schema version should be readable");
+        assert_eq!(version, 14);
+        assert!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'sync_profiles'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .expect("table lookup should succeed")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn corrupt_database_fails_integrity_validation() {
+        let directory = TestDatabaseDirectory::new("syncplus-integrity");
+        let path = directory.path().join("syncplus.db");
+        {
+            let store = RunEvidenceStore::open(&path).expect("SQLite store should open");
+            store
+                .connection
+                .execute(
+                    "INSERT INTO application_settings (key, value) VALUES ('theme', 'dark')",
+                    [],
+                )
+                .expect("corruption fixture should have data");
+        }
+
+        let mut bytes = fs::read(&path).expect("read database fixture");
+        bytes[16..18].copy_from_slice(&8192_u16.to_be_bytes());
+        fs::write(&path, bytes).expect("write corrupt database fixture");
+
+        let connection = Connection::open(&path).expect("corrupt SQLite should still open");
+        assert!(RunEvidenceStore::open(&path).is_err());
+        assert!(verify_integrity(&connection).is_err());
+    }
+
+    struct TestDatabaseDirectory(PathBuf);
+
+    impl TestDatabaseDirectory {
+        fn new(prefix: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "{prefix}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&path).expect("create test database directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDatabaseDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 }

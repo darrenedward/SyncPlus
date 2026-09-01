@@ -23,6 +23,7 @@ mod volume;
 mod ssh_host;
 mod ssh;
 mod ssh_workflow;
+mod storage;
 
 pub use model::{
     ActiveRunState, AuthorizationSnapshot, CoreError, DeletionMethod, MetadataRequirements,
@@ -82,10 +83,11 @@ pub use mirror_deletion::{
 pub use evidence::{
     ActionId, ActionJournalEntry, ActionOutcome, ActionReason, FileIdentity,
     JournalEvent, PlanRecord, PreActionState, RecoveryEvidence, RecoveryResolution,
-    RemovalResult, RunEvidenceStore, RunExecutionResult, RunLifecycle, RunReport, RunReportItem,
+    ApplicationDatabase, RemovalResult, RunEvidenceStore, RunExecutionResult, RunLifecycle, RunReport, RunReportItem,
     MirrorResolutionOutcome, MirrorResolutionReportItem, MirrorResolutionReviewState,
     RunReportStatus, RunSnapshot, StorageError,
 };
+pub use storage::{ApplicationMode, ApplicationSettings, PersistedSyncProfile, SyncProfileId, ThemePreference};
 pub use parser::{
     ItemizedRecord, ParseDiagnostic, ParsedOutput, ParsedTransferOutput, ProgressRecord,
     TransferOutputParser,
@@ -146,6 +148,9 @@ mod resolution_run_tests;
 
 #[cfg(test)]
 mod preserved_copy_tests;
+
+#[cfg(test)]
+mod storage_tests;
 
 #[cfg(test)]
 mod baseline_tests;
