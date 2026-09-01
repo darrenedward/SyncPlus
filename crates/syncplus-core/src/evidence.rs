@@ -3868,12 +3868,19 @@ fn validate_removal_evidence(
             !evidence.recovery_present() && evidence.recovery_target().is_none()
         }
     };
+    let valid_provenance = evidence.provenance().map_or(true, |provenance| {
+        provenance.action_id() == Some(entry.plan.action_id())
+            && provenance.recovery_method() == deletion_method
+            && provenance.verification_state() == crate::RecoveryVerificationState::Verified
+    });
     if evidence.source_present()
         || !evidence.destination_present()
         || evidence.destination_size().is_none()
         || (content_proof_required && evidence.destination_sha256().is_none())
-        || (evidence.provenance().is_some()
+        || (content_proof_required
+            && evidence.provenance().is_some()
             && (evidence.recovery_size().is_none() || evidence.recovery_sha256().is_none()))
+        || !valid_provenance
         || !valid_recovery
     {
         return Err(StorageError::CorruptEvidence(
@@ -4019,7 +4026,19 @@ fn decode_recovery_provenance(
             ))
         }
     };
-    RecoveryProvenance::from_record(
+    let recovery_method = row
+        .deletion_method
+        .as_deref()
+        .map(decode_deletion_method)
+        .transpose()?
+        .unwrap_or(DeletionMethod::Trash);
+    let verification_state = if row.phase == "removal_completed" {
+        crate::RecoveryVerificationState::Verified
+    } else {
+        crate::RecoveryVerificationState::ReviewRequired
+    };
+    RecoveryProvenance::from_record_with_details(
+        Some(row.action_id),
         peer,
         root,
         relative,
@@ -4027,9 +4046,12 @@ fn decode_recovery_provenance(
             StorageError::CorruptEvidence("recovery provenance run id is invalid".to_owned())
         })?),
         removed_at,
+        recovery_method,
+        verification_state,
         item_type,
         content,
         source_identity,
+        None,
     )
     .map(Some)
     .map_err(|error| StorageError::CorruptEvidence(error.to_string()))

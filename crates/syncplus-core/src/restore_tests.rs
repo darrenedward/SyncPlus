@@ -65,6 +65,48 @@ fn sidecar_round_trip_preserves_remote_recovery_provenance_and_digest() {
     assert_eq!(loaded.content(), Some(content));
     assert_eq!(loaded.source_identity(), provenance.source_identity());
     assert_eq!(loaded.removed_at_unix_nanos(), provenance.removed_at_unix_nanos());
+    assert_eq!(loaded.recovery_method(), crate::DeletionMethod::Trash);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn restore_from_sidecar_rejects_a_missing_manifest() {
+    let root = temp_dir();
+    let recovered = root.join("recovered");
+    fs::write(&recovered, b"recovered").unwrap();
+    let sidecar = RecoveryProvenance::sidecar_path(&recovered).unwrap();
+
+    assert!(matches!(
+        CollisionSafeRestore::restore_from_sidecar(&recovered, &sidecar, || false),
+        Err(RestoreError::SidecarInvalid(_))
+    ));
+    assert!(!root.join("target").exists());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn restore_from_sidecar_rejects_the_wrong_recovered_item() {
+    let root = temp_dir();
+    let recovered = root.join("recovered");
+    let sidecar = root.join("recovered.syncplus-manifest");
+    fs::write(&recovered, b"actual item").unwrap();
+    let provenance = RecoveryProvenance::new(
+        "local",
+        root.clone(),
+        PathBuf::from("target"),
+        RunId::new(12),
+        ItemType::RegularFile,
+        Some(ContentProof::new(8, [1; 32])),
+        None,
+    )
+    .unwrap();
+    provenance.write_sidecar(&sidecar).unwrap();
+
+    assert!(matches!(
+        CollisionSafeRestore::restore_from_sidecar(&recovered, &sidecar, || false),
+        Err(RestoreError::Verification(_))
+    ));
+    assert!(!root.join("target").exists());
     let _ = fs::remove_dir_all(root);
 }
 

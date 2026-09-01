@@ -3550,7 +3550,8 @@ mod tests {
                 .source_metadata()
                 .ok_or(SshRunError::InvalidOperation)?
                 .item_type();
-            let provenance = crate::RecoveryProvenance::new(
+            let provenance = crate::RecoveryProvenance::new_for_action(
+                request.action().action_id(),
                 format!(
                     "{}@{}:{}",
                     request.remote_peer().username(),
@@ -3560,6 +3561,7 @@ mod tests {
                 request.remote_peer().remote_path().to_path_buf(),
                 request.action().relative_path().to_path_buf(),
                 request.run_id(),
+                crate::DeletionMethod::Trash,
                 item_type,
                 Some(source_proof),
                 Some(source_identity),
@@ -3568,15 +3570,14 @@ mod tests {
             if let Some(parent) = recovery.parent() {
                 fs::create_dir_all(parent).map_err(|_| SshRunError::RemoteUnavailable)?;
             }
-            let sidecar = recovery.with_extension("syncplus-manifest");
             provenance
-                .write_sidecar(&sidecar)
+                .write_sidecar_for(&recovery)
                 .map_err(|_| SshRunError::RemoteRecoveryFailed {
                     boundary: SshRecoveryBoundary::BeforeRecovery,
                     evidence: None,
                 })?;
             if let Err(_error) = fs::rename(&source, &recovery) {
-                let _ = fs::remove_file(&sidecar);
+                let _ = fs::remove_file(crate::RecoveryProvenance::sidecar_path(&recovery).unwrap());
                 return Err(SshRunError::RemoteRecoveryFailed {
                     boundary: SshRecoveryBoundary::BeforeRecovery,
                     evidence: None,
@@ -3586,7 +3587,7 @@ mod tests {
                 Ok(proof) => proof,
                 Err(_) => {
                     let restored = fs::rename(&recovery, &source).is_ok();
-                    let _ = fs::remove_file(&sidecar);
+                    let _ = fs::remove_file(crate::RecoveryProvenance::sidecar_path(&recovery).unwrap());
                     return Err(if restored {
                         SshRunError::RemoteRecoveryFailed {
                             boundary: SshRecoveryBoundary::RecoveryStarted,
