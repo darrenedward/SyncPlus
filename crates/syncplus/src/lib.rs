@@ -1,3 +1,3 @@
 mod app;
 
-pub use app::{EndpointKind, SyncPlusApp, UiValidationError};
+pub use app::{run_background_scheduler_once, EndpointKind, SyncPlusApp, UiValidationError};

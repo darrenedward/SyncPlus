@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, OptionalExtension, Row, Transaction};
@@ -12,7 +12,7 @@ use crate::{
     ProcessSpecification, SavedSecretReference, SpecialistMetadataRequirements,
     RetryPolicy, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
 };
-use crate::evidence::{RunEvidenceStore, StorageError};
+use crate::evidence::{RunEvidenceStore, RunSnapshot, StorageError};
 
 /// A stable identifier for a persisted Sync Profile. The display name is
 /// editable and therefore is not used as the profile identity.
@@ -81,6 +81,7 @@ pub struct ScheduleDefinition {
     interval_minutes: u32,
     timezone: String,
     enabled: bool,
+    next_run_at_unix_seconds: Option<i64>,
 }
 
 impl ScheduleDefinition {
@@ -93,6 +94,23 @@ impl ScheduleDefinition {
             interval_minutes,
             timezone: timezone.into(),
             enabled,
+            next_run_at_unix_seconds: None,
+        };
+        schedule.validate()?;
+        Ok(schedule)
+    }
+
+    pub fn new_with_next_run_at(
+        interval_minutes: u32,
+        timezone: impl Into<String>,
+        enabled: bool,
+        next_run_at_unix_seconds: Option<i64>,
+    ) -> Result<Self, StorageError> {
+        let schedule = Self {
+            interval_minutes,
+            timezone: timezone.into(),
+            enabled,
+            next_run_at_unix_seconds,
         };
         schedule.validate()?;
         Ok(schedule)
@@ -110,8 +128,20 @@ impl ScheduleDefinition {
         self.enabled
     }
 
+    pub const fn next_run_at_unix_seconds(&self) -> Option<i64> {
+        self.next_run_at_unix_seconds
+    }
+
     pub const fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
+        if !enabled {
+            self.next_run_at_unix_seconds = None;
+        }
+        self
+    }
+
+    fn with_next_run_at(mut self, next_run_at_unix_seconds: Option<i64>) -> Self {
+        self.next_run_at_unix_seconds = next_run_at_unix_seconds;
         self
     }
 
@@ -129,7 +159,43 @@ impl ScheduleDefinition {
                 "timezone must be a nonempty value of at most 128 characters".to_owned(),
             ));
         }
+        if self.next_run_at_unix_seconds.is_some_and(|value| value < 0) {
+            return Err(StorageError::InvalidSchedule(
+                "next run must be a nonnegative Unix timestamp".to_owned(),
+            ));
+        }
+        if !self.enabled && self.next_run_at_unix_seconds.is_some() {
+            return Err(StorageError::InvalidSchedule(
+                "a disabled schedule cannot have a next run".to_owned(),
+            ));
+        }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaimedScheduledRun {
+    profile_id: SyncProfileId,
+    run_id: crate::RunId,
+    scheduled_at_unix_seconds: i64,
+    snapshot: RunSnapshot,
+}
+
+impl ClaimedScheduledRun {
+    pub(crate) const fn profile_id(&self) -> SyncProfileId {
+        self.profile_id
+    }
+
+    pub(crate) const fn run_id(&self) -> crate::RunId {
+        self.run_id
+    }
+
+    pub(crate) const fn scheduled_at_unix_seconds(&self) -> i64 {
+        self.scheduled_at_unix_seconds
+    }
+
+    pub(crate) fn snapshot(&self) -> &RunSnapshot {
+        &self.snapshot
     }
 }
 
@@ -413,6 +479,39 @@ impl RunEvidenceStore {
         schedule: Option<ScheduleDefinition>,
         mode: ApplicationMode,
     ) -> Result<PersistedSyncProfile, StorageError> {
+        let now = current_unix_seconds()?;
+        self.update_schedule_at(id, schedule, mode, now)
+    }
+
+    pub fn update_schedule_at(
+        &mut self,
+        id: SyncProfileId,
+        schedule: Option<ScheduleDefinition>,
+        mode: ApplicationMode,
+        now_unix_seconds: i64,
+    ) -> Result<PersistedSyncProfile, StorageError> {
+        if now_unix_seconds < 0 {
+            return Err(StorageError::InvalidSchedule(
+                "current time must be a nonnegative Unix timestamp".to_owned(),
+            ));
+        }
+        let schedule = schedule
+            .map(|schedule| {
+                if schedule.enabled() && schedule.next_run_at_unix_seconds().is_none() {
+                    let interval = i64::from(schedule.interval_minutes())
+                        .checked_mul(60)
+                        .ok_or_else(|| {
+                            StorageError::InvalidSchedule("interval is out of range".to_owned())
+                        })?;
+                    let next = now_unix_seconds.checked_add(interval).ok_or_else(|| {
+                        StorageError::InvalidSchedule("next run is out of range".to_owned())
+                    })?;
+                    Ok::<ScheduleDefinition, StorageError>(schedule.with_next_run_at(Some(next)))
+                } else {
+                    Ok::<ScheduleDefinition, StorageError>(schedule)
+                }
+            })
+            .transpose()?;
         if let Some(schedule) = &schedule {
             schedule.validate()?;
             if schedule.enabled() && mode != ApplicationMode::Advanced {
@@ -446,17 +545,19 @@ impl RunEvidenceStore {
         if let Some(schedule) = &schedule {
             transaction.execute(
                 "INSERT INTO sync_profile_schedules
-                    (profile_id, interval_minutes, timezone, enabled)
-                 VALUES (?1, ?2, ?3, ?4)
+                    (profile_id, interval_minutes, timezone, enabled, next_run_at_unix_seconds)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(profile_id) DO UPDATE SET
                     interval_minutes = excluded.interval_minutes,
                     timezone = excluded.timezone,
-                    enabled = excluded.enabled",
+                    enabled = excluded.enabled,
+                    next_run_at_unix_seconds = excluded.next_run_at_unix_seconds",
                 params![
                     id.value_as_i64()?,
                     schedule.interval_minutes(),
                     schedule.timezone(),
                     schedule.enabled(),
+                    schedule.next_run_at_unix_seconds(),
                 ],
             )?;
         } else {
@@ -467,6 +568,79 @@ impl RunEvidenceStore {
         }
         transaction.commit()?;
         self.load_profile(id)?.ok_or(StorageError::ProfileNotFound { id: id.value() })
+    }
+
+    pub(crate) fn claim_due_schedule(
+        &mut self,
+        id: SyncProfileId,
+        now_unix_seconds: i64,
+    ) -> Result<Option<ClaimedScheduledRun>, StorageError> {
+        if now_unix_seconds < 0 {
+            return Err(StorageError::InvalidSchedule(
+                "current time must be a nonnegative Unix timestamp".to_owned(),
+            ));
+        }
+        let existing = self
+            .load_profile(id)?
+            .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
+        let Some(schedule) = existing.schedule() else {
+            return Ok(None);
+        };
+        let Some(scheduled_at) = schedule.next_run_at_unix_seconds() else {
+            return Ok(None);
+        };
+        if !schedule.enabled() || scheduled_at > now_unix_seconds {
+            return Ok(None);
+        }
+        let interval = i64::from(schedule.interval_minutes())
+            .checked_mul(60)
+            .ok_or_else(|| StorageError::InvalidSchedule("interval is out of range".to_owned()))?;
+        let elapsed = now_unix_seconds
+            .checked_sub(scheduled_at)
+            .ok_or_else(|| StorageError::InvalidSchedule("schedule time is out of range".to_owned()))?;
+        let occurrences = elapsed
+            .checked_div(interval)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| StorageError::InvalidSchedule("next run is out of range".to_owned()))?;
+        let next_run = scheduled_at
+            .checked_add(interval.checked_mul(occurrences).ok_or_else(|| {
+                StorageError::InvalidSchedule("next run is out of range".to_owned())
+            })?)
+            .ok_or_else(|| StorageError::InvalidSchedule("next run is out of range".to_owned()))?;
+
+        let transaction = self
+            .connection_mut()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current_revision: i64 = transaction.query_row(
+            "SELECT profile_revision FROM sync_profiles WHERE profile_id = ?1",
+            params![id.value_as_i64()?],
+            |row| row.get(0),
+        )?;
+        if u64::try_from(current_revision).ok() != Some(existing.revision()) {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let run_id = RunEvidenceStore::allocate_run_id_in_transaction(&transaction)?;
+        let snapshot = RunSnapshot::from_profile(run_id, existing.profile(), existing.authorizations())?;
+        let changed = transaction.execute(
+            "UPDATE sync_profile_schedules
+             SET next_run_at_unix_seconds = ?1
+             WHERE profile_id = ?2 AND enabled = 1
+               AND next_run_at_unix_seconds = ?3",
+            params![next_run, id.value_as_i64()?, scheduled_at],
+        )?;
+        if changed != 1 {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        RunEvidenceStore::begin_run_in_transaction(&transaction, &snapshot)?;
+        transaction.commit()?;
+        Ok(Some(ClaimedScheduledRun {
+            profile_id: id,
+            run_id,
+            scheduled_at_unix_seconds: scheduled_at,
+            snapshot,
+        }))
     }
 
     pub fn load_profile(
@@ -570,7 +744,7 @@ impl RunEvidenceStore {
     ) -> Result<Option<ScheduleDefinition>, StorageError> {
         let raw = connection
             .query_row(
-                "SELECT interval_minutes, timezone, enabled
+                "SELECT interval_minutes, timezone, enabled, next_run_at_unix_seconds
                  FROM sync_profile_schedules WHERE profile_id = ?1",
                 params![profile_id],
                 |row| {
@@ -578,16 +752,18 @@ impl RunEvidenceStore {
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
                     ))
                 },
             )
             .optional()?;
-        raw.map(|(interval_minutes, timezone, enabled)| {
-            ScheduleDefinition::new(
+        raw.map(|(interval_minutes, timezone, enabled, next_run_at_unix_seconds)| {
+            ScheduleDefinition::new_with_next_run_at(
                 u32::try_from(interval_minutes)
                     .map_err(|_| StorageError::InvalidSchedule("invalid interval".to_owned()))?,
                 timezone,
                 decode_profile_bool(enabled)?,
+                next_run_at_unix_seconds,
             )
         })
         .transpose()
@@ -613,6 +789,17 @@ impl SyncProfileId {
         i64::try_from(self.0)
             .map_err(|_| StorageError::CorruptEvidence("profile identifier is out of range".to_owned()))
     }
+}
+
+fn current_unix_seconds() -> Result<i64, StorageError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| StorageError::InvalidSchedule(format!("system clock is before Unix epoch: {error}")))
+        .and_then(|duration| {
+            i64::try_from(duration.as_secs()).map_err(|_| {
+                StorageError::InvalidSchedule("system clock is out of range".to_owned())
+            })
+        })
 }
 
 const PROFILE_SELECT: &str = "SELECT

@@ -241,9 +241,102 @@ impl RunWorkflow {
             authorizations,
             store,
             should_cancel,
+            true,
             source_volume_identity,
             destination_volume_identity,
         )?;
+        self.cleanup_partials_after_success(&confirmed, &report)?;
+        Ok(report)
+    }
+
+    /// Execute a scheduler-claimed Sync Run without a UI confirmation dialog.
+    /// The scheduler has already persisted the immutable Run Snapshot. This
+    /// method therefore reuses that run and still performs every non-optional
+    /// precheck, Fresh Analysis, recheck, verification, and reconciliation
+    /// boundary before or during filesystem mutation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_unattended<P, F>(
+        &self,
+        run_id: RunId,
+        profile: &crate::SyncProfile,
+        authorizations: AuthorizationSnapshot,
+        probe: &P,
+        store: &mut RunEvidenceStore,
+        should_cancel: F,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        P: PrecheckProbe,
+        F: Fn() -> bool,
+    {
+        if let Err(error) = validate_unattended_authorizations(profile, authorizations) {
+            store.mark_blocked(run_id, &error.to_string())?;
+            return Err(error);
+        }
+        let lease = match self.acquire_precheck(run_id, profile, probe) {
+            Ok(lease) => lease,
+            Err(error) => {
+                store.mark_blocked(run_id, &error.to_string())?;
+                return Err(error);
+            }
+        };
+        let source_volume_identity = lease.result().source_volume_identity();
+        let destination_volume_identity = lease.result().destination_volume_identity();
+        let analysis = match FreshAnalysis::analyze(profile) {
+            Ok(analysis) => analysis,
+            Err(error) => {
+                store.mark_blocked(run_id, &error.to_string())?;
+                return Err(error.into());
+            }
+        };
+        let confirmed = match analysis.confirm(profile) {
+            Ok(confirmed) => confirmed,
+            Err(error) => {
+                store.mark_blocked(run_id, &error.to_string())?;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = self.recheck_precheck(
+            profile,
+            probe,
+            source_volume_identity,
+            destination_volume_identity,
+            false,
+            false,
+        ) {
+            store.mark_blocked(run_id, &error.to_string())?;
+            return Err(error);
+        }
+        let (peer_a_volume_identity, peer_b_volume_identity) = orient_volume_identities(
+            profile,
+            source_volume_identity,
+            destination_volume_identity,
+        );
+        store.record_run_volume_identities(
+            run_id,
+            peer_a_volume_identity,
+            peer_b_volume_identity,
+        )?;
+        let report = match self.execute_confirmed_with_authorizations(
+            run_id,
+            &confirmed,
+            authorizations,
+            store,
+            should_cancel,
+            false,
+            source_volume_identity,
+            destination_volume_identity,
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                if store
+                    .load_report(run_id)
+                    .is_ok_and(|report| report.status() == RunReportStatus::InProgress)
+                {
+                    store.mark_blocked(run_id, &error.to_string())?;
+                }
+                return Err(error);
+            }
+        };
         self.cleanup_partials_after_success(&confirmed, &report)?;
         Ok(report)
     }
@@ -1415,6 +1508,7 @@ impl RunWorkflow {
         authorizations: AuthorizationSnapshot,
         store: &mut RunEvidenceStore,
         should_cancel: F,
+        persist_snapshot: bool,
         source_volume_identity: Option<crate::VolumeIdentity>,
         destination_volume_identity: Option<crate::VolumeIdentity>,
     ) -> Result<RunReport, WorkflowError>
@@ -1429,15 +1523,17 @@ impl RunWorkflow {
             source_volume_identity,
             destination_volume_identity,
         );
-        let snapshot = RunSnapshot::from_profile_with_volume_identities(
-            run_id,
-            confirmed.profile(),
-            authorizations,
-            peer_a_volume_identity,
-            peer_b_volume_identity,
-        )?;
         store.backup_before_file_change()?;
-        store.begin_run(&snapshot)?;
+        if persist_snapshot {
+            let snapshot = RunSnapshot::from_profile_with_volume_identities(
+                run_id,
+                confirmed.profile(),
+                authorizations,
+                peer_a_volume_identity,
+                peer_b_volume_identity,
+            )?;
+            store.begin_run(&snapshot)?;
+        }
         let inventory = SourceInventorySnapshot::from_inventory(plan.source_inventory());
         let destination_inventory = SourceInventorySnapshot::from_inventory(plan.destination_inventory());
         store.record_source_inventory(run_id, &inventory)?;
@@ -1650,6 +1746,7 @@ impl RunWorkflow {
             authorizations,
             store,
             should_cancel,
+            true,
             source_volume_identity,
             destination_volume_identity,
         )?;
@@ -2474,6 +2571,28 @@ impl RunWorkflow {
         }
         Ok(())
     }
+}
+
+fn validate_unattended_authorizations(
+    profile: &crate::SyncProfile,
+    authorizations: AuthorizationSnapshot,
+) -> Result<(), WorkflowError> {
+    let options = profile.options();
+    if (options.safe_delete || options.destination_cleanup)
+        && !authorizations.allow_unattended_destructive()
+    {
+        return Err(WorkflowError::InvalidRun(
+            "scheduled destructive actions require explicit unattended authorization".to_owned(),
+        ));
+    }
+    if options.deletion_method == Some(DeletionMethod::PermanentRemoval)
+        && !authorizations.allow_unattended_permanent_removal()
+    {
+        return Err(WorkflowError::InvalidRun(
+            "scheduled Permanent Removal requires separate explicit authorization".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn ssh_peer_for_profile(
@@ -4377,6 +4496,7 @@ mod tests {
                 AuthorizationSnapshot::default(),
                 &mut store,
                 || calls.fetch_add(1, Ordering::Relaxed) >= 514,
+                true,
                 None,
                 None,
             )

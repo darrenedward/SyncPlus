@@ -951,7 +951,7 @@ impl RunEvidenceStore {
                     ));
                 }
             };
-            if version < 16 {
+            if version < 17 {
                 let manager = DatabaseBackupManager::for_database(path)
                     .map_err(|error| StorageError::DatabaseBackup(error.to_string()))?;
                 if let Err(error) = manager.create_validated_backup(&connection) {
@@ -1026,7 +1026,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 16 {
+        if version > 17 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -1569,6 +1569,35 @@ impl RunEvidenceStore {
             transaction.pragma_update(None, "user_version", 16)?;
             verify_integrity(&transaction)?;
             transaction.commit()?;
+            version = 16;
+        }
+        if version == 16 {
+            let transaction = connection.transaction()?;
+            let has_next_run_column: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('sync_profile_schedules')
+                    WHERE name = 'next_run_at_unix_seconds'
+                )",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_next_run_column {
+                transaction.execute(
+                    "ALTER TABLE sync_profile_schedules
+                     ADD COLUMN next_run_at_unix_seconds INTEGER
+                     CHECK (next_run_at_unix_seconds IS NULL OR next_run_at_unix_seconds >= 0)",
+                    [],
+                )?;
+                transaction.execute(
+                    "UPDATE sync_profile_schedules
+                     SET next_run_at_unix_seconds = CAST(strftime('%s', 'now') AS INTEGER)
+                     WHERE enabled = 1 AND next_run_at_unix_seconds IS NULL",
+                    [],
+                )?;
+            }
+            transaction.pragma_update(None, "user_version", 17)?;
+            verify_integrity(&transaction)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -1606,6 +1635,15 @@ impl RunEvidenceStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::begin_run_in_transaction(&transaction, snapshot)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn begin_run_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        snapshot: &RunSnapshot,
+    ) -> Result<(), StorageError> {
         let profile = snapshot.profile();
         let options = snapshot.validated_options();
         let authorizations = snapshot.authorizations();
@@ -1688,7 +1726,36 @@ impl RunEvidenceStore {
                 params![snapshot.run_id().value(), ordinal as i64, pattern],
             )?;
         }
-        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Persist volume identities discovered by a scheduled precheck before
+    /// any filesystem mutation. This fills only the pre-mutation identity
+    /// fields of the already-frozen report snapshot and never changes its
+    /// profile, options, or authorizations.
+    pub(crate) fn record_run_volume_identities(
+        &mut self,
+        run_id: RunId,
+        peer_a_volume_identity: Option<VolumeIdentity>,
+        peer_b_volume_identity: Option<VolumeIdentity>,
+    ) -> Result<(), StorageError> {
+        let changed = self.connection.execute(
+            "UPDATE run_snapshots
+             SET peer_a_volume_identity = COALESCE(peer_a_volume_identity, ?1),
+                 peer_b_volume_identity = COALESCE(peer_b_volume_identity, ?2)
+             WHERE run_id = ?3",
+            params![
+                peer_a_volume_identity.map(volume_identity_to_blob),
+                peer_b_volume_identity.map(volume_identity_to_blob),
+                run_id.value(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::InvalidEvent(format!(
+                "run {} does not exist",
+                run_id.value()
+            )));
+        }
         Ok(())
     }
 
@@ -2367,6 +2434,14 @@ impl RunEvidenceStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let next = Self::allocate_run_id_in_transaction(&transaction)?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    pub(crate) fn allocate_run_id_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+    ) -> Result<RunId, StorageError> {
         let allocated: i64 = transaction.query_row(
             "SELECT next_run_id FROM run_id_sequence WHERE sequence_id = 1",
             [],
@@ -2389,7 +2464,6 @@ impl RunEvidenceStore {
             "UPDATE run_id_sequence SET next_run_id = ?1 WHERE sequence_id = 1",
             params![following],
         )?;
-        transaction.commit()?;
         Ok(RunId::new(
             u64::try_from(next)
                 .map_err(|_| StorageError::InvalidSnapshot("run identifier is invalid".to_owned()))?,
@@ -5348,7 +5422,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
         assert!(
             migrated
                 .connection
@@ -5399,7 +5473,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
         for table in ["application_settings", "sync_profiles", "sync_profile_exclusions"] {
             assert!(
                 migrated
@@ -5452,7 +5526,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            16
+            17
         );
     }
 
