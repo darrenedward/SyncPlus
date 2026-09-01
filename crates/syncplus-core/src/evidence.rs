@@ -8,6 +8,7 @@ use std::{
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
+use crate::backup::DatabaseBackupManager;
 use crate::{
     AuthorizationSnapshot, DeletionMethod, ItemType, MetadataRequirements, OneWaySource, Peer,
     PeerSide, PartialTransferPolicy, PlanActionKind, ProcessSpecError, ProcessSpecification,
@@ -824,6 +825,7 @@ pub enum StorageError {
     InvalidSnapshot(String),
     InvalidEvent(String),
     CorruptEvidence(String),
+    DatabaseBackup(String),
 }
 
 impl fmt::Display for StorageError {
@@ -865,6 +867,7 @@ impl fmt::Display for StorageError {
             Self::InvalidSnapshot(reason) => write!(formatter, "invalid run snapshot: {reason}"),
             Self::InvalidEvent(reason) => write!(formatter, "invalid journal event: {reason}"),
             Self::CorruptEvidence(reason) => write!(formatter, "corrupt run evidence: {reason}"),
+            Self::DatabaseBackup(reason) => write!(formatter, "database backup failed: {reason}"),
         }
     }
 }
@@ -885,6 +888,7 @@ impl From<io::Error> for StorageError {
 
 pub struct RunEvidenceStore {
     connection: Connection,
+    database_path: Option<PathBuf>,
     #[cfg(test)]
     fail_event_phase: Option<&'static str>,
 }
@@ -934,8 +938,41 @@ impl RunEvidenceStore {
                 return Err(StorageError::UnsafeDatabasePath);
             }
         }
+        let existed_before_open = fs::symlink_metadata(path).is_ok();
         let connection = open_canonical_connection(path)?;
-        let store = Self::from_connection(connection)?;
+        if existed_before_open {
+            let version: i64 = match connection.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+                Ok(version) => version,
+                Err(error) => {
+                    drop(connection);
+                    return Err(quarantine_after_open_failure(
+                        path,
+                        format!("could not read the live database schema version: {error}"),
+                    ));
+                }
+            };
+            if version < 16 {
+                let manager = DatabaseBackupManager::for_database(path)
+                    .map_err(|error| StorageError::DatabaseBackup(error.to_string()))?;
+                if let Err(error) = manager.create_validated_backup(&connection) {
+                    if matches!(error, crate::BackupError::Integrity(_) | crate::BackupError::Sqlite(_)) {
+                        drop(connection);
+                        return Err(quarantine_after_open_failure(
+                            path,
+                            format!("pre-migration database backup failed: {error}"),
+                        ));
+                    }
+                    return Err(StorageError::DatabaseBackup(error.to_string()));
+                }
+            }
+        }
+        let store = match Self::from_connection(connection, Some(path.to_path_buf())) {
+            Ok(store) => store,
+            Err(error @ StorageError::CorruptEvidence(_)) => {
+                return Err(quarantine_after_open_failure(path, error.to_string()))
+            }
+            Err(error) => return Err(error),
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -964,7 +1001,8 @@ impl RunEvidenceStore {
 
     #[cfg(test)]
     fn open_path(path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        Self::from_connection(Self::open_connection(path)?)
+        let path = path.as_ref();
+        Self::from_connection(Self::open_connection(path)?, Some(path.to_path_buf()))
     }
 
     #[cfg(any(test, not(target_os = "linux")))]
@@ -976,10 +1014,13 @@ impl RunEvidenceStore {
     }
 
     pub fn open_in_memory() -> Result<Self, StorageError> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(Connection::open_in_memory()?, None)
     }
 
-    fn from_connection(mut connection: Connection) -> Result<Self, StorageError> {
+    fn from_connection(
+        mut connection: Connection,
+        database_path: Option<PathBuf>,
+    ) -> Result<Self, StorageError> {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -1532,6 +1573,7 @@ impl RunEvidenceStore {
         verify_integrity(&connection)?;
         Ok(Self {
             connection,
+            database_path,
             #[cfg(test)]
             fail_event_phase: None,
         })
@@ -1543,6 +1585,20 @@ impl RunEvidenceStore {
 
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
         &mut self.connection
+    }
+
+    /// Validate and snapshot the Application Database before a file-changing
+    /// run. In-memory stores used by core tests do not have a persistent DB to
+    /// protect and therefore intentionally perform no filesystem work.
+    pub fn backup_before_file_change(&self) -> Result<(), StorageError> {
+        let Some(database_path) = self.database_path.as_deref() else {
+            return Ok(());
+        };
+        DatabaseBackupManager::for_database(database_path)
+            .map_err(|error| StorageError::DatabaseBackup(error.to_string()))?
+            .create_validated_backup(&self.connection)
+            .map(|_| ())
+            .map_err(|error| StorageError::DatabaseBackup(error.to_string()))
     }
 
     /// Persist the immutable snapshot before any filesystem action starts.
@@ -3168,6 +3224,23 @@ fn verify_integrity(connection: &Connection) -> Result<(), StorageError> {
         )));
     }
     Ok(())
+}
+
+fn quarantine_after_open_failure(path: &Path, reason: String) -> StorageError {
+    match DatabaseBackupManager::for_database(path) {
+        Ok(manager) => match manager.quarantine_live_database() {
+            Ok(quarantine_path) => StorageError::DatabaseBackup(format!(
+                "{reason}; the live database was quarantined at {quarantine_path:?}"
+            )),
+            Err(crate::BackupError::LiveDatabaseHealthy) => StorageError::DatabaseBackup(reason),
+            Err(error) => StorageError::DatabaseBackup(format!(
+                "{reason}; database quarantine failed: {error}"
+            )),
+        },
+        Err(error) => StorageError::DatabaseBackup(format!(
+            "{reason}; database quarantine could not be prepared: {error}"
+        )),
+    }
 }
 
 struct EventFields {
@@ -5244,7 +5317,7 @@ mod tests {
             )
             .expect("fixture should represent a version ten database");
 
-        let migrated = RunEvidenceStore::from_connection(store.connection)
+        let migrated = RunEvidenceStore::from_connection(store.connection, None)
             .expect("version ten database should migrate");
         let version: i64 = migrated
             .connection
@@ -5330,6 +5403,36 @@ mod tests {
     }
 
     #[test]
+    fn canonical_open_creates_a_validated_backup_before_migration() {
+        let directory = TestDatabaseDirectory::new("syncplus-migration-backup");
+        let database = RunEvidenceStore::canonical_path_for_data_home(directory.path());
+        {
+            let store = RunEvidenceStore::open_at_data_home(directory.path())
+                .expect("canonical database should open");
+            drop(store);
+        }
+        {
+            let connection = Connection::open(&database).expect("database should reopen");
+            connection
+                .pragma_update(None, "user_version", 15)
+                .expect("fixture should represent a pre-migration database");
+        }
+
+        let migrated = RunEvidenceStore::open_at_data_home(directory.path())
+            .expect("migration should complete after the pre-migration backup");
+        let manager = DatabaseBackupManager::for_database(&database)
+            .expect("canonical backup manager should resolve");
+        assert_eq!(manager.list_validated_backups().unwrap().len(), 1);
+        assert_eq!(
+            migrated
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            16
+        );
+    }
+
+    #[test]
     fn failed_application_storage_migration_rolls_back_its_schema_changes() {
         let directory = TestDatabaseDirectory::new("syncplus-migration-rollback");
         let path = directory.path().join("syncplus.db");
@@ -5389,6 +5492,34 @@ mod tests {
         let connection = Connection::open(&path).expect("corrupt SQLite should still open");
         assert!(RunEvidenceStore::open(&path).is_err());
         assert!(verify_integrity(&connection).is_err());
+    }
+
+    #[test]
+    fn canonical_open_quarantines_an_unverifiable_live_database() {
+        let directory = TestDatabaseDirectory::new("syncplus-canonical-corruption");
+        let database = RunEvidenceStore::canonical_path_for_data_home(directory.path());
+        let store = RunEvidenceStore::open_at_data_home(directory.path())
+            .expect("canonical database should open");
+        drop(store);
+        let mut bytes = fs::read(&database).expect("read canonical database");
+        bytes[16..18].copy_from_slice(&8192_u16.to_be_bytes());
+        fs::write(&database, bytes).expect("write corrupt canonical database");
+
+        let error = match RunEvidenceStore::open_at_data_home(directory.path()) {
+            Ok(_) => panic!("corrupt canonical database must not open"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StorageError::DatabaseBackup(_)));
+        assert!(!database.exists());
+        let manager = DatabaseBackupManager::for_database(&database)
+            .expect("canonical backup manager should resolve");
+        assert!(
+            fs::read_dir(manager.quarantine_dir())
+                .unwrap()
+                .filter_map(Result::ok)
+                .count()
+                >= 1
+        );
     }
 
     struct TestDatabaseDirectory(PathBuf);
