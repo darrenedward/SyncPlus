@@ -2597,7 +2597,9 @@ impl RunEvidenceStore {
             ));
         }
         let action_id = event_action_id(&event);
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let run_exists: Option<i64> = transaction
             .query_row(
                 "SELECT run_id FROM run_snapshots WHERE run_id = ?1",
