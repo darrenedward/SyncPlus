@@ -276,6 +276,24 @@ impl Peer {
         matches!(self.endpoint, PeerEndpoint::Ssh(_))
     }
 
+    /// Compare endpoint identity without considering display names or
+    /// credentials. Credentials select how an endpoint is accessed; they do
+    /// not make the same local folder or remote location a different pair.
+    pub fn same_endpoint(&self, other: &Self) -> bool {
+        match (self.endpoint(), other.endpoint()) {
+            (PeerEndpoint::Local { root: left }, PeerEndpoint::Local { root: right }) => {
+                left == right
+            }
+            (PeerEndpoint::Ssh(left), PeerEndpoint::Ssh(right)) => {
+                left.server() == right.server()
+                    && left.username() == right.username()
+                    && left.port() == right.port()
+                    && left.remote_path() == right.remote_path()
+            }
+            _ => false,
+        }
+    }
+
     pub fn ssh_peer(&self) -> Option<&SshPeer> {
         match &self.endpoint {
             PeerEndpoint::Local { .. } => None,

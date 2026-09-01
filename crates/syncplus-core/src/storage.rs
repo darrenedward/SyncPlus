@@ -149,10 +149,19 @@ impl RunEvidenceStore {
         &mut self,
         profile: &SyncProfile,
     ) -> Result<PersistedSyncProfile, StorageError> {
+        self.create_profile_with_authorizations(profile, AuthorizationSnapshot::default())
+    }
+
+    pub fn create_profile_with_authorizations(
+        &mut self,
+        profile: &SyncProfile,
+        authorizations: AuthorizationSnapshot,
+    ) -> Result<PersistedSyncProfile, StorageError> {
         validate_profile(profile)?;
+        self.reject_duplicate_endpoint_pair(profile, None)?;
         let values = ProfileValues::from_profile(profile);
         let transaction = self.connection_mut().transaction()?;
-        let id = insert_profile(&transaction, &values)?;
+        let id = insert_profile(&transaction, &values, authorizations)?;
         insert_exclusions(&transaction, id, profile)?;
         transaction.commit()?;
         let id = SyncProfileId::new(
@@ -162,7 +171,7 @@ impl RunEvidenceStore {
             id,
             profile: profile.clone(),
             schedule_enabled: false,
-            authorizations: AuthorizationSnapshot::default(),
+            authorizations,
         })
     }
 
@@ -175,6 +184,7 @@ impl RunEvidenceStore {
         let existing = self
             .load_profile(id)?
             .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
+        self.reject_duplicate_endpoint_pair(profile, Some(id))?;
         let values = ProfileValues::from_profile(profile);
         let transaction = self.connection_mut().transaction()?;
         let changed = update_profile_row(&transaction, id, &values)?;
@@ -229,6 +239,22 @@ impl RunEvidenceStore {
             params![id.value_as_i64()?],
         )?;
         Ok(changed == 1)
+    }
+
+    fn reject_duplicate_endpoint_pair(
+        &self,
+        profile: &SyncProfile,
+        excluded_id: Option<SyncProfileId>,
+    ) -> Result<(), StorageError> {
+        let duplicate = self.list_profiles()?.into_iter().any(|persisted| {
+            Some(persisted.id()) != excluded_id
+                && persisted.profile().peer_a().same_endpoint(profile.peer_a())
+                && persisted.profile().peer_b().same_endpoint(profile.peer_b())
+        });
+        if duplicate {
+            return Err(StorageError::DuplicateEndpointPair);
+        }
+        Ok(())
     }
 
     fn materialize_profile(&self, raw: RawProfile) -> Result<PersistedSyncProfile, StorageError> {
@@ -378,7 +404,14 @@ impl PersistedPeer {
     }
 }
 
-fn insert_profile(transaction: &Transaction<'_>, values: &ProfileValues) -> Result<i64, StorageError> {
+fn insert_profile(
+    transaction: &Transaction<'_>,
+    values: &ProfileValues,
+    authorizations: AuthorizationSnapshot,
+) -> Result<i64, StorageError> {
+    let mut parameters = profile_params(values);
+    parameters.push(Box::new(i64::from(authorizations.allow_unattended_destructive())));
+    parameters.push(Box::new(i64::from(authorizations.allow_unattended_permanent_removal())));
     transaction.execute(
         "INSERT INTO sync_profiles (
             name, mode, source,
@@ -397,9 +430,9 @@ fn insert_profile(transaction: &Transaction<'_>, values: &ProfileValues) -> Resu
             ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
             ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
             ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-            ?30, ?31, ?32, 0, 0, 0
+            ?30, ?31, ?32, 0, ?33, ?34
         )",
-        rusqlite::params_from_iter(profile_params(values).iter().map(|value| value.as_ref())),
+        rusqlite::params_from_iter(parameters.iter().map(|value| value.as_ref())),
     )?;
     Ok(transaction.last_insert_rowid())
 }

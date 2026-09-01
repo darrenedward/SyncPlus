@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::Duration};
 
 use eframe::egui;
 use syncplus_core::{
-    AnalysisOutcome, ApplicationMode, ApplicationSettings, DeletionMethod,
+    AnalysisOutcome, ApplicationMode, ApplicationSettings, AuthorizationSnapshot, DeletionMethod,
     FreshAnalysis, LocalPrecheckProbe, MetadataRequirements, OneWaySource, PartialTransferPolicy,
     Peer, PeerEndpoint, PersistedSyncProfile,
     PrecheckErrorKind, PrecheckResult, RetryPolicy, RunEvidenceStore, SavedSecretReference,
@@ -36,6 +36,9 @@ pub enum UiValidationError {
     SavedSecretUnavailable,
     InvalidRetryAttempts,
     InvalidRetryDelay,
+    CloneEndpointsUnchanged,
+    DuplicateEndpointPair,
+    CloneAuthorizationConfirmationRequired,
     PrecheckBlocked,
     ReviewNotReady,
     StrongerConfirmationRequired,
@@ -67,6 +70,15 @@ impl std::fmt::Display for UiValidationError {
             Self::InvalidRetryDelay => {
                 formatter.write_str("Retry delay must be between 0 and 3,600,000 milliseconds.")
             }
+            Self::CloneEndpointsUnchanged => {
+                formatter.write_str("A cloned profile must change at least one endpoint before it can be saved.")
+            }
+            Self::DuplicateEndpointPair => {
+                formatter.write_str("The source and destination endpoint pair is already used by another Sync Profile.")
+            }
+            Self::CloneAuthorizationConfirmationRequired => formatter.write_str(
+                "Review and explicitly confirm the cloned profile's unattended authorization choice before saving.",
+            ),
             Self::PrecheckBlocked => {
                 formatter.write_str("The non-mutating precheck found blockers; execution is not available.")
             }
@@ -83,6 +95,7 @@ impl std::fmt::Display for UiValidationError {
             Self::Core(message) => formatter.write_str(message),
         }
     }
+
 }
 
 impl std::error::Error for UiValidationError {}
@@ -238,6 +251,20 @@ impl EndpointForm {
             }
         }
     }
+
+    fn without_saved_credentials(mut self) -> Self {
+        if matches!(self.authentication, AuthenticationForm::SavedPassword) {
+            self.authentication = AuthenticationForm::Agent;
+            self.secret_reference.clear();
+        }
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloneAuthorizationChoice {
+    Reset,
+    CopyUnattendedDestructive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +276,7 @@ struct ProfileForm {
     mode: SyncMode,
     source: OneWaySource,
     safe_delete: bool,
+    deletion_method: Option<DeletionMethod>,
     destination_cleanup: bool,
     exclusions: String,
     timestamps: bool,
@@ -258,6 +286,11 @@ struct ProfileForm {
     partial_transfer_policy: PartialTransferPolicy,
     retry_attempts: String,
     retry_delay_millis: String,
+    clone_source: Option<SyncProfileId>,
+    clone_source_endpoints: Option<(Peer, Peer)>,
+    clone_source_authorizations: AuthorizationSnapshot,
+    clone_authorization_choice: CloneAuthorizationChoice,
+    clone_authorization_confirmed: bool,
 }
 
 impl Default for ProfileForm {
@@ -270,6 +303,7 @@ impl Default for ProfileForm {
             mode: SyncMode::OneWay,
             source: OneWaySource::PeerA,
             safe_delete: false,
+            deletion_method: None,
             destination_cleanup: false,
             exclusions: String::new(),
             timestamps: false,
@@ -279,6 +313,11 @@ impl Default for ProfileForm {
             partial_transfer_policy: PartialTransferPolicy::Cleanup,
             retry_attempts: RetryPolicy::default().max_attempts().to_string(),
             retry_delay_millis: RetryPolicy::default().initial_delay().as_millis().to_string(),
+            clone_source: None,
+            clone_source_endpoints: None,
+            clone_source_authorizations: AuthorizationSnapshot::default(),
+            clone_authorization_choice: CloneAuthorizationChoice::Reset,
+            clone_authorization_confirmed: false,
         }
     }
 }
@@ -297,6 +336,7 @@ impl ProfileForm {
             mode: value.mode(),
             source: value.source(),
             safe_delete: options.safe_delete,
+            deletion_method: options.deletion_method,
             destination_cleanup: options.destination_cleanup,
             exclusions: value.exclusions().join("\n"),
             timestamps: metadata.timestamps(),
@@ -306,6 +346,11 @@ impl ProfileForm {
             partial_transfer_policy: options.partial_transfer_policy,
             retry_attempts: options.retry_policy.max_attempts().to_string(),
             retry_delay_millis: options.retry_policy.initial_delay().as_millis().to_string(),
+            clone_source: None,
+            clone_source_endpoints: None,
+            clone_source_authorizations: AuthorizationSnapshot::default(),
+            clone_authorization_choice: CloneAuthorizationChoice::Reset,
+            clone_authorization_confirmed: false,
         }
     }
 
@@ -332,7 +377,7 @@ impl ProfileForm {
         let mut options = SyncOptions::default();
         options.safe_delete = self.safe_delete;
         options.destination_cleanup = self.destination_cleanup;
-        options.deletion_method = self.safe_delete.then_some(DeletionMethod::Trash);
+        options.deletion_method = self.safe_delete.then(|| self.deletion_method.unwrap_or(DeletionMethod::Trash));
         options.metadata = MetadataRequirements::new(true, true, true, self.timestamps)
             .with_specialist_metadata(SpecialistMetadataRequirements::new(
                 self.ownership,
@@ -424,6 +469,36 @@ impl SyncPlusApp {
         self.status = "New profile: One-Way Sync is selected and destructive actions are off.".to_owned();
     }
 
+    pub fn clone_profile(&mut self, id: SyncProfileId) -> Result<(), UiValidationError> {
+        let persisted = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id() == id)
+            .cloned()
+            .ok_or_else(|| UiValidationError::Core(format!("Sync Profile {id:?} was not found")))?;
+        let source = persisted.profile();
+        let has_unattended_authorization = persisted.authorizations().allow_unattended_destructive()
+            || persisted.authorizations().allow_unattended_permanent_removal();
+        let mut form = ProfileForm::from_persisted(&persisted);
+        form.id = None;
+        form.name = self.next_clone_name(source.name());
+        form.peer_a = form.peer_a.without_saved_credentials();
+        form.peer_b = form.peer_b.without_saved_credentials();
+        form.deletion_method = form.safe_delete.then_some(DeletionMethod::Trash);
+        form.clone_source = Some(id);
+        form.clone_source_endpoints = Some((source.peer_a().clone(), source.peer_b().clone()));
+        form.clone_source_authorizations = persisted.authorizations();
+        form.clone_authorization_choice = CloneAuthorizationChoice::Reset;
+        form.clone_authorization_confirmed = !has_unattended_authorization;
+        self.form = form;
+        self.review = None;
+        self.status = format!(
+            "Cloned {} as an editable copy. Review both endpoints; saved credentials and Permanent Removal authorization are not copied.",
+            source.name()
+        );
+        Ok(())
+    }
+
     pub fn set_mode(&mut self, mode: ApplicationMode) {
         self.settings = ApplicationSettings::new(mode, self.settings.theme());
         if let Err(error) = self.store.save_settings(&self.settings) {
@@ -448,15 +523,16 @@ impl SyncPlusApp {
 
     pub fn save_profile(&mut self) -> Result<SyncProfileId, UiValidationError> {
         let profile = self.validated_profile()?;
+        let clone_authorizations = self.validate_clone(&profile)?;
         let persisted = match self.form.id {
             Some(id) => self
                 .store
                 .update_profile(id, &profile)
-                .map_err(|error| UiValidationError::Core(error.to_string()))?,
+                .map_err(map_storage_error)?,
             None => self
                 .store
-                .create_profile(&profile)
-                .map_err(|error| UiValidationError::Core(error.to_string()))?,
+                .create_profile_with_authorizations(&profile, clone_authorizations)
+                .map_err(map_storage_error)?,
         };
         let id = persisted.id();
         self.form = ProfileForm::from_persisted(&persisted);
@@ -467,6 +543,54 @@ impl SyncPlusApp {
             .map_err(|error| UiValidationError::Core(error.to_string()))?;
         self.status = "Profile saved. Changes apply to future runs; an active run keeps its Profile Snapshot.".to_owned();
         Ok(id)
+    }
+
+    fn validate_clone(
+        &self,
+        profile: &SyncProfile,
+    ) -> Result<AuthorizationSnapshot, UiValidationError> {
+        let Some(_source_id) = self.form.clone_source else {
+            return Ok(AuthorizationSnapshot::default());
+        };
+        let Some((source_a, source_b)) = &self.form.clone_source_endpoints else {
+            return Err(UiValidationError::Core(
+                "clone source endpoints are unavailable; start the clone again".to_owned(),
+            ));
+        };
+        if profile.peer_a().same_endpoint(source_a) && profile.peer_b().same_endpoint(source_b) {
+            return Err(UiValidationError::CloneEndpointsUnchanged);
+        }
+        let source_authorizations = self.form.clone_source_authorizations;
+        let has_unattended_authorization = source_authorizations.allow_unattended_destructive()
+            || source_authorizations.allow_unattended_permanent_removal();
+        if has_unattended_authorization && !self.form.clone_authorization_confirmed {
+            return Err(UiValidationError::CloneAuthorizationConfirmationRequired);
+        }
+        if self.form.clone_authorization_choice == CloneAuthorizationChoice::CopyUnattendedDestructive
+            && self.settings.mode() != ApplicationMode::Advanced
+        {
+            return Err(UiValidationError::CloneAuthorizationConfirmationRequired);
+        }
+        let copy_destructive = self.form.clone_authorization_choice
+            == CloneAuthorizationChoice::CopyUnattendedDestructive;
+        Ok(AuthorizationSnapshot::new(
+            copy_destructive && source_authorizations.allow_unattended_destructive(),
+            false,
+        ))
+    }
+
+    fn next_clone_name(&self, source_name: &str) -> String {
+        let base = format!("{source_name} copy");
+        if !self.profiles.iter().any(|profile| profile.profile().name() == base) {
+            return base;
+        }
+        for number in 2..=u32::MAX {
+            let candidate = format!("{base} {number}");
+            if !self.profiles.iter().any(|profile| profile.profile().name() == candidate) {
+                return candidate;
+            }
+        }
+        base
     }
 
     fn validated_profile(&self) -> Result<SyncProfile, UiValidationError> {
@@ -699,12 +823,21 @@ impl SyncPlusApp {
             .map(|profile| (profile.id(), profile.profile().name().to_owned()))
             .collect::<Vec<_>>();
         for (id, name) in &profiles {
-            if ui
-                .selectable_label(self.form.id == Some(*id), name)
-                .clicked()
-            {
-                self.select_profile(*id);
-            }
+            ui.push_id(id.value(), |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(self.form.id == Some(*id), name)
+                        .clicked()
+                    {
+                        self.select_profile(*id);
+                    }
+                    if ui.button("Clone").clicked() {
+                        if let Err(error) = self.clone_profile(*id) {
+                            self.status = format!("Profile could not be cloned: {error}");
+                        }
+                    }
+                });
+            });
         }
         if profiles.is_empty() {
             ui.label("No profiles saved yet.");
@@ -715,6 +848,44 @@ impl SyncPlusApp {
         let form_before_draw = self.form.clone();
         ui.heading("Sync Profile");
         ui.label("Define named endpoints and safety settings. SyncPlus never accepts arbitrary rsync arguments.");
+        if let Some(source_id) = self.form.clone_source {
+            ui.group(|ui| {
+                ui.heading("Clone Profile safeguards");
+                ui.label(format!(
+                    "This is an editable copy of Sync Profile {source_id:?}. Both endpoint forms below are pre-filled for review. Change at least one endpoint before saving."
+                ));
+                ui.label("Saving this clone changes future Sync Runs only; an active run continues using its frozen Profile Snapshot.");
+                ui.label("Saved passwords, passphrases, and keyring references were cleared from the clone. Configure authentication intentionally through the approved SSH/keyring controls.");
+                let source_authorizations = self.form.clone_source_authorizations;
+                if source_authorizations.allow_unattended_destructive()
+                    || source_authorizations.allow_unattended_permanent_removal()
+                {
+                    ui.label("Authorization warning: this clone does not silently inherit unattended destructive authorization.");
+                    ui.radio_value(
+                        &mut self.form.clone_authorization_choice,
+                        CloneAuthorizationChoice::Reset,
+                        "Reset unattended destructive authorization (recommended)",
+                    );
+                    if source_authorizations.allow_unattended_destructive() {
+                        let copy_enabled = self.settings.mode() == ApplicationMode::Advanced;
+                        ui.add_enabled_ui(copy_enabled, |ui| {
+                            ui.radio_value(
+                                &mut self.form.clone_authorization_choice,
+                                CloneAuthorizationChoice::CopyUnattendedDestructive,
+                                "Copy unattended destructive authorization (Advanced only)",
+                            );
+                        });
+                    }
+                    if source_authorizations.allow_unattended_permanent_removal() {
+                        ui.label("Permanent Removal authorization is never copied by cloning. It requires separate Advanced Mode authorization.");
+                    }
+                    ui.checkbox(
+                        &mut self.form.clone_authorization_confirmed,
+                        "I understand and confirm this clone's explicit authorization choice.",
+                    );
+                }
+            });
+        }
         ui.horizontal(|ui| {
             ui.label("Profile name");
             ui.text_edit_singleline(&mut self.form.name);
@@ -741,7 +912,27 @@ impl SyncPlusApp {
         });
         if self.settings.mode() == ApplicationMode::Advanced {
             ui.collapsing("Advanced safety options", |ui| {
-                ui.checkbox(&mut self.form.safe_delete, "One-Way Safe-Delete Sync");
+                let safe_delete_changed = ui
+                    .checkbox(&mut self.form.safe_delete, "One-Way Safe-Delete Sync")
+                    .changed();
+                if !self.form.safe_delete {
+                    self.form.deletion_method = None;
+                } else if safe_delete_changed && self.form.deletion_method.is_none() {
+                    self.form.deletion_method = Some(DeletionMethod::Trash);
+                }
+                if self.form.safe_delete {
+                    ui.label("Recovery method (Permanent Removal is separately authorized and irreversible):");
+                    ui.radio_value(
+                        &mut self.form.deletion_method,
+                        Some(DeletionMethod::Trash),
+                        "Move verified removals to Trash",
+                    );
+                    ui.radio_value(
+                        &mut self.form.deletion_method,
+                        Some(DeletionMethod::PermanentRemoval),
+                        "Permanent Removal (separate Advanced authorization)",
+                    );
+                }
                 ui.checkbox(&mut self.form.destination_cleanup, "Destination Cleanup");
                 ui.separator();
                 ui.label("Metadata preservation (validated named options)");
@@ -1145,6 +1336,13 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn map_storage_error(error: syncplus_core::StorageError) -> UiValidationError {
+    match error {
+        syncplus_core::StorageError::DuplicateEndpointPair => UiValidationError::DuplicateEndpointPair,
+        other => UiValidationError::Core(other.to_string()),
+    }
+}
+
 fn format_precheck_error(error: &PrecheckErrorKind) -> String {
     match error {
         PrecheckErrorKind::InvalidSpecification(error) => format!("invalid profile: {error}"),
@@ -1356,6 +1554,110 @@ mod tests {
         assert_eq!(app.profiles()[0].profile().name(), "Documents backup");
         assert_eq!(app.profiles()[0].profile().peer_a().root(), PathBuf::from("/home/user/Documents"));
         assert!(app.status().contains("future runs"));
+    }
+
+    #[test]
+    fn cloning_clears_saved_credentials_and_requires_a_real_endpoint_change() {
+        let mut store = RunEvidenceStore::open_in_memory().expect("database");
+        let mut source_form = valid_form();
+        source_form.peer_b.kind = EndpointKind::Ssh;
+        source_form.peer_b.server = "backup.example.com".to_owned();
+        source_form.peer_b.username = "sync-user".to_owned();
+        source_form.peer_b.remote_path = "/srv/backup".to_owned();
+        source_form.peer_b.authentication = AuthenticationForm::SavedPassword;
+        source_form.peer_b.secret_reference = "backup-password".to_owned();
+        let source = source_form.build().expect("source profile");
+        let source_id = store.create_profile(&source).expect("source profile").id();
+        let mut app = SyncPlusApp::new_with_store(store).expect("app");
+
+        app.clone_profile(source_id).expect("clone profile");
+        assert_eq!(app.form.id, None);
+        assert_eq!(app.form.peer_b.secret_reference, "");
+        assert_eq!(app.form.peer_b.authentication, AuthenticationForm::Agent);
+        app.form.peer_b.name = "renamed destination label".to_owned();
+        assert_eq!(
+            app.save_profile(),
+            Err(UiValidationError::CloneEndpointsUnchanged)
+        );
+
+        app.form.peer_b.remote_path = "/srv/backup-copy".to_owned();
+        let clone_id = app.save_profile().expect("changed endpoint clone");
+        let clone = app
+            .profiles()
+            .iter()
+            .find(|profile| profile.id() == clone_id)
+            .expect("saved clone");
+        assert_eq!(clone.profile().peer_b().root(), PathBuf::from("/srv/backup-copy"));
+        assert!(!clone.authorizations().allow_unattended_destructive());
+        assert!(!clone.authorizations().allow_unattended_permanent_removal());
+    }
+
+    #[test]
+    fn cloning_requires_authorization_choice_and_never_copies_permanent_removal() {
+        let mut store = RunEvidenceStore::open_in_memory().expect("database");
+        let mut source_form = valid_form();
+        source_form.safe_delete = true;
+        source_form.deletion_method = Some(DeletionMethod::PermanentRemoval);
+        let source = source_form.build().expect("source profile");
+        let source_id = store
+            .create_profile_with_authorizations(
+                &source,
+                AuthorizationSnapshot::new(true, true),
+            )
+            .expect("authorized source profile")
+            .id();
+        let mut app = SyncPlusApp::new_with_store(store).expect("app");
+
+        app.clone_profile(source_id).expect("clone profile");
+        assert_eq!(app.form.deletion_method, Some(DeletionMethod::Trash));
+        app.form.peer_a.local_path = "/home/user/other-documents".to_owned();
+        assert_eq!(
+            app.save_profile(),
+            Err(UiValidationError::CloneAuthorizationConfirmationRequired)
+        );
+
+        app.form.clone_authorization_confirmed = true;
+        let clone_id = app.save_profile().expect("explicitly confirmed clone");
+        let clone = app
+            .profiles()
+            .iter()
+            .find(|profile| profile.id() == clone_id)
+            .expect("saved clone");
+        assert_eq!(clone.profile().options().deletion_method, Some(DeletionMethod::Trash));
+        assert!(!clone.authorizations().allow_unattended_destructive());
+        assert!(!clone.authorizations().allow_unattended_permanent_removal());
+    }
+
+    #[test]
+    fn clone_copy_authorization_is_explicit_advanced_only_and_excludes_permanent_removal() {
+        let mut store = RunEvidenceStore::open_in_memory().expect("database");
+        let source = valid_form().build().expect("source profile");
+        let source_id = store
+            .create_profile_with_authorizations(
+                &source,
+                AuthorizationSnapshot::new(true, true),
+            )
+            .expect("authorized source profile")
+            .id();
+        let mut app = SyncPlusApp::new_with_store(store).expect("app");
+        app.clone_profile(source_id).expect("clone profile");
+        app.form.peer_b.local_path = "/home/user/other-backup".to_owned();
+        app.form.clone_authorization_choice = CloneAuthorizationChoice::CopyUnattendedDestructive;
+        app.form.clone_authorization_confirmed = true;
+        assert_eq!(
+            app.save_profile(),
+            Err(UiValidationError::CloneAuthorizationConfirmationRequired)
+        );
+
+        app.set_mode(ApplicationMode::Advanced);
+        let clone_id = app.save_profile().expect("advanced explicit copy");
+        let clone = app
+            .profiles()
+            .iter()
+            .find(|profile| profile.id() == clone_id)
+            .expect("saved clone");
+        assert!(clone.authorizations().allow_unattended_destructive());
+        assert!(!clone.authorizations().allow_unattended_permanent_removal());
     }
 
     #[test]

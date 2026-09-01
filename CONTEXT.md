@@ -399,7 +399,7 @@ A source path that cannot be represented safely at the selected destination beca
 _Avoid_: Assuming the source filesystem's naming rules apply at the destination
 
 **Clone Profile**:
-An action that creates a new editable Sync Profile pre-filled from an existing profile. The editor shows both endpoints and requires at least one endpoint to differ before the new profile can be saved; an identical source/destination pair is rejected. Cloning copies validated settings and references to saved credentials without copying, displaying, or exporting secret values.
+An action that creates a new editable Sync Profile pre-filled from an existing profile. The editor shows both endpoints and requires at least one endpoint to differ before the new profile can be saved; an identical source/destination pair is rejected. Cloning copies validated nonsecret settings, clears saved credential references for intentional reconfiguration, and never copies, displays, or exports secret values.
 _Avoid_: Silent duplicate profiles or secret duplication during cloning
 
 If a profile contains an Unattended Destructive Authorization, the Clone Profile wizard must explicitly disclose that permission and ask whether to copy it. The user may continue with the authorization, disable it for the clone, or cancel. Unattended Permanent Removal remains a separate confirmation.
