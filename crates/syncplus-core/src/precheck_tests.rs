@@ -449,6 +449,8 @@ fn naming_conflicts_block_the_affected_action() {
     assert!(result.blockers().iter().any(|blocker| blocker
         .requirement()
         .contains("destination naming")));
+    assert_eq!(result.naming_conflicts().len(), 1);
+    assert_eq!(result.naming_conflicts()[0].source_path(), PathBuf::from("Report.txt"));
 }
 
 #[test]

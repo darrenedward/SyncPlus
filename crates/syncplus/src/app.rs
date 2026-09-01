@@ -1,13 +1,14 @@
-use std::{path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use eframe::egui;
 use syncplus_core::{
-    AnalysisOutcome, ApplicationMode, ApplicationSettings, AuthorizationSnapshot, DeletionMethod,
+    AnalysisOutcome, ApplicationMode, ApplicationSettings, AuthorizationSnapshot, ConflictDecision,
+    ConflictEntry, ConflictEntryKey, ConflictResolution, ConflictReview, DeletionMethod,
     FreshAnalysis, LocalPrecheckProbe, MetadataRequirements, OneWaySource, PartialTransferPolicy,
-    Peer, PeerEndpoint, PersistedSyncProfile,
-    PrecheckErrorKind, PrecheckResult, RetryPolicy, RunEvidenceStore, SavedSecretReference,
-    SpecialistMetadataRequirements, SshAuthentication, SyncMode, SecretStore, SecretStoreError,
-    SyncOptions, SyncProfile, SyncProfileId, ThemePreference, RunPrecheck,
+    Peer, PeerEndpoint, PersistedSyncProfile, PrecheckErrorKind, PrecheckResult, ResolutionRun,
+    RetryPolicy, RunEvidenceStore, RunPrecheck, SavedSecretReference, SecretStore, SecretStoreError,
+    SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
+    SyncProfileId, ThemePreference,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +47,9 @@ pub enum UiValidationError {
     ReviewNotReady,
     StrongerConfirmationRequired,
     UnresolvedItems,
+    ConflictReviewNotReady,
+    ResolutionRequiresMirror,
+    Resolution(String),
     Analysis(String),
     Core(String),
 }
@@ -103,6 +107,13 @@ impl std::fmt::Display for UiValidationError {
             Self::UnresolvedItems => {
                 formatter.write_str("Unresolved or unsupported items must be resolved before confirmation.")
             }
+            Self::ConflictReviewNotReady => {
+                formatter.write_str("Run Fresh Analysis for a Mirror Sync before opening Conflict Review.")
+            }
+            Self::ResolutionRequiresMirror => {
+                formatter.write_str("Conflict Review and Resolution Runs require Mirror Sync.")
+            }
+            Self::Resolution(message) => write!(formatter, "Resolution Run could not proceed: {message}"),
             Self::Analysis(message) => write!(formatter, "Fresh Analysis could not be completed: {message}"),
             Self::Core(message) => formatter.write_str(message),
         }
@@ -422,10 +433,40 @@ impl ProfileForm {
 }
 
 #[derive(Debug, Clone)]
+struct ConflictReviewState {
+    review: ConflictReview,
+    decisions: BTreeMap<ConflictEntryKey, ConflictResolution>,
+    resolution_run: Option<ResolutionRun>,
+    confirmed: bool,
+    error: Option<String>,
+}
+
+impl ConflictReviewState {
+    fn from_analysis(analysis: &FreshAnalysis) -> Self {
+        Self {
+            review: analysis.conflict_review(),
+            decisions: BTreeMap::new(),
+            resolution_run: None,
+            confirmed: false,
+            error: None,
+        }
+    }
+
+    fn has_all_decisions(&self) -> bool {
+        self.review
+            .entries()
+            .iter()
+            .filter(|entry| !entry.available_resolutions().is_empty())
+            .all(|entry| self.decisions.contains_key(&entry.key()))
+    }
+}
+
+#[derive(Debug, Clone)]
 struct PlanReviewState {
     profile: SyncProfile,
     precheck: Option<PrecheckResult>,
     analysis: Option<FreshAnalysis>,
+    conflicts: Option<ConflictReviewState>,
     error: Option<String>,
     stronger_confirmation_path: String,
     confirmed: bool,
@@ -657,10 +698,17 @@ impl SyncPlusApp {
         };
 
         if !precheck.can_execute() {
+            let analysis = FreshAnalysis::analyze(&profile).ok();
+            let conflicts = analysis.as_ref().and_then(|analysis| {
+                (profile.mode() == SyncMode::Mirror).then(|| {
+                    ConflictReviewState::from_analysis(analysis)
+                })
+            });
             self.review = Some(PlanReviewState {
                 profile,
                 precheck: Some(precheck),
-                analysis: None,
+                analysis,
+                conflicts,
                 error: None,
                 stronger_confirmation_path: String::new(),
                 confirmed: false,
@@ -678,10 +726,13 @@ impl SyncPlusApp {
                 return Err(UiValidationError::Analysis(message));
             }
         };
+        let conflicts = (profile.mode() == SyncMode::Mirror)
+            .then(|| ConflictReviewState::from_analysis(&analysis));
 
         self.review = Some(PlanReviewState {
             profile,
             precheck: Some(precheck),
+            conflicts,
             analysis: Some(analysis),
             error: None,
             stronger_confirmation_path: String::new(),
@@ -689,6 +740,252 @@ impl SyncPlusApp {
         });
         self.status = "Fresh Analysis ready. Review the plan and consequences before confirmation.".to_owned();
         Ok(())
+    }
+
+    pub fn conflict_entries(&self) -> Option<&[ConflictEntry]> {
+        self.review
+            .as_ref()
+            .and_then(|review| review.conflicts.as_ref())
+            .map(|conflicts| conflicts.review.entries())
+    }
+
+    pub fn conflict_resolution(&self, relative_path: impl Into<PathBuf>) -> Option<ConflictResolution> {
+        let relative_path = relative_path.into();
+        let review = self.review.as_ref()?;
+        let conflicts = review.conflicts.as_ref()?;
+        let entries = conflicts
+            .review
+            .entries()
+            .iter()
+            .filter(|entry| entry.relative_path() == relative_path)
+            .collect::<Vec<_>>();
+        (entries.len() == 1)
+            .then(|| conflicts.decisions.get(&entries[0].key()).copied())
+            .flatten()
+    }
+
+    pub fn conflict_entry_resolution(
+        &self,
+        key: &ConflictEntryKey,
+    ) -> Option<ConflictResolution> {
+        self.review
+            .as_ref()
+            .and_then(|review| review.conflicts.as_ref())
+            .and_then(|conflicts| conflicts.decisions.get(key).copied())
+    }
+
+    pub fn set_conflict_resolution(
+        &mut self,
+        relative_path: impl Into<PathBuf>,
+        resolution: ConflictResolution,
+    ) -> Result<(), UiValidationError> {
+        let relative_path = relative_path.into();
+        let key = {
+            let review = self
+                .review
+                .as_ref()
+                .ok_or(UiValidationError::ConflictReviewNotReady)?;
+            let conflicts = review
+                .conflicts
+                .as_ref()
+                .ok_or(UiValidationError::ConflictReviewNotReady)?;
+            let mut entries = conflicts
+                .review
+                .entries()
+                .iter()
+                .filter(|entry| entry.relative_path() == relative_path);
+            let entry = entries
+                .next()
+                .ok_or_else(|| UiValidationError::Resolution(format!("no reviewed conflict exists for {}", relative_path.display())))?;
+            if entries.next().is_some() {
+                return Err(UiValidationError::Resolution(format!(
+                    "multiple reviewed conflicts use {}; select the typed conflict row",
+                    relative_path.display()
+                )));
+            }
+            entry.key()
+        };
+        self.set_conflict_entry_resolution(&key, resolution)
+    }
+
+    pub fn set_conflict_entry_resolution(
+        &mut self,
+        key: &ConflictEntryKey,
+        resolution: ConflictResolution,
+    ) -> Result<(), UiValidationError> {
+        let conflicts = self
+            .review
+            .as_mut()
+            .and_then(|review| review.conflicts.as_mut())
+            .ok_or(UiValidationError::ConflictReviewNotReady)?;
+        let entry = conflicts
+            .review
+            .entries()
+            .iter()
+            .find(|entry| entry.key() == *key)
+            .ok_or_else(|| {
+                UiValidationError::Resolution(format!(
+                    "no reviewed conflict exists for {}",
+                    key.relative_path().display()
+                ))
+            })?;
+        if !entry.available_resolutions().contains(&resolution) {
+            return Err(UiValidationError::Resolution(format!(
+                "{} is not a safe decision for a {} conflict; preserve or defer it for review",
+                resolution_label(resolution),
+                conflict_kind_label(entry.kind())
+            )));
+        }
+        conflicts.decisions.insert(key.clone(), resolution);
+        conflicts.resolution_run = None;
+        conflicts.confirmed = false;
+        conflicts.error = None;
+        self.status = format!(
+            "Selected {} for {}. Start a fresh Resolution Run review before any confirmation.",
+            resolution_label(resolution),
+            key.relative_path().display()
+        );
+        Ok(())
+    }
+
+    pub fn start_resolution_run(&mut self) -> Result<(), UiValidationError> {
+        let current_profile = self.validated_profile()?;
+        let precheck = Self::fresh_local_precheck(&current_profile).map_err(|message| {
+            self.status = format!("Fresh precheck could not complete: {message}");
+            UiValidationError::Core(message)
+        })?;
+        if !precheck.can_execute() {
+            if let Some(review) = self.review.as_mut() {
+                review.precheck = Some(precheck);
+                review.confirmed = false;
+                review.error = Some("fresh precheck found blockers".to_owned());
+            }
+            self.status = "Fresh precheck found blockers; Resolution Run remains unavailable.".to_owned();
+            return Err(UiValidationError::PrecheckBlocked);
+        }
+        let (reviewed_profile, reviewed_analysis, decisions) = {
+            let review = self
+                .review
+                .as_ref()
+                .ok_or(UiValidationError::ConflictReviewNotReady)?;
+            let conflicts = review
+                .conflicts
+                .as_ref()
+                .ok_or(UiValidationError::ResolutionRequiresMirror)?;
+            if review.profile.mode() != SyncMode::Mirror {
+                return Err(UiValidationError::ResolutionRequiresMirror);
+            }
+            if review.profile != current_profile {
+                return Err(UiValidationError::Resolution(
+                    "the profile changed; run Fresh Analysis again before reviewing conflicts".to_owned(),
+                ));
+            }
+            if !conflicts.has_all_decisions() {
+                return Err(UiValidationError::UnresolvedItems);
+            }
+            let decisions = conflicts
+                .review
+                .entries()
+                .iter()
+                .map(|entry| {
+                    ConflictDecision::for_entry(entry, conflicts.decisions[&entry.key()])
+                })
+                .collect::<Vec<_>>();
+            let reviewed_analysis = review
+                .analysis
+                .clone()
+                .ok_or(UiValidationError::ConflictReviewNotReady)?;
+            (review.profile.clone(), reviewed_analysis, decisions)
+        };
+
+        let fresh_analysis = FreshAnalysis::analyze(&reviewed_profile)
+            .map_err(|error| UiValidationError::Resolution(error.to_string()))?;
+        let changed_paths = reviewed_analysis
+            .revision()
+            .changed_paths(&fresh_analysis.revision());
+        if !changed_paths.is_empty() {
+            let message = format!(
+                "the reviewed conflict state changed for {changed_paths:?}; run Fresh Analysis again"
+            );
+            if let Some(review) = self.review.as_mut() {
+                if let Some(conflicts) = review.conflicts.as_mut() {
+                    conflicts.confirmed = false;
+                    conflicts.error = Some(message.clone());
+                }
+            }
+            self.status = format!("Resolution Run was not started: {message}");
+            return Err(UiValidationError::Resolution(message));
+        }
+        let plan = fresh_analysis
+            .resolve_conflicts(decisions)
+            .map_err(|error| UiValidationError::Resolution(error.to_string()))?;
+        let resolution_run = ResolutionRun::from_analysis(&fresh_analysis, plan, None)
+            .map_err(|error| UiValidationError::Resolution(error.to_string()))?;
+        if let Some(review) = self.review.as_mut() {
+            if let Some(conflicts) = review.conflicts.as_mut() {
+                conflicts.resolution_run = Some(resolution_run);
+                conflicts.confirmed = false;
+                conflicts.error = None;
+            }
+            review.precheck = Some(precheck);
+        }
+        self.status = "Resolution Run review started after Fresh Analysis. Review every whole-file decision before confirmation.".to_owned();
+        Ok(())
+    }
+
+    pub fn confirm_resolution_run(&mut self) -> Result<(), UiValidationError> {
+        let current_profile = self.validated_profile()?;
+        let precheck = Self::fresh_local_precheck(&current_profile).map_err(|message| {
+            self.status = format!("Fresh precheck could not complete: {message}");
+            UiValidationError::Core(message)
+        })?;
+        if !precheck.can_execute() {
+            if let Some(review) = self.review.as_mut() {
+                review.precheck = Some(precheck);
+                if let Some(conflicts) = review.conflicts.as_mut() {
+                    conflicts.confirmed = false;
+                    conflicts.error = Some("fresh precheck found blockers".to_owned());
+                }
+            }
+            self.status = "Fresh precheck found blockers; Resolution Run confirmation remains unavailable.".to_owned();
+            return Err(UiValidationError::PrecheckBlocked);
+        }
+        let resolution_run = self
+            .review
+            .as_ref()
+            .and_then(|review| review.conflicts.as_ref())
+            .and_then(|conflicts| conflicts.resolution_run.as_ref())
+            .cloned()
+            .ok_or(UiValidationError::ConflictReviewNotReady)?;
+        if let Some(review) = self.review.as_mut() {
+            review.precheck = Some(precheck);
+        }
+        resolution_run
+            .prepare(&current_profile, None, true)
+            .map_err(|error| {
+                if let Some(review) = self.review.as_mut() {
+                    if let Some(conflicts) = review.conflicts.as_mut() {
+                        conflicts.confirmed = false;
+                        conflicts.error = Some(error.to_string());
+                    }
+                }
+                UiValidationError::Resolution(error.to_string())
+            })?;
+        if let Some(review) = self.review.as_mut() {
+            if let Some(conflicts) = review.conflicts.as_mut() {
+                conflicts.confirmed = true;
+                conflicts.error = None;
+            }
+        }
+        self.status = "Resolution Run confirmation recorded for this exact reviewed scope; no filesystem mutation has started.".to_owned();
+        Ok(())
+    }
+
+    pub fn resolution_is_confirmed(&self) -> bool {
+        self.review
+            .as_ref()
+            .and_then(|review| review.conflicts.as_ref())
+            .is_some_and(|conflicts| conflicts.confirmed)
     }
 
     pub fn confirm_review(&mut self) -> Result<(), UiValidationError> {
@@ -786,6 +1083,7 @@ impl SyncPlusApp {
             profile,
             precheck,
             analysis: None,
+            conflicts: None,
             error: Some(message),
             stronger_confirmation_path: String::new(),
             confirmed: false,
@@ -1103,6 +1401,8 @@ impl SyncPlusApp {
 
     fn draw_review(&mut self, ui: &mut egui::Ui) {
         let mut request_confirmation = false;
+        let mut request_resolution_start = false;
+        let mut request_resolution_confirmation = false;
         ui.separator();
         ui.heading("Plan review and Execution Confirmation");
 
@@ -1156,12 +1456,26 @@ impl SyncPlusApp {
                     if precheck.blockers().is_empty() && precheck.warnings().is_empty() {
                         ui.label("No precheck warnings or blockers were reported.");
                     }
+                    draw_compatibility_review(ui, precheck);
                 });
             }
 
             if let Some(analysis) = review.analysis.clone() {
                 draw_analysis_review(ui, review, &analysis);
+                if review.profile.mode() == SyncMode::Mirror {
+                    match draw_conflict_review(ui, review) {
+                        ConflictReviewAction::StartResolutionRun => request_resolution_start = true,
+                        ConflictReviewAction::ConfirmResolutionRun => {
+                            request_resolution_confirmation = true;
+                        }
+                        ConflictReviewAction::None => {}
+                    }
+                }
                 let unresolved = analysis_has_unresolved_items(&analysis);
+                let conflicts_pending = review
+                    .conflicts
+                    .as_ref()
+                    .is_some_and(|conflicts| !conflicts.review.entries().is_empty());
                 let precheck_ready = review
                     .precheck
                     .as_ref()
@@ -1176,6 +1490,7 @@ impl SyncPlusApp {
                     .is_some_and(|precheck| stronger_confirmation_satisfied(review, precheck));
                 let can_confirm = precheck_ready
                     && !unresolved
+                    && !conflicts_pending
                     && (!stronger_required || stronger_confirmation);
                 ui.group(|ui| {
                     ui.label("Final Execution Confirmation");
@@ -1197,6 +1512,8 @@ impl SyncPlusApp {
                     }
                     if unresolved && !review.confirmed {
                         ui.label("Confirmation is unavailable while unresolved or unsupported items remain.");
+                    } else if conflicts_pending && !review.confirmed {
+                        ui.label("Ordinary sync confirmation is unavailable while Mirror conflicts await Resolution Run review.");
                     } else if stronger_required && !stronger_confirmation && !review.confirmed {
                         ui.label("Confirmation is unavailable until the exact high-risk source path is entered.");
                     } else if !can_confirm && !review.confirmed {
@@ -1210,12 +1527,269 @@ impl SyncPlusApp {
             ui.label("No plan has been analyzed. Select Analyze current state to review the intended work.");
         }
 
+        if request_resolution_start {
+            if let Err(error) = self.start_resolution_run() {
+                self.status = format!("Resolution Run was not started: {error}");
+            }
+        }
+        if request_resolution_confirmation {
+            if let Err(error) = self.confirm_resolution_run() {
+                self.status = format!("Resolution Run confirmation was not recorded: {error}");
+            }
+        }
         if request_confirmation {
             if let Err(error) = self.confirm_review() {
                 self.status = format!("Execution Confirmation was not recorded: {error}");
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictReviewAction {
+    None,
+    StartResolutionRun,
+    ConfirmResolutionRun,
+}
+
+fn draw_conflict_review(ui: &mut egui::Ui, review: &mut PlanReviewState) -> ConflictReviewAction {
+    let Some(conflicts) = review.conflicts.as_mut() else {
+        return ConflictReviewAction::None;
+    };
+    let entries = conflicts.review.entries().to_vec();
+    let mut decisions_changed = false;
+    let mut action = ConflictReviewAction::None;
+
+    ui.group(|ui| {
+        ui.heading("Conflict Review (read-only)");
+        ui.label("Mirror Sync has no implicit winner. Inspect both peer versions and choose one explicit whole-file decision for every entry.");
+        ui.label("This review never edits file content. Preserve Both, Rename/Preserve for Review, and Defer keep the run open for later review.");
+        if entries.is_empty() {
+            ui.label("No Mirror conflicts require a whole-file decision in this Fresh Analysis.");
+        }
+
+        for entry in &entries {
+            let path = entry.relative_path().to_path_buf();
+            let key = entry.key();
+            ui.push_id(format!("{:?}:{:?}", entry.kind(), key), |ui| {
+                ui.separator();
+                ui.label(format!("Conflict path: {}", path.display()));
+                ui.label(format!("Conflict kind: {}", conflict_kind_label(entry.kind())));
+                if let Some(related_path) = entry.related_path() {
+                    ui.label(format!("Related possible rename/duplicate path: {}", related_path.display()));
+                }
+                if let Some(destination_path) = entry.destination_path() {
+                    ui.label(format!("Destination path under review: {}", destination_path.display()));
+                }
+                if let Some(rule) = entry.compatibility_rule() {
+                    ui.label(format!("Destination compatibility rule: {:?}", rule));
+                }
+
+                if entry.evidence().is_empty() {
+                    ui.label("No file content is shown for this destination-compatibility blocker.");
+                } else {
+                    ui.columns(entry.evidence().len().min(2), |columns| {
+                        for (column, evidence) in columns.iter_mut().zip(entry.evidence()) {
+                            draw_conflict_evidence(column, evidence);
+                        }
+                    });
+                }
+
+                ui.label(conflict_next_action(entry.kind()));
+                let previous = conflicts.decisions.get(&key).copied();
+                let mut selected = previous;
+                for resolution in entry.available_resolutions().iter().copied() {
+                    ui.radio_value(
+                        &mut selected,
+                        Some(resolution),
+                        resolution_label(resolution),
+                    );
+                }
+                if selected != previous {
+                    if let Some(resolution) = selected {
+                        conflicts.decisions.insert(key.clone(), resolution);
+                    } else {
+                        conflicts.decisions.remove(&key);
+                    }
+                    decisions_changed = true;
+                }
+                ui.label(format!(
+                    "Decision status: {}",
+                    selected
+                        .map_or("unresolved".to_owned(), |resolution| {
+                            format!("selected {}", resolution_label(resolution))
+                        })
+                ));
+            });
+        }
+
+        if decisions_changed {
+            conflicts.resolution_run = None;
+            conflicts.confirmed = false;
+            conflicts.error = None;
+        }
+
+        let all_decisions = conflicts.has_all_decisions();
+        let precheck_ready = review
+            .precheck
+            .as_ref()
+            .is_some_and(PrecheckResult::can_execute);
+        if let Some(error) = &conflicts.error {
+            ui.label(format!("Resolution status: blocked — {error}"));
+        }
+        if let Some(resolution_run) = &conflicts.resolution_run {
+            ui.separator();
+            ui.label("Resolution Run confirmation");
+            ui.label("The following whole-file actions were freshly rechecked. Confirming them records approval only; execution is a separate core workflow boundary.");
+            for resolution in resolution_run.plan().actions() {
+                ui.label(format!(
+                    "{}: {} — {}",
+                    resolution.relative_path().display(),
+                    resolution_label(resolution.resolution()),
+                    resolution_consequence(resolution)
+                ));
+            }
+            if conflicts.confirmed {
+                ui.label("Resolution Run confirmation recorded. No filesystem mutation has started.");
+            } else if ui.button("Confirm this exact Resolution Run").clicked() {
+                action = ConflictReviewAction::ConfirmResolutionRun;
+            }
+        } else if entries.is_empty() {
+            ui.label("Resolution Run is not needed because Fresh Analysis found no conflicts.");
+        } else if ui
+            .add_enabled(
+                all_decisions && precheck_ready,
+                egui::Button::new("Start Resolution Run review (fresh-check decisions)"),
+            )
+            .clicked()
+        {
+            action = ConflictReviewAction::StartResolutionRun;
+        } else {
+            if !precheck_ready {
+                ui.label("Resolution Run is blocked until the fresh precheck has no blockers.");
+            } else {
+                ui.label("Resolution Run is blocked until every conflict has one explicit decision.");
+            }
+        }
+    });
+
+    action
+}
+
+fn draw_conflict_evidence(ui: &mut egui::Ui, evidence: &syncplus_core::ConflictEvidence) {
+    ui.group(|ui| {
+        ui.label(format!("{} evidence", peer_side_label(evidence.side())));
+        ui.label(format!("Path: {}", evidence.relative_path().display()));
+        ui.label(format!("Type: {:?} | Size: {} bytes", evidence.item_type(), evidence.size()));
+        ui.label(format!(
+            "Review classification: {}",
+            file_review_classification_label(evidence.classification())
+        ));
+        ui.label(format!(
+            "Metadata: modified {:?}, read-only {}, permissions {:?}",
+            evidence.modified_at_unix_nanos(),
+            evidence.is_readonly(),
+            evidence.permissions()
+        ));
+        if let Some(target) = evidence.symlink_target() {
+            ui.label(format!("Symlink target: {}", target.display()));
+        }
+        if let Some(hash) = evidence.sha256() {
+            ui.label(format!("SHA-256 evidence: {}", format_hash(hash)));
+        } else {
+            ui.label("SHA-256 evidence: unavailable; do not assume the contents match.");
+        }
+        ui.label("File contents are not shown. Conflict Review uses safe classification, metadata, and hash evidence only.");
+    });
+}
+
+fn draw_compatibility_review(ui: &mut egui::Ui, precheck: &PrecheckResult) {
+    if precheck.naming_conflicts().is_empty() {
+        return;
+    }
+    ui.group(|ui| {
+        ui.heading("Destination Compatibility Review (blocked)");
+        ui.label("These names cannot be represented safely at the destination. No resolution choice can bypass this blocker.");
+        for conflict in precheck.naming_conflicts() {
+            ui.label(format!(
+                "Source path: {} → destination path: {}",
+                conflict.source_path().display(),
+                conflict.destination_path().display()
+            ));
+            if let Some(related_path) = conflict.related_path() {
+                ui.label(format!("Conflicting destination path: {}", related_path.display()));
+            }
+            ui.label(format!(
+                "Rule: {:?}. Next action: rename or exclude the item, or choose compatible destination storage; retry Fresh Analysis afterward.",
+                conflict.rule()
+            ));
+        }
+    });
+}
+
+fn conflict_kind_label(kind: syncplus_core::ConflictKind) -> &'static str {
+    match kind {
+        syncplus_core::ConflictKind::SamePath => "same path differs",
+        syncplus_core::ConflictKind::PossibleDuplicateOrRename => "possible duplicate or rename",
+        syncplus_core::ConflictKind::DestinationCompatibility => "destination compatibility",
+    }
+}
+
+fn file_review_classification_label(
+    classification: syncplus_core::FileReviewClassification,
+) -> &'static str {
+    match classification {
+        syncplus_core::FileReviewClassification::Text => "text file",
+        syncplus_core::FileReviewClassification::Binary => "binary file",
+        syncplus_core::FileReviewClassification::Large => "large file; metadata only",
+        syncplus_core::FileReviewClassification::Unreadable => "unreadable; content unavailable",
+        syncplus_core::FileReviewClassification::NonRegular => "non-regular item",
+    }
+}
+
+fn conflict_next_action(kind: syncplus_core::ConflictKind) -> &'static str {
+    match kind {
+        syncplus_core::ConflictKind::SamePath => {
+            "Next action: choose which complete peer file to keep, preserve both, rename for review, or defer."
+        }
+        syncplus_core::ConflictKind::PossibleDuplicateOrRename => {
+            "Next action: inspect both paths; equal hashes are evidence only and never authorize an automatic move or deletion."
+        }
+        syncplus_core::ConflictKind::DestinationCompatibility => {
+            "Next action: correct the naming conflict, exclude the item, or preserve it for review; compatibility blockers cannot be bypassed silently."
+        }
+    }
+}
+
+fn resolution_label(resolution: ConflictResolution) -> &'static str {
+    match resolution {
+        ConflictResolution::KeepPeerA => "Keep Peer A whole file",
+        ConflictResolution::KeepPeerB => "Keep Peer B whole file",
+        ConflictResolution::PreserveBoth => "Preserve both files",
+        ConflictResolution::RenamePreserveForReview => "Rename/preserve for review",
+        ConflictResolution::Defer => "Defer for later review",
+    }
+}
+
+fn resolution_consequence(action: &syncplus_core::ConflictResolutionAction) -> &'static str {
+    match action.resolution() {
+        ConflictResolution::KeepPeerA => "copy Peer A's verified whole file to Peer B; Peer A is preserved",
+        ConflictResolution::KeepPeerB => "copy Peer B's verified whole file to Peer A; Peer B is preserved",
+        ConflictResolution::PreserveBoth => "keep both existing peer versions without an implicit winner",
+        ConflictResolution::RenamePreserveForReview => "preserve both versions for a later explicit review",
+        ConflictResolution::Defer => "make no file change and keep this conflict unresolved",
+    }
+}
+
+fn peer_side_label(side: syncplus_core::PeerSide) -> &'static str {
+    match side {
+        syncplus_core::PeerSide::PeerA => "Peer A",
+        syncplus_core::PeerSide::PeerB => "Peer B",
+    }
+}
+
+fn format_hash(hash: &[u8; 32]) -> String {
+    hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn draw_analysis_review(ui: &mut egui::Ui, review: &PlanReviewState, analysis: &FreshAnalysis) {
@@ -1876,6 +2450,48 @@ mod tests {
         let error = app.confirm_review().expect_err("stale analysis must block");
         assert!(matches!(error, UiValidationError::Analysis(message) if message.contains("stale")));
         assert!(!app.review.as_ref().expect("review state").confirmed);
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn mirror_conflict_review_requires_explicit_decision_and_fresh_resolution_confirmation() {
+        let (mut form, source, base) = filesystem_form();
+        form.mode = SyncMode::Mirror;
+        let mut app = app();
+        app.form = form;
+
+        app.analyze_profile().expect("mirror analysis should pass");
+        let entries = app.conflict_entries().expect("mirror conflict review");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_read_only());
+        assert!(app.start_resolution_run().is_err(), "missing decisions must block");
+
+        app.set_conflict_resolution("keep.txt", ConflictResolution::KeepPeerA)
+            .expect("whole-file decision");
+        fs::write(source.join("keep.txt"), b"changed before resolution start").expect("change source");
+        assert!(app.start_resolution_run().is_err(), "stale resolution must block before start");
+
+        app.analyze_profile().expect("fresh mirror analysis should pass");
+        app.set_conflict_resolution("keep.txt", ConflictResolution::KeepPeerA)
+            .expect("whole-file decision after fresh analysis");
+        app.start_resolution_run()
+            .expect("selected decision starts a fresh Resolution Run");
+        assert!(!app.resolution_is_confirmed());
+        let source_before = fs::read(source.join("keep.txt")).expect("source contents");
+        let destination_before = fs::read(base.join("destination/keep.txt")).expect("destination contents");
+        app.confirm_resolution_run()
+            .expect("fresh Resolution Run confirmation should pass");
+        assert!(app.resolution_is_confirmed());
+        assert_eq!(fs::read(source.join("keep.txt")).expect("source contents"), source_before);
+        assert_eq!(
+            fs::read(base.join("destination/keep.txt")).expect("destination contents"),
+            destination_before
+        );
+
+        fs::write(source.join("keep.txt"), b"changed after conflict review").expect("change source");
+        assert!(app.confirm_resolution_run().is_err(), "stale resolution must block");
+        assert!(!app.resolution_is_confirmed());
 
         fs::remove_dir_all(base).expect("test directory cleanup");
     }

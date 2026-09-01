@@ -54,7 +54,8 @@ pub use analysis::{
     PlanAction, PlanActionKind, PlanError, PlanSummary, ScopeDecision, SourceInventory,
 };
 pub use conflict::{
-    ConflictEntry, ConflictEvidence, ConflictKind, ConflictReview, FileReviewClassification,
+    ConflictEntry, ConflictEntryKey, ConflictEvidence, ConflictKind, ConflictReview,
+    FileReviewClassification,
 };
 pub use resolution::{
     ConflictDecision, ConflictResolution, ConflictResolutionAction, ConflictResolutionError,

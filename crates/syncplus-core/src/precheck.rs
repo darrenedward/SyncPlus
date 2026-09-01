@@ -959,6 +959,7 @@ pub struct PrecheckResult {
     source_volume_identity: Option<VolumeIdentity>,
     destination_volume_identity: Option<VolumeIdentity>,
     blockers: Vec<PrecheckBlocker>,
+    naming_conflicts: Vec<NamingConflict>,
     warnings: Vec<PathRiskWarning>,
 }
 
@@ -970,6 +971,7 @@ impl PrecheckResult {
             source_volume_identity: None,
             destination_volume_identity: None,
             blockers: Vec::new(),
+            naming_conflicts: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -992,6 +994,10 @@ impl PrecheckResult {
 
     pub fn blockers(&self) -> &[PrecheckBlocker] {
         &self.blockers
+    }
+
+    pub fn naming_conflicts(&self) -> &[NamingConflict] {
+        &self.naming_conflicts
     }
 
     pub fn warnings(&self) -> &[PathRiskWarning] {
@@ -1515,6 +1521,7 @@ impl RunPrecheck {
             let naming_conflicts = probe
                 .naming_conflicts(source, destination, profile.exclusions())
                 .map_err(PrecheckErrorKind::Probe)?;
+            result.naming_conflicts.extend(naming_conflicts.iter().cloned());
             for conflict in naming_conflicts {
                 let related = conflict
                     .related_path()
@@ -1545,6 +1552,7 @@ impl RunPrecheck {
             let naming_conflicts = probe
                 .naming_conflicts(destination, source, profile.exclusions())
                 .map_err(PrecheckErrorKind::Probe)?;
+            result.naming_conflicts.extend(naming_conflicts.iter().cloned());
             for conflict in naming_conflicts {
                 let related = conflict
                     .related_path()
