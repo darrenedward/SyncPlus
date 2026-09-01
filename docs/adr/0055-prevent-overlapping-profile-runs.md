@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Prevent concurrent runs on overlapping peer scopes

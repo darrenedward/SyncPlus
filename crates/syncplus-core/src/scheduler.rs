@@ -7,7 +7,7 @@ use crate::storage::{ClaimedScheduledRun, SyncProfileId};
 use crate::{
     CredentialResolver, PrecheckProbe, RemotePrecheckPermit,
     RunEvidenceStore, RunReport, RunSnapshot, RunWorkflow, SecretStore, SshHostTrustPermit,
-    SshRunBackend, SshRunMode, StorageError, WorkflowError,
+    SshRunBackend, SshRunMode, StorageError, WorkflowError, PeerScopeLockRegistry,
 };
 use crate::workflow::mark_unattended_blocked;
 
@@ -173,17 +173,20 @@ impl ScheduledRun {
     }
 }
 
-/// Per-user scheduler policy. It owns only due-time claiming; the caller owns
-/// the user-level process/service lifetime and supplies the shared workflow.
+/// Per-user scheduler policy. It owns due-time claiming and the process-shared
+/// scope-lock registry; the caller owns the user-level process/service lifetime
+/// and supplies workflows configured with the returned registry.
 #[derive(Debug, Clone)]
 pub struct BackgroundScheduler<C = SystemSchedulerClock> {
     clock: C,
+    scope_locks: PeerScopeLockRegistry,
 }
 
 impl BackgroundScheduler<SystemSchedulerClock> {
     pub fn new() -> Self {
         Self {
             clock: SystemSchedulerClock,
+            scope_locks: PeerScopeLockRegistry::new(),
         }
     }
 }
@@ -196,7 +199,16 @@ impl Default for BackgroundScheduler<SystemSchedulerClock> {
 
 impl<C: SchedulerClock> BackgroundScheduler<C> {
     pub fn with_clock(clock: C) -> Self {
-        Self { clock }
+        Self {
+            clock,
+            scope_locks: PeerScopeLockRegistry::new(),
+        }
+    }
+
+    /// Return the registry that must be shared by every workflow launched by
+    /// this scheduler and by foreground workflows in the same process.
+    pub fn scope_lock_registry(&self) -> PeerScopeLockRegistry {
+        self.scope_locks.clone()
     }
 
     /// Claim each currently due enabled schedule once. Claiming advances the
@@ -243,7 +255,8 @@ mod tests {
     use super::{BackgroundScheduler, SchedulerClock, SchedulerError};
     use crate::{
         ApplicationMode, DeletionMethod, LocalPrecheckProbe, Peer, RecoveryMethod,
-        RunEvidenceStore, RunReportStatus, SyncOptions, SyncProfile,
+        PeerScope, PeerScopeLockRegistry, ProcessSupervisor, RunEvidenceStore, RunId,
+        RunReportStatus, ScopeLockOwner, SyncOptions, SyncProfile,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
@@ -357,6 +370,62 @@ mod tests {
         assert!(blocked_reason.contains("Next action:"));
         assert!(!blocked_reason.contains("source data"));
         assert!(source.join("must-remain.txt").exists());
+        fs::remove_dir_all(root).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn overlapping_scheduled_run_is_recorded_as_skipped_without_mutation() {
+        let root = fixture_root();
+        let active_source = root.join("active-source");
+        let scheduled_source = active_source.join("nested");
+        let scheduled_destination = root.join("scheduled-destination");
+        fs::create_dir_all(&scheduled_source).expect("scheduled source");
+        fs::create_dir_all(&scheduled_destination).expect("scheduled destination");
+        fs::write(scheduled_source.join("must-remain.txt"), b"source data").expect("source file");
+
+        let profile = SyncProfile::new(
+            "overlapping scheduled profile",
+            Peer::new("source", scheduled_source.clone()),
+            Peer::new("destination", scheduled_destination.clone()),
+        );
+        let mut store = RunEvidenceStore::open_in_memory().expect("store");
+        let persisted = store.create_profile(&profile).expect("profile");
+        let schedule = crate::ScheduleDefinition::new_with_next_run_at(1, "UTC", true, Some(100))
+            .expect("schedule");
+        store
+            .update_schedule_at(persisted.id(), Some(schedule), ApplicationMode::Advanced, 100)
+            .expect("schedule update");
+        let scheduler = BackgroundScheduler::with_clock(FixedClock(100));
+        let claim = scheduler
+            .poll_due(&mut store)
+            .expect("due poll")
+            .pop()
+            .expect("claim");
+
+        let registry = PeerScopeLockRegistry::new();
+        let _active_lock = registry
+            .acquire(
+                ScopeLockOwner::new("active profile", RunId::new(900)),
+                [PeerScope::new(&active_source)],
+            )
+            .expect("active scope lock");
+        let workflow = crate::RunWorkflow::with_scope_lock_registry(
+            ProcessSupervisor::default(),
+            RecoveryMethod::trash(root.join("trash")),
+            registry,
+        );
+
+        let error = claim
+            .execute(&workflow, &LocalPrecheckProbe::default(), &mut store, || false)
+            .expect_err("an overlapping scheduled run must be skipped");
+        assert!(matches!(error, crate::WorkflowError::Precheck(crate::PrecheckFailure::ScopeLocked(_))));
+        let report = store.load_report(claim.run_id()).expect("blocked report");
+        assert_eq!(report.status(), RunReportStatus::Blocked);
+        let reason = report.blocked_reason().expect("skip reason");
+        assert!(reason.contains("Scheduled Run skipped"), "reason: {reason}");
+        assert!(reason.contains("active profile"), "reason: {reason}");
+        assert!(!scheduled_destination.join("must-remain.txt").exists());
+        assert!(scheduled_source.join("must-remain.txt").exists());
         fs::remove_dir_all(root).expect("fixture cleanup");
     }
 }

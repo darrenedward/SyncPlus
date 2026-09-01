@@ -387,6 +387,9 @@ pub struct RetryPolicy {
 }
 
 impl RetryPolicy {
+    pub const MAX_ATTEMPTS: u8 = 10;
+    pub const MAX_INITIAL_DELAY: Duration = Duration::from_secs(60 * 60);
+
     pub const fn new(max_attempts: u8, initial_delay: Duration) -> Self {
         Self {
             max_attempts,
@@ -400,6 +403,16 @@ impl RetryPolicy {
 
     pub const fn initial_delay(self) -> Duration {
         self.initial_delay
+    }
+
+    /// Return the delay before the numbered retry. Retry numbers start at one
+    /// and grow linearly so a transient failure cannot create a tight restart
+    /// loop. Saturation keeps malformed values from wrapping into a shorter
+    /// delay; profile validation rejects values outside the supported policy.
+    pub fn delay_for_retry(self, retry_number: u8) -> Duration {
+        self.initial_delay
+            .checked_mul(retry_number as u32)
+            .unwrap_or(Duration::MAX)
     }
 }
 

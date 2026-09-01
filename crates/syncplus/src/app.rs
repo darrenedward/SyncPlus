@@ -151,6 +151,7 @@ pub fn run_background_scheduler_once() -> Result<usize, String> {
         .to_path_buf();
     let mut store = RunEvidenceStore::open_canonical().map_err(|error| error.to_string())?;
     let scheduler = BackgroundScheduler::new();
+    let scope_locks = scheduler.scope_lock_registry();
     let due_runs = scheduler
         .poll_due(&mut store)
         .map_err(|error| error.to_string())?;
@@ -164,7 +165,11 @@ pub fn run_background_scheduler_once() -> Result<usize, String> {
         } else {
             RecoveryMethod::native_trash(data_home.clone())
         };
-        let workflow = syncplus_core::RunWorkflow::new(recovery_method);
+        let workflow = syncplus_core::RunWorkflow::with_scope_lock_registry(
+            syncplus_core::ProcessSupervisor::default(),
+            recovery_method,
+            scope_locks.clone(),
+        );
         match scheduled_run.execute(
             &workflow,
             &LocalPrecheckProbe::default(),
@@ -473,7 +478,7 @@ impl ProfileForm {
             .trim()
             .parse::<u8>()
             .ok()
-            .filter(|attempts| (1..=10).contains(attempts))
+            .filter(|attempts| (1..=RetryPolicy::MAX_ATTEMPTS).contains(attempts))
             .ok_or(UiValidationError::InvalidRetryAttempts)?;
         let retry_delay_millis = self
             .retry_delay_millis
