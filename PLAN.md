@@ -250,9 +250,9 @@ without secrets or file contents.
 If a schedule cannot run, SyncPlus records and notifies the reason. The user can choose **Yes, Run Now** or **No, Not Now**. Run Now becomes an Interactive Run with fresh analysis and confirmation. No leaves the event visible.
 
 Scheduler outcomes and decisions are durable events with canonical reason and
-next-action text. The future tray and Quit surfaces consume typed safe intents
+next-action text. The desktop tray and Quit surfaces consume typed safe intents
 that can open a Run Report or start the already-gated interactive catch-up
-flow. The desktop tray and Quit surfaces now consume those safe intents;
+flow;
 desktop notification delivery is best effort and never changes the report or
 safety outcome. Manual runs remain on the shared core workflow while the UI is
 hidden, and Quit waits for cancellation evidence before exiting.
