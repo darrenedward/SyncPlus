@@ -24,3 +24,9 @@ text. Presentation layers consume a derived notification contract: the only
 actions are opening a Run Report or starting the existing gated interactive
 catch-up flow. Notification delivery is best effort and cannot change the
 persisted Run Report or safety outcome.
+
+The Debian package registers this boundary with a fixed per-user systemd
+service and timer. Registration is an explicit action by the desktop user; the
+package does not enable a root daemon, accept command arguments, or change the
+canonical XDG data locations. Unregistering the timer is provided before
+package removal so user data remains independent of package lifecycle.

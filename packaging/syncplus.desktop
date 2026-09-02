@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=SyncPlus
+Comment=Safety-first local and SSH synchronization
+Exec=/usr/bin/syncplus
+Icon=syncplus
+Terminal=false
+Categories=Utility;
+Keywords=sync;backup;recovery;rsync;
+Actions=RegisterScheduler;UnregisterScheduler;
+
+[Desktop Action RegisterScheduler]
+Name=Enable user-level background scheduler
+Exec=/usr/bin/syncplus-scheduler-register
+
+[Desktop Action UnregisterScheduler]
+Name=Disable user-level background scheduler
+Exec=/usr/bin/syncplus-scheduler-unregister
