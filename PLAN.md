@@ -461,6 +461,15 @@ Tests express intended product behavior and safety contracts, not accidental imp
 
 At every milestone run configured formatting, compiler checks, `cargo clippy -- -D warnings`, unit/integration tests, dependency/license checks, and security review of process invocation. Before release, run the disposable end-to-end matrix on local folders, an external filesystem, and a real SSH peer. The SSH gate is run with `cargo test -p syncplus-core --lib disposable_ssh_peer_exercises_push_pull_strict_identity_and_hostile_paths -- --ignored`; it requires `sshd`, `ssh-keygen`, `ssh`, and `rsync`. A green UI test suite alone is not release evidence.
 
+The aggregate `./packaging/release-gate.sh` command is the release evidence
+boundary. It runs named cases for every required scheduling, recovery, failure,
+privacy, process, SSH, SQLite, filesystem, and installed-package scenario. It
+retains sanitized per-case logs, tool versions, the package digest, and a
+machine-readable `manifest.json` under `target/release-evidence/<run-id>/`.
+Missing required tools and skipped cases are recorded as non-release-ready;
+the command exits nonzero and creates no `RELEASE_READY` marker unless the
+complete matrix passes.
+
 ## Help and user-facing requirements
 
 Help must explain exactly what each mode and option does, why it matters, when to use it, what it may remove, what recovery costs, and what limitations apply. Important messages must identify the path, peer, account, reason, and next action.
