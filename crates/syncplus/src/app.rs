@@ -12,7 +12,8 @@ use syncplus_core::{
     RemotePrecheckRequest, ResolutionRun, RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId,
     RecoveryMethod, RunLifecycle, RunPrecheck, RunReport, RunReportStatus, SavedSecretReference, SecretStore,
     SecretStoreError,
-    ScheduleDefinition, SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
+    ScheduleDefinition, SchedulerEvent, SchedulerNotificationAction,
+    SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
     SyncProfileId, ThemePreference,
 };
 
@@ -1115,6 +1116,7 @@ pub struct SyncPlusApp {
     review: Option<PlanReviewState>,
     run_reports: Vec<RunReport>,
     missed_schedule_notices: Vec<MissedScheduleNotice>,
+    scheduler_events: Vec<SchedulerEvent>,
     selected_run_report: Option<RunId>,
     pending_report_action: Option<PendingReportAction>,
     help_topic: HelpTopic,
@@ -1137,6 +1139,7 @@ impl SyncPlusApp {
         let profiles = store.list_profiles()?;
         let run_reports = store.list_run_reports()?;
         let missed_schedule_notices = store.list_missed_schedule_notices()?;
+        let scheduler_events = store.list_scheduler_events()?;
         let selected_run_report = run_reports.first().map(RunReport::run_id);
         Ok(Self {
             store,
@@ -1148,6 +1151,7 @@ impl SyncPlusApp {
             review: None,
             run_reports,
             missed_schedule_notices,
+            scheduler_events,
             selected_run_report,
             pending_report_action: None,
             help_topic: HelpTopic::Modes,
@@ -1176,6 +1180,10 @@ impl SyncPlusApp {
 
     pub fn missed_schedule_notices(&self) -> &[MissedScheduleNotice] {
         &self.missed_schedule_notices
+    }
+
+    pub fn scheduler_events(&self) -> &[SchedulerEvent] {
+        &self.scheduler_events
     }
 
     pub fn selected_run_report(&self) -> Option<&RunReport> {
@@ -1211,6 +1219,10 @@ impl SyncPlusApp {
         self.missed_schedule_notices = self
             .store
             .list_missed_schedule_notices()
+            .map_err(|error| UiValidationError::Core(error.to_string()))?;
+        self.scheduler_events = self
+            .store
+            .list_scheduler_events()
             .map_err(|error| UiValidationError::Core(error.to_string()))?;
         self.selected_run_report = selected;
         if self
@@ -2587,6 +2599,39 @@ impl SyncPlusApp {
             }
         }
     }
+
+    fn draw_scheduler_events(&self, ui: &mut egui::Ui) {
+        if self.scheduler_events.is_empty() {
+            return;
+        }
+        ui.separator();
+        ui.heading("Scheduler Events and Notifications");
+        ui.label("These text equivalents preserve the reason and safe next action for unattended work. Notification actions never bypass confirmation, verification, host-identity review, or Recovery Review.");
+        for event in &self.scheduler_events {
+            let notification = event.notification();
+            ui.group(|ui| {
+                ui.label(format!(
+                    "{} — Sync Profile {} — Sync Run {}",
+                    notification.title(),
+                    notification.profile_id().value(),
+                    notification.run_id().value()
+                ));
+                ui.label(format!("Reason: {}", notification.reason()));
+                ui.label(format!("Next action: {}", notification.next_action()));
+                match notification.action() {
+                    SchedulerNotificationAction::OpenReport(run_id) => {
+                        ui.label(format!("Safe action: open Run Report {}.", run_id.value()));
+                    }
+                    SchedulerNotificationAction::StartInteractiveCatchUp(notice_id) => {
+                        ui.label(format!(
+                            "Safe action: start interactive catch-up from missed notice {}.",
+                            notice_id
+                        ));
+                    }
+                }
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3130,6 +3175,7 @@ impl eframe::App for SyncPlusApp {
         egui::Panel::left("profiles").show(ui, |ui| self.draw_profile_list(ui));
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_missed_schedule_notices(ui));
+            egui::ScrollArea::vertical().show(ui, |ui| self.draw_scheduler_events(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_profile_form(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_review(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_run_reports(ui));

@@ -249,6 +249,11 @@ without secrets or file contents.
 
 If a schedule cannot run, SyncPlus records and notifies the reason. The user can choose **Yes, Run Now** or **No, Not Now**. Run Now becomes an Interactive Run with fresh analysis and confirmation. No leaves the event visible.
 
+Scheduler outcomes and decisions are durable events with canonical reason and
+next-action text. The future tray and Quit surfaces consume typed safe intents
+that can open a Run Report or start the already-gated interactive catch-up
+flow; notification delivery never changes the report or safety outcome.
+
 If the same profile is already active, the schedule is skipped and the user is told why, with **Open Running Sync** and **Dismiss**. Dismissal does not erase the event.
 
 ## Persistence, privacy, and recovery metadata

@@ -16,3 +16,11 @@ SQLite transaction, then `ScheduledRun::execute` invokes the shared
 through the fixed `--background-scheduler` command for user-level registration;
 it does not accept a command or credential payload and never installs a root
 service.
+
+Each claimed Scheduled Run also writes a durable scheduler-event timeline. The
+timeline records outcomes, missed/overlap/preflight decisions, bounded retries,
+and later Review-Cleared acknowledgement with canonical reason and next-action
+text. Presentation layers consume a derived notification contract: the only
+actions are opening a Run Report or starting the existing gated interactive
+catch-up flow. Notification delivery is best effort and cannot change the
+persisted Run Report or safety outcome.

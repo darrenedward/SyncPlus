@@ -4,6 +4,7 @@ use std::{
     fs,
     io,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -746,6 +747,262 @@ pub struct MissedScheduleNotice {
     missed_count: u64,
 }
 
+/// Durable scheduler lifecycle facts. The claim event is an internal
+/// correlation boundary: it lets later report and review events remain tied
+/// to a Scheduled Run without adding scheduler state to the immutable profile
+/// snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerEventKind {
+    ScheduledRunClaimed,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+    PendingReview,
+    ReviewCleared,
+    Missed,
+    SkippedOverlap,
+    BlockedPreflight,
+    Retry,
+    RetryExhausted,
+}
+
+impl SchedulerEventKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ScheduledRunClaimed => "scheduled_run_claimed",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+            Self::PendingReview => "pending_review",
+            Self::ReviewCleared => "review_cleared",
+            Self::Missed => "missed",
+            Self::SkippedOverlap => "skipped_overlap",
+            Self::BlockedPreflight => "blocked_preflight",
+            Self::Retry => "retry",
+            Self::RetryExhausted => "retry_exhausted",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "scheduled_run_claimed" => Ok(Self::ScheduledRunClaimed),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            "interrupted" => Ok(Self::Interrupted),
+            "pending_review" => Ok(Self::PendingReview),
+            "review_cleared" => Ok(Self::ReviewCleared),
+            "missed" => Ok(Self::Missed),
+            "skipped_overlap" => Ok(Self::SkippedOverlap),
+            "blocked_preflight" => Ok(Self::BlockedPreflight),
+            "retry" => Ok(Self::Retry),
+            "retry_exhausted" => Ok(Self::RetryExhausted),
+            _ => Err(StorageError::CorruptEvidence(format!(
+                "unknown scheduler event kind {value:?}"
+            ))),
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ScheduledRunClaimed => "Scheduled Run claimed",
+            Self::Completed => "Scheduled Run completed",
+            Self::Failed => "Scheduled Run failed",
+            Self::Cancelled => "Scheduled Run cancelled",
+            Self::Interrupted => "Scheduled Run interrupted",
+            Self::PendingReview => "Scheduled Run needs review",
+            Self::ReviewCleared => "Scheduled Run review cleared",
+            Self::Missed => "Scheduled Run missed",
+            Self::SkippedOverlap => "Scheduled Run skipped for overlap",
+            Self::BlockedPreflight => "Scheduled Run blocked before mutation",
+            Self::Retry => "Scheduled Run retried",
+            Self::RetryExhausted => "Scheduled Run retries exhausted",
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ScheduledRunClaimed => "The scheduler claimed this occurrence for execution.",
+            Self::Completed => "The Scheduled Run completed successfully.",
+            Self::Failed => "The Scheduled Run failed before all approved work completed.",
+            Self::Cancelled => "The Scheduled Run was cancelled before all approved work completed.",
+            Self::Interrupted => "The Scheduled Run was interrupted before all approved work completed.",
+            Self::PendingReview => "The Scheduled Run completed with work that remains open for review.",
+            Self::ReviewCleared => "The Scheduled Run review was explicitly cleared after reconciliation.",
+            Self::Missed => "The Scheduled Run did not complete and remains visible for catch-up review.",
+            Self::SkippedOverlap => "The Scheduled Run was skipped because an overlapping peer scope is active.",
+            Self::BlockedPreflight => "The Scheduled Run was blocked before filesystem mutation by a safety preflight.",
+            Self::Retry => "A transient transfer condition caused the Scheduled Run to retry within its bound.",
+            Self::RetryExhausted => "The Scheduled Run exhausted its bounded retry policy.",
+        }
+    }
+
+    const fn next_action(self) -> &'static str {
+        match self {
+            Self::ScheduledRunClaimed => "Open the Run Report after execution settles.",
+            Self::Completed => "Open the Run Report to review verification and reconciliation evidence.",
+            Self::Failed => "Open the Run Report, resolve the reported failure, and retry after review.",
+            Self::Cancelled => "Open the Run Report and review the unfinished actions before retrying.",
+            Self::Interrupted => "Open the Run Report and complete Recovery Review before resuming.",
+            Self::PendingReview => "Open the Run Report and complete the required review before clearing it.",
+            Self::ReviewCleared => "Open the Run Report to review the final safety evidence.",
+            Self::Missed => "Choose Run Now for fresh interactive analysis and confirmation, or choose Not Now.",
+            Self::SkippedOverlap => "Open the running sync or wait for the overlapping scope to finish.",
+            Self::BlockedPreflight => "Open the Run Report, resolve the preflight blocker, and retry.",
+            Self::Retry => "Open the Run Report to review the bounded retry evidence.",
+            Self::RetryExhausted => "Open the Run Report, resolve the cause, and retry after review.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerEvent {
+    event_id: u64,
+    profile_id: SyncProfileId,
+    run_id: RunId,
+    kind: SchedulerEventKind,
+    reason: String,
+    next_action: String,
+    created_at_unix_seconds: i64,
+    missed_notice_id: Option<u64>,
+    retry_count: Option<u32>,
+}
+
+impl SchedulerEvent {
+    pub const fn event_id(&self) -> u64 {
+        self.event_id
+    }
+
+    pub const fn profile_id(&self) -> SyncProfileId {
+        self.profile_id
+    }
+
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub const fn kind(&self) -> SchedulerEventKind {
+        self.kind
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn next_action(&self) -> &str {
+        &self.next_action
+    }
+
+    pub const fn created_at_unix_seconds(&self) -> i64 {
+        self.created_at_unix_seconds
+    }
+
+    pub const fn missed_notice_id(&self) -> Option<u64> {
+        self.missed_notice_id
+    }
+
+    pub const fn retry_count(&self) -> Option<u32> {
+        self.retry_count
+    }
+
+    pub fn notification(&self) -> SchedulerNotification {
+        let action = if self.kind == SchedulerEventKind::Missed {
+            self.missed_notice_id
+                .map(SchedulerNotificationAction::StartInteractiveCatchUp)
+                .unwrap_or(SchedulerNotificationAction::OpenReport(self.run_id))
+        } else {
+            SchedulerNotificationAction::OpenReport(self.run_id)
+        };
+        SchedulerNotification {
+            event_id: self.event_id,
+            profile_id: self.profile_id,
+            run_id: self.run_id,
+            kind: self.kind,
+            title: self.kind.label().to_owned(),
+            reason: self.reason.clone(),
+            next_action: self.next_action.clone(),
+            action,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedulerNotificationAction {
+    OpenReport(RunId),
+    StartInteractiveCatchUp(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerNotification {
+    event_id: u64,
+    profile_id: SyncProfileId,
+    run_id: RunId,
+    kind: SchedulerEventKind,
+    title: String,
+    reason: String,
+    next_action: String,
+    action: SchedulerNotificationAction,
+}
+
+impl SchedulerNotification {
+    pub const fn event_id(&self) -> u64 {
+        self.event_id
+    }
+
+    pub const fn profile_id(&self) -> SyncProfileId {
+        self.profile_id
+    }
+
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub const fn kind(&self) -> SchedulerEventKind {
+        self.kind
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn next_action(&self) -> &str {
+        &self.next_action
+    }
+
+    pub const fn action(&self) -> SchedulerNotificationAction {
+        self.action
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationDeliveryError {
+    Unavailable,
+}
+
+impl fmt::Display for NotificationDeliveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("scheduler notification delivery is unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for NotificationDeliveryError {}
+
+/// A future tray, desktop notification, or other presentation layer can
+/// implement this sink. Delivery is deliberately separate from event and
+/// report persistence so a failed presentation cannot alter safety evidence.
+pub trait SchedulerNotificationSink {
+    fn deliver(&mut self, notification: &SchedulerNotification)
+        -> Result<(), NotificationDeliveryError>;
+}
+
 impl MissedScheduleNotice {
     pub const fn notice_id(&self) -> u64 {
         self.notice_id
@@ -1037,7 +1294,7 @@ impl RunEvidenceStore {
                     ));
                 }
             };
-            if version < 18 {
+            if version < 19 {
                 let manager = DatabaseBackupManager::for_database(path)
                     .map_err(|error| StorageError::DatabaseBackup(error.to_string()))?;
                 if let Err(error) = manager.create_validated_backup(&connection) {
@@ -1112,7 +1369,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 18 {
+        if version > 19 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -1711,6 +1968,36 @@ impl RunEvidenceStore {
                 ",
             )?;
             transaction.pragma_update(None, "user_version", 18)?;
+            verify_integrity(&transaction)?;
+            transaction.commit()?;
+            version = 18;
+        }
+        if version == 18 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS scheduler_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_id INTEGER NOT NULL,
+                    run_id INTEGER NOT NULL,
+                    event_kind TEXT NOT NULL CHECK (event_kind IN (
+                        'scheduled_run_claimed', 'completed', 'failed', 'cancelled',
+                        'interrupted', 'pending_review', 'review_cleared', 'missed',
+                        'skipped_overlap', 'blocked_preflight', 'retry', 'retry_exhausted'
+                    )),
+                    reason TEXT NOT NULL CHECK (length(reason) > 0),
+                    next_action TEXT NOT NULL CHECK (length(next_action) > 0),
+                    created_at_unix_seconds INTEGER NOT NULL CHECK (created_at_unix_seconds >= 0),
+                    missed_notice_id INTEGER,
+                    retry_count INTEGER CHECK (retry_count IS NULL OR retry_count > 0)
+                );
+                CREATE INDEX IF NOT EXISTS scheduler_events_by_run
+                    ON scheduler_events (run_id, event_id);
+                CREATE INDEX IF NOT EXISTS scheduler_events_by_profile
+                    ON scheduler_events (profile_id, event_id);
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 19)?;
             verify_integrity(&transaction)?;
             transaction.commit()?;
         }
@@ -2545,6 +2832,231 @@ impl RunEvidenceStore {
         Ok(())
     }
 
+    /// Persist one scheduler event using only the canonical, nonsecret text
+    /// for its kind. Callers cannot accidentally put credentials or file
+    /// contents into the scheduler notification payload.
+    pub fn record_scheduler_event(
+        &mut self,
+        profile_id: SyncProfileId,
+        run_id: RunId,
+        kind: SchedulerEventKind,
+    ) -> Result<SchedulerEvent, StorageError> {
+        let created_at = current_unix_seconds()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let event_id = Self::insert_scheduler_event_in_transaction(
+            &transaction,
+            profile_id,
+            run_id,
+            kind,
+            created_at,
+            None,
+            None,
+        )?;
+        transaction.commit()?;
+        self.load_scheduler_event(event_id)?
+            .ok_or_else(|| StorageError::CorruptEvidence("new scheduler event disappeared".to_owned()))
+    }
+
+    pub fn load_scheduler_event(&self, event_id: u64) -> Result<Option<SchedulerEvent>, StorageError> {
+        let event_id = i64::try_from(event_id)
+            .map_err(|_| StorageError::InvalidEvent("scheduler event identifier is out of range".to_owned()))?;
+        self.connection
+            .query_row(
+                "SELECT event_id, profile_id, run_id, event_kind, reason,
+                        next_action, created_at_unix_seconds, missed_notice_id, retry_count
+                 FROM scheduler_events WHERE event_id = ?1",
+                params![event_id],
+                Self::scheduler_event_from_row,
+            )
+            .optional()?
+            .map(Self::decode_scheduler_event)
+            .transpose()
+    }
+
+    pub fn list_scheduler_events(&self) -> Result<Vec<SchedulerEvent>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT event_id, profile_id, run_id, event_kind, reason,
+                    next_action, created_at_unix_seconds, missed_notice_id, retry_count
+             FROM scheduler_events ORDER BY event_id DESC",
+        )?;
+        let rows = statement
+            .query_map([], Self::scheduler_event_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(Self::decode_scheduler_event).collect()
+    }
+
+    /// Deliver a derived notification without opening a write transaction.
+    /// A sink failure therefore leaves both the event and its Run Report
+    /// exactly as they were persisted.
+    pub fn deliver_scheduler_notification<S: SchedulerNotificationSink>(
+        &self,
+        event_id: u64,
+        sink: &mut S,
+    ) -> Result<(), NotificationDeliveryError> {
+        let Some(event) = self
+            .load_scheduler_event(event_id)
+            .map_err(|_| NotificationDeliveryError::Unavailable)?
+        else {
+            return Err(NotificationDeliveryError::Unavailable);
+        };
+        sink.deliver(&event.notification())
+    }
+
+    pub(crate) fn record_scheduler_retry(
+        &mut self,
+        run_id: RunId,
+        retry_count: u32,
+        exhausted: bool,
+    ) -> Result<(), StorageError> {
+        if retry_count == 0 {
+            return Ok(());
+        }
+        let run_id_i64 = i64::try_from(run_id.value())
+            .map_err(|_| StorageError::InvalidEvent("scheduler run identifier is out of range".to_owned()))?;
+        let Some(profile_id) = self
+            .connection
+            .query_row(
+                "SELECT profile_id FROM scheduler_events
+                 WHERE run_id = ?1 AND event_kind = 'scheduled_run_claimed'
+                 ORDER BY event_id LIMIT 1",
+                params![run_id_i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
+        let profile_id = u64::try_from(profile_id)
+            .map_err(|_| StorageError::CorruptEvidence("scheduler profile id is invalid".to_owned()))?;
+        let kind = if exhausted {
+            SchedulerEventKind::RetryExhausted
+        } else {
+            SchedulerEventKind::Retry
+        };
+        let created_at = current_unix_seconds()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::insert_scheduler_event_in_transaction(
+            &transaction,
+            SyncProfileId::new(profile_id),
+            run_id,
+            kind,
+            created_at,
+            None,
+            Some(retry_count),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn is_scheduled_run(&self, run_id: RunId) -> Result<bool, StorageError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM scheduler_events
+                WHERE run_id = ?1 AND event_kind = 'scheduled_run_claimed'
+            )",
+            params![run_id.value()],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn insert_scheduler_event_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        profile_id: SyncProfileId,
+        run_id: RunId,
+        kind: SchedulerEventKind,
+        created_at_unix_seconds: i64,
+        missed_notice_id: Option<u64>,
+        retry_count: Option<u32>,
+    ) -> Result<u64, StorageError> {
+        let profile_id = profile_id.value_as_i64()?;
+        let run_id = i64::try_from(run_id.value())
+            .map_err(|_| StorageError::InvalidEvent("scheduler run identifier is out of range".to_owned()))?;
+        if created_at_unix_seconds < 0 {
+            return Err(StorageError::InvalidEvent(
+                "scheduler event time must be nonnegative".to_owned(),
+            ));
+        }
+        let missed_notice_id = missed_notice_id
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StorageError::InvalidEvent("scheduler notice identifier is out of range".to_owned()))?;
+        let changed = transaction.execute(
+            "INSERT INTO scheduler_events (
+                profile_id, run_id, event_kind, reason, next_action,
+                created_at_unix_seconds, missed_notice_id, retry_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                profile_id,
+                run_id,
+                kind.as_str(),
+                kind.reason(),
+                kind.next_action(),
+                created_at_unix_seconds,
+                missed_notice_id,
+                retry_count.map(i64::from),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::InvalidEvent("scheduler event was not persisted".to_owned()));
+        }
+        u64::try_from(transaction.last_insert_rowid())
+            .map_err(|_| StorageError::CorruptEvidence("scheduler event id is invalid".to_owned()))
+    }
+
+    fn scheduler_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64, i64, String, String, String, i64, Option<i64>, Option<i64>)> {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+        ))
+    }
+
+    fn decode_scheduler_event(
+        row: (i64, i64, i64, String, String, String, i64, Option<i64>, Option<i64>),
+    ) -> Result<SchedulerEvent, StorageError> {
+        let (event_id, profile_id, run_id, kind, reason, next_action, created_at, notice_id, retry_count) = row;
+        let event_id = u64::try_from(event_id)
+            .map_err(|_| StorageError::CorruptEvidence("scheduler event id is invalid".to_owned()))?;
+        let profile_id = u64::try_from(profile_id)
+            .map_err(|_| StorageError::CorruptEvidence("scheduler profile id is invalid".to_owned()))?;
+        let run_id = u64::try_from(run_id)
+            .map_err(|_| StorageError::CorruptEvidence("scheduler run id is invalid".to_owned()))?;
+        let notice_id = notice_id
+            .map(|value| u64::try_from(value).map_err(|_| StorageError::CorruptEvidence("scheduler notice id is invalid".to_owned())))
+            .transpose()?;
+        let retry_count = retry_count
+            .map(|value| u32::try_from(value).map_err(|_| StorageError::CorruptEvidence("scheduler retry count is invalid".to_owned())))
+            .transpose()?;
+        if created_at < 0 || reason.trim().is_empty() || next_action.trim().is_empty() {
+            return Err(StorageError::CorruptEvidence("scheduler event contains invalid text or time".to_owned()));
+        }
+        let kind = SchedulerEventKind::from_str(&kind)?;
+        if reason != kind.reason() || next_action != kind.next_action() {
+            return Err(StorageError::CorruptEvidence("scheduler event text does not match its kind".to_owned()));
+        }
+        Ok(SchedulerEvent {
+            event_id,
+            profile_id: SyncProfileId::new(profile_id),
+            run_id: RunId::new(run_id),
+            kind,
+            reason,
+            next_action,
+            created_at_unix_seconds: created_at,
+            missed_notice_id: notice_id,
+            retry_count,
+        })
+    }
+
     /// Record a Scheduled Run that could not proceed. There is at most one
     /// pending notice per Sync Profile; later missed occurrences update that
     /// notice instead of creating duplicate catch-up choices.
@@ -2564,6 +3076,7 @@ impl RunEvidenceStore {
         let run_id = i64::try_from(run_id.value()).map_err(|_| {
             StorageError::InvalidEvent("missed schedule run identifier is out of range".to_owned())
         })?;
+        let created_at = current_unix_seconds()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2607,6 +3120,31 @@ impl RunEvidenceStore {
             )?;
             transaction.last_insert_rowid()
         };
+        let event_exists: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM scheduler_events
+                WHERE run_id = ?1 AND event_kind = 'missed'
+            )",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        if !event_exists {
+            Self::insert_scheduler_event_in_transaction(
+                &transaction,
+                SyncProfileId::new(u64::try_from(profile_id).map_err(|_| {
+                    StorageError::InvalidEvent("missed schedule profile identifier is out of range".to_owned())
+                })?),
+                RunId::new(u64::try_from(run_id).map_err(|_| {
+                    StorageError::InvalidEvent("missed schedule run identifier is out of range".to_owned())
+                })?),
+                SchedulerEventKind::Missed,
+                created_at,
+                Some(u64::try_from(notice_id).map_err(|_| {
+                    StorageError::InvalidEvent("missed schedule notice identifier is out of range".to_owned())
+                })?),
+                None,
+            )?;
+        }
         transaction.commit()?;
         self.load_missed_schedule_notice_by_i64(notice_id)?
             .ok_or_else(|| StorageError::CorruptEvidence("new missed schedule notice disappeared".to_owned()))
@@ -3451,6 +3989,46 @@ impl RunEvidenceStore {
                     run_id: run_id.value(),
                 });
             }
+            let profile_id: Option<i64> = store
+                .connection
+                .query_row(
+                    "SELECT profile_id FROM scheduler_events
+                     WHERE run_id = ?1 AND event_kind = 'scheduled_run_claimed'
+                     ORDER BY event_id LIMIT 1",
+                    params![run_id.value()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(profile_id) = profile_id {
+                let already_recorded: bool = store.connection.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM scheduler_events
+                        WHERE run_id = ?1 AND event_kind = 'review_cleared'
+                    )",
+                    params![run_id.value()],
+                    |row| row.get(0),
+                )?;
+                if !already_recorded {
+                    let profile_id = u64::try_from(profile_id).map_err(|_| {
+                        StorageError::CorruptEvidence("scheduler profile id is invalid".to_owned())
+                    })?;
+                    let kind = SchedulerEventKind::ReviewCleared;
+                    store.connection.execute(
+                        "INSERT INTO scheduler_events (
+                            profile_id, run_id, event_kind, reason, next_action,
+                            created_at_unix_seconds
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            profile_id,
+                            run_id.value(),
+                            kind.as_str(),
+                            kind.reason(),
+                            kind.next_action(),
+                            current_unix_seconds()?,
+                        ],
+                    )?;
+                }
+            }
             Ok(())
         })
     }
@@ -3474,6 +4052,14 @@ fn validate_canonical_parent(path: &Path) -> Result<(), StorageError> {
         }
     }
     Ok(())
+}
+
+fn current_unix_seconds() -> Result<i64, StorageError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| StorageError::InvalidEvent(format!("system clock is before Unix epoch: {error}")))?;
+    i64::try_from(duration.as_secs())
+        .map_err(|_| StorageError::InvalidEvent("scheduler event time is out of range".to_owned()))
 }
 
 #[cfg(target_os = "linux")]
@@ -5742,7 +6328,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
         assert!(
             migrated
                 .connection
@@ -5793,7 +6379,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
         for table in ["application_settings", "sync_profiles", "sync_profile_exclusions"] {
             assert!(
                 migrated
@@ -5846,7 +6432,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            18
+            19
         );
     }
 

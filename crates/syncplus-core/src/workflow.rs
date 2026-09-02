@@ -1407,12 +1407,21 @@ impl RunWorkflow {
             match result {
                 Ok(evidence) => return Ok(evidence),
                 Err(error) if error.is_retryable() && attempt + 1 < policy.max_attempts() => {
+                    store.record_scheduler_retry(run_id, u32::from(attempt + 1), false)
+                        .map_err(SshTransferExecutionError::Journal)?;
                     let delay = policy.delay_for_retry(attempt + 1);
                     if !sleep_interruptibly(delay, should_cancel) {
                         return Err(SshTransferExecutionError::Remote(SshRunError::Cancelled));
                     }
                 }
-                Err(error) => return Err(SshTransferExecutionError::Remote(error)),
+                Err(error) => {
+                    if error.is_retryable() {
+                        store
+                            .record_scheduler_retry(run_id, u32::from(attempt + 1), true)
+                            .map_err(SshTransferExecutionError::Journal)?;
+                    }
+                    return Err(SshTransferExecutionError::Remote(error));
+                }
             }
         }
         unreachable!("a validated retry policy always has at least one attempt")
@@ -2332,8 +2341,10 @@ impl RunWorkflow {
         match action.kind() {
             PlanActionKind::CopyToDestination | PlanActionKind::OverwriteDestination => {
                 let mut progress_error = None;
-                let result = self.retry_transfer(
-                    plan.specification().options().retry_policy(),
+                let mut retry_count = 0;
+                let retry_policy = plan.specification().options().retry_policy();
+                let result = self.retry_transfer_with_hook(
+                    retry_policy,
                     should_cancel,
                     || {
                         self.transfer.execute_with_progress_and_policy(
@@ -2355,7 +2366,9 @@ impl RunWorkflow {
                             },
                         )
                     },
+                    |retry| retry_count = retry,
                 );
+                self.record_scheduler_retry_if_needed(run_id, retry_count, &result, retry_policy, store)?;
                 if let Some(error) = progress_error {
                     return self.record_journal_failure(
                         run_id,
@@ -2433,8 +2446,10 @@ impl RunWorkflow {
                     );
                 }
                 let mut progress_error = None;
-                let result = self.retry_transfer(
-                    plan.specification().options().retry_policy(),
+                let mut retry_count = 0;
+                let retry_policy = plan.specification().options().retry_policy();
+                let result = self.retry_transfer_with_hook(
+                    retry_policy,
                     should_cancel,
                     || {
                         self.transfer.execute_source_verification(
@@ -2456,7 +2471,9 @@ impl RunWorkflow {
                             },
                         )
                     },
+                    |retry| retry_count = retry,
                 );
+                self.record_scheduler_retry_if_needed(run_id, retry_count, &result, retry_policy, store)?;
                 if let Some(error) = progress_error {
                     return self.record_journal_failure(
                         run_id,
@@ -2550,14 +2567,16 @@ impl RunWorkflow {
         }
     }
 
-    fn retry_transfer<F>(
+    fn retry_transfer_with_hook<F, R>(
         &self,
         policy: RetryPolicy,
         should_cancel: &dyn Fn() -> bool,
         mut operation: F,
+        mut on_retry: R,
     ) -> Result<VerifiedReplacement, TransferError>
     where
         F: FnMut() -> Result<VerifiedReplacement, TransferError>,
+        R: FnMut(u32),
     {
         for attempt in 0..policy.max_attempts() {
             if should_cancel() {
@@ -2566,6 +2585,7 @@ impl RunWorkflow {
             match operation() {
                 Ok(replacement) => return Ok(replacement),
                 Err(error) if error.is_transient() && attempt + 1 < policy.max_attempts() => {
+                    on_retry(u32::from(attempt + 1));
                     let delay = policy.delay_for_retry(attempt + 1);
                     if !sleep_interruptibly(delay, should_cancel) {
                         return Err(TransferError::Replacement(ReplacementError::Cancelled));
@@ -2575,6 +2595,24 @@ impl RunWorkflow {
             }
         }
         unreachable!("a validated retry policy always has at least one attempt")
+    }
+
+    fn record_scheduler_retry_if_needed(
+        &self,
+        run_id: RunId,
+        retry_count: u32,
+        result: &Result<VerifiedReplacement, TransferError>,
+        policy: RetryPolicy,
+        store: &mut RunEvidenceStore,
+    ) -> Result<(), WorkflowError> {
+        if retry_count == 0 || !store.is_scheduled_run(run_id)? {
+            return Ok(());
+        }
+        let exhausted = result.as_ref().is_err_and(|error| {
+            error.is_transient() && retry_count + 1 >= u32::from(policy.max_attempts())
+        });
+        store.record_scheduler_retry(run_id, retry_count, exhausted)?;
+        Ok(())
     }
 
     fn record_journal_failure(
@@ -5145,7 +5183,7 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let operation_attempts = Arc::clone(&attempts);
         let error = workflow
-            .retry_transfer(
+            .retry_transfer_with_hook(
                 RetryPolicy::new(3, std::time::Duration::ZERO),
                 &|| false,
                 move || {
@@ -5154,6 +5192,7 @@ mod tests {
                         "temporary transport failure".to_owned(),
                     )))
                 },
+                |_| {},
             )
             .expect_err("three transient failures should stop at the bound");
 
@@ -5167,7 +5206,7 @@ mod tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let operation_attempts = Arc::clone(&attempts);
         let error = workflow
-            .retry_transfer(
+            .retry_transfer_with_hook(
                 RetryPolicy::new(3, std::time::Duration::ZERO),
                 &|| false,
                 move || {
@@ -5176,6 +5215,7 @@ mod tests {
                         VerificationError::HashMismatch,
                     )))
                 },
+                |_| {},
             )
             .expect_err("a verification failure must stop without a transport retry");
 
