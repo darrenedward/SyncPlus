@@ -49,3 +49,15 @@ Run the disposable package contract before release:
 ```sh
 ./packaging/test-deb.sh
 ```
+
+Run the complete disposable release gate, including the scheduling, recovery,
+privacy, SSH, process, SQLite, filesystem, and installed-package matrix:
+
+```sh
+./packaging/release-gate.sh
+```
+
+Each run retains a machine-readable manifest, sanitized per-case logs, tool
+versions, and package digest under `target/release-evidence/<run-id>/`. The
+command exits nonzero and does not create `RELEASE_READY` when a required case
+fails or cannot run.
