@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 0 ]; then
+    echo "This command accepts no arguments" >&2
+    exit 2
+fi
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Run this as the desktop user; SyncPlus does not install a root scheduler" >&2
+    exit 1
+fi
+if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemctl is required for the per-user SyncPlus scheduler" >&2
+    exit 1
+fi
+
+systemctl --user disable --now syncplus-background.timer
+echo "SyncPlus background scheduler disabled for this user"

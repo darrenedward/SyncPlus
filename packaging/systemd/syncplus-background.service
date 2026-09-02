@@ -1,0 +1,7 @@
+[Unit]
+Description=SyncPlus per-user background scheduler
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/syncplus --background-scheduler
+NoNewPrivileges=yes

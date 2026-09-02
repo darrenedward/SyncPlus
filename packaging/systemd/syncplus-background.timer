@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll SyncPlus schedules for this user
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=true
+Unit=syncplus-background.service
+
+[Install]
+WantedBy=timers.target

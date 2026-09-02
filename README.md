@@ -28,3 +28,24 @@ The application never creates SQLite files beside selected source or destination
 - Mirror Sync and One-Way Sync are separate modes.
 - No arbitrary shell or rsync arguments and no automatic privilege escalation.
 - Every data-changing action is visible, explainable, and recoverable where possible.
+
+## Debian package
+
+The supported Linux package is built from the locked Rust workspace with a
+deterministic timestamp:
+
+```sh
+SOURCE_DATE_EPOCH=0 ./packaging/build-deb.sh
+```
+
+The resulting versioned package is written under `target/debian/`. It contains
+the application, desktop entry, icon, Help asset, and fixed per-user systemd
+service/timer. Installing the package does not enable a root daemon. Enable or
+disable the scheduler explicitly as the desktop user with the desktop-menu
+actions or `syncplus-scheduler-register` and `syncplus-scheduler-unregister`.
+
+Run the disposable package contract before release:
+
+```sh
+./packaging/test-deb.sh
+```

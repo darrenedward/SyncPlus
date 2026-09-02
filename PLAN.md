@@ -227,7 +227,9 @@ The current core scheduler persists a validated interval, timezone, enabled
 state, and next-run timestamp. It claims due occurrences atomically with the
 frozen Run Snapshot, and the desktop's fixed `--background-scheduler` command
 provides the user-level launch point while leaving registration to the native
-packaging integration.
+packaging integration. The Debian package installs a fixed per-user systemd
+service and timer plus explicit register/unregister helpers; it does not install
+or enable a root daemon.
 
 Automatic schedules:
 
