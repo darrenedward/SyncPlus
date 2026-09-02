@@ -3920,17 +3920,33 @@ impl eframe::App for SyncPlusApp {
             .show(ui, |ui| draw_help(ui, &mut self.help_topic));
         egui::Panel::top("settings").show(ui, |ui| self.draw_settings(ui));
         egui::Panel::left("profiles").show(ui, |ui| self.draw_profile_list(ui));
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.draw_notifications(ui));
-            egui::ScrollArea::vertical().show(ui, |ui| self.draw_missed_schedule_notices(ui));
-            egui::ScrollArea::vertical().show(ui, |ui| self.draw_scheduler_events(ui));
-            egui::ScrollArea::vertical().show(ui, |ui| self.draw_profile_form(ui));
-            egui::ScrollArea::vertical().show(ui, |ui| self.draw_review(ui));
-            egui::ScrollArea::vertical().show(ui, |ui| self.draw_run_reports(ui));
-            ui.separator();
-            ui.label(egui::RichText::new(&self.status).strong());
-        });
+        egui::CentralPanel::default().show(ui, |ui| self.draw_central_content(ui));
         self.draw_quit_dialog(&context);
+    }
+}
+
+impl SyncPlusApp {
+    fn draw_central_content(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("notifications")
+            .show(ui, |ui| self.draw_notifications(ui));
+        egui::ScrollArea::vertical()
+            .id_salt("missed-schedule-notices")
+            .show(ui, |ui| self.draw_missed_schedule_notices(ui));
+        egui::ScrollArea::vertical()
+            .id_salt("scheduler-events")
+            .show(ui, |ui| self.draw_scheduler_events(ui));
+        egui::ScrollArea::vertical()
+            .id_salt("profile-form")
+            .show(ui, |ui| self.draw_profile_form(ui));
+        egui::ScrollArea::vertical()
+            .id_salt("review")
+            .show(ui, |ui| self.draw_review(ui));
+        egui::ScrollArea::vertical()
+            .id_salt("run-reports")
+            .show(ui, |ui| self.draw_run_reports(ui));
+        ui.separator();
+        ui.label(egui::RichText::new(&self.status).strong());
     }
 }
 
@@ -4355,6 +4371,38 @@ mod tests {
     fn app() -> SyncPlusApp {
         SyncPlusApp::new_with_store(RunEvidenceStore::open_in_memory().expect("database"))
             .expect("app")
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn central_content_does_not_paint_scroll_area_id_clash_diagnostics() {
+        fn collect_text(shape: &egui::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut syncplus = app();
+        let context = egui::Context::default();
+        let output = context.run_ui(Default::default(), |context| {
+            egui::CentralPanel::default().show(context, |ui| syncplus.draw_central_content(ui));
+        });
+        let mut texts = Vec::new();
+        for clipped_shape in &output.shapes {
+            collect_text(&clipped_shape.shape, &mut texts);
+        }
+        output.drop_without_applying_deltas();
+
+        assert!(
+            !texts.iter().any(|text| text.contains("ScrollArea ID")),
+            "egui painted an internal widget diagnostic: {texts:?}"
+        );
     }
 
     #[test]
