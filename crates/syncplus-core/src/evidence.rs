@@ -16,7 +16,7 @@ use crate::{
     AnalysisOutcome, CompletionReconciliation, ConflictResolution, ContentProof, InventorySnapshotItem,
     ResolutionOperation, SourceDrainStatus, SourceInventorySnapshot, SyncBaseline,
     SyncBaselineItem, SyncBaselineItemState, SyncMode, SyncOptions, SyncProfile,
-    ValidatedSyncOptions, VolumeIdentity,
+    SyncProfileId, ValidatedSyncOptions, VolumeIdentity,
 };
 use crate::restore::RecoveryProvenance;
 
@@ -707,6 +707,80 @@ pub enum RunReportStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissedScheduleDecision {
+    Pending,
+    RunNow,
+    NotNow,
+}
+
+impl MissedScheduleDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::RunNow => "run_now",
+            Self::NotNow => "not_now",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "run_now" => Ok(Self::RunNow),
+            "not_now" => Ok(Self::NotNow),
+            _ => Err(StorageError::CorruptEvidence(format!(
+                "unknown missed schedule decision {value:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissedScheduleNotice {
+    notice_id: u64,
+    profile_id: SyncProfileId,
+    run_id: RunId,
+    first_scheduled_at_unix_seconds: i64,
+    latest_scheduled_at_unix_seconds: i64,
+    reason: String,
+    decision: MissedScheduleDecision,
+    missed_count: u64,
+}
+
+impl MissedScheduleNotice {
+    pub const fn notice_id(&self) -> u64 {
+        self.notice_id
+    }
+
+    pub const fn profile_id(&self) -> SyncProfileId {
+        self.profile_id
+    }
+
+    pub const fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub const fn first_scheduled_at_unix_seconds(&self) -> i64 {
+        self.first_scheduled_at_unix_seconds
+    }
+
+    pub const fn latest_scheduled_at_unix_seconds(&self) -> i64 {
+        self.latest_scheduled_at_unix_seconds
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub const fn decision(&self) -> MissedScheduleDecision {
+        self.decision
+    }
+
+    pub const fn missed_count(&self) -> u64 {
+        self.missed_count
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunExecutionResult {
     NotStarted,
     InProgress,
@@ -815,6 +889,11 @@ pub enum StorageError {
     ConcurrentProfileUpdate,
     ProfileNotFound { id: u64 },
     ReportNotFound { run_id: u64 },
+    MissedScheduleNotFound { notice_id: u64 },
+    MissedScheduleAlreadyDecided {
+        notice_id: u64,
+        decision: MissedScheduleDecision,
+    },
     ReportActionNotAllowed {
         run_id: u64,
         action: &'static str,
@@ -851,6 +930,13 @@ impl fmt::Display for StorageError {
             ),
             Self::ProfileNotFound { id } => write!(formatter, "Sync Profile {id} was not found"),
             Self::ReportNotFound { run_id } => write!(formatter, "Sync Run report {run_id} was not found"),
+            Self::MissedScheduleNotFound { notice_id } => {
+                write!(formatter, "missed schedule notice {notice_id} was not found")
+            }
+            Self::MissedScheduleAlreadyDecided { notice_id, decision } => write!(
+                formatter,
+                "missed schedule notice {notice_id} already has decision {decision:?}"
+            ),
             Self::ReportActionNotAllowed {
                 run_id,
                 action,
@@ -951,7 +1037,7 @@ impl RunEvidenceStore {
                     ));
                 }
             };
-            if version < 17 {
+            if version < 18 {
                 let manager = DatabaseBackupManager::for_database(path)
                     .map_err(|error| StorageError::DatabaseBackup(error.to_string()))?;
                 if let Err(error) = manager.create_validated_backup(&connection) {
@@ -1026,7 +1112,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 17 {
+        if version > 18 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -1596,6 +1682,35 @@ impl RunEvidenceStore {
                 )?;
             }
             transaction.pragma_update(None, "user_version", 17)?;
+            verify_integrity(&transaction)?;
+            transaction.commit()?;
+            version = 17;
+        }
+        if version == 17 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS missed_schedule_notices (
+                    notice_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_id INTEGER NOT NULL,
+                    run_id INTEGER NOT NULL,
+                    first_scheduled_at_unix_seconds INTEGER NOT NULL
+                        CHECK (first_scheduled_at_unix_seconds >= 0),
+                    latest_scheduled_at_unix_seconds INTEGER NOT NULL
+                        CHECK (latest_scheduled_at_unix_seconds >= first_scheduled_at_unix_seconds),
+                    reason TEXT NOT NULL CHECK (length(reason) > 0),
+                    decision TEXT NOT NULL CHECK (decision IN ('pending', 'run_now', 'not_now')),
+                    missed_count INTEGER NOT NULL CHECK (missed_count > 0),
+                    created_at_unix_seconds INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS missed_schedule_notices_by_profile
+                    ON missed_schedule_notices (profile_id, latest_scheduled_at_unix_seconds DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS one_pending_missed_schedule_notice_per_profile
+                    ON missed_schedule_notices (profile_id)
+                    WHERE decision = 'pending';
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 18)?;
             verify_integrity(&transaction)?;
             transaction.commit()?;
         }
@@ -2428,6 +2543,211 @@ impl RunEvidenceStore {
             )));
         }
         Ok(())
+    }
+
+    /// Record a Scheduled Run that could not proceed. There is at most one
+    /// pending notice per Sync Profile; later missed occurrences update that
+    /// notice instead of creating duplicate catch-up choices.
+    pub fn record_missed_schedule(
+        &mut self,
+        profile_id: SyncProfileId,
+        run_id: RunId,
+        scheduled_at_unix_seconds: i64,
+        reason: &str,
+    ) -> Result<MissedScheduleNotice, StorageError> {
+        if scheduled_at_unix_seconds < 0 || reason.trim().is_empty() {
+            return Err(StorageError::InvalidEvent(
+                "missed schedule notices require a nonnegative time and a reason".to_owned(),
+            ));
+        }
+        let profile_id = profile_id.value_as_i64()?;
+        let run_id = i64::try_from(run_id.value()).map_err(|_| {
+            StorageError::InvalidEvent("missed schedule run identifier is out of range".to_owned())
+        })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let existing_for_run: Option<i64> = transaction
+            .query_row(
+                "SELECT notice_id FROM missed_schedule_notices WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let notice_id = if let Some(notice_id) = existing_for_run {
+            notice_id
+        } else if let Some(notice_id) = transaction
+            .query_row(
+                "SELECT notice_id FROM missed_schedule_notices
+                 WHERE profile_id = ?1 AND decision = 'pending'",
+                params![profile_id],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            transaction.execute(
+                "UPDATE missed_schedule_notices
+                 SET latest_scheduled_at_unix_seconds = MAX(latest_scheduled_at_unix_seconds, ?1),
+                     reason = ?2,
+                     missed_count = missed_count + 1
+                 WHERE notice_id = ?3",
+                params![scheduled_at_unix_seconds, reason, notice_id],
+            )?;
+            notice_id
+        } else {
+            transaction.execute(
+                "INSERT INTO missed_schedule_notices (
+                     profile_id, run_id, first_scheduled_at_unix_seconds,
+                     latest_scheduled_at_unix_seconds, reason, decision,
+                     missed_count, created_at_unix_seconds
+                 ) VALUES (?1, ?2, ?3, ?3, ?4, 'pending', 1,
+                           CAST(strftime('%s', 'now') AS INTEGER))",
+                params![profile_id, run_id, scheduled_at_unix_seconds, reason],
+            )?;
+            transaction.last_insert_rowid()
+        };
+        transaction.commit()?;
+        self.load_missed_schedule_notice_by_i64(notice_id)?
+            .ok_or_else(|| StorageError::CorruptEvidence("new missed schedule notice disappeared".to_owned()))
+    }
+
+    pub fn load_missed_schedule_notice(
+        &self,
+        notice_id: u64,
+    ) -> Result<Option<MissedScheduleNotice>, StorageError> {
+        let notice_id = i64::try_from(notice_id)
+            .map_err(|_| StorageError::InvalidEvent("notice identifier is out of range".to_owned()))?;
+        self.load_missed_schedule_notice_by_i64(notice_id)
+    }
+
+    pub fn list_missed_schedule_notices(&self) -> Result<Vec<MissedScheduleNotice>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT notice_id, profile_id, run_id,
+                    first_scheduled_at_unix_seconds, latest_scheduled_at_unix_seconds,
+                    reason, decision, missed_count
+             FROM missed_schedule_notices
+             ORDER BY CASE decision WHEN 'pending' THEN 0 ELSE 1 END,
+                      latest_scheduled_at_unix_seconds DESC, notice_id DESC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(Self::decode_missed_schedule_notice)
+            .collect()
+    }
+
+    /// Record the user's explicit catch-up choice. A settled notice remains
+    /// durable for review, but cannot create a second catch-up run.
+    pub fn mark_missed_schedule_decision(
+        &mut self,
+        notice_id: u64,
+        decision: MissedScheduleDecision,
+    ) -> Result<MissedScheduleNotice, StorageError> {
+        if decision == MissedScheduleDecision::Pending {
+            return Err(StorageError::InvalidEvent(
+                "a missed schedule decision must be Run Now or Not Now".to_owned(),
+            ));
+        }
+        let notice_id_i64 = i64::try_from(notice_id)
+            .map_err(|_| StorageError::InvalidEvent("notice identifier is out of range".to_owned()))?;
+        let changed = self.connection.execute(
+            "UPDATE missed_schedule_notices SET decision = ?1
+             WHERE notice_id = ?2 AND decision = 'pending'",
+            params![decision.as_str(), notice_id_i64],
+        )?;
+        if changed == 0 {
+            let existing = self
+                .connection
+                .query_row(
+                    "SELECT decision FROM missed_schedule_notices WHERE notice_id = ?1",
+                    params![notice_id_i64],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let Some(existing) = existing else {
+                return Err(StorageError::MissedScheduleNotFound { notice_id });
+            };
+            let existing = MissedScheduleDecision::from_str(&existing)?;
+            if existing != decision {
+                return Err(StorageError::MissedScheduleAlreadyDecided {
+                    notice_id,
+                    decision: existing,
+                });
+            }
+        }
+        self.load_missed_schedule_notice(notice_id)
+            .and_then(|notice| notice.ok_or(StorageError::MissedScheduleNotFound { notice_id }))
+    }
+
+    fn load_missed_schedule_notice_by_i64(
+        &self,
+        notice_id: i64,
+    ) -> Result<Option<MissedScheduleNotice>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT notice_id, profile_id, run_id,
+                        first_scheduled_at_unix_seconds, latest_scheduled_at_unix_seconds,
+                        reason, decision, missed_count
+                 FROM missed_schedule_notices WHERE notice_id = ?1",
+                params![notice_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(Self::decode_missed_schedule_notice)
+            .transpose()
+    }
+
+    fn decode_missed_schedule_notice(
+        row: (i64, i64, i64, i64, i64, String, String, i64),
+    ) -> Result<MissedScheduleNotice, StorageError> {
+        let (notice_id, profile_id, run_id, first_scheduled_at, latest_scheduled_at, reason, decision, missed_count) = row;
+        let notice_id = u64::try_from(notice_id)
+            .map_err(|_| StorageError::CorruptEvidence("missed schedule notice id is invalid".to_owned()))?;
+        let profile_id = u64::try_from(profile_id)
+            .map_err(|_| StorageError::CorruptEvidence("missed schedule profile id is invalid".to_owned()))?;
+        let run_id = u64::try_from(run_id)
+            .map_err(|_| StorageError::CorruptEvidence("missed schedule run id is invalid".to_owned()))?;
+        let missed_count = u64::try_from(missed_count)
+            .map_err(|_| StorageError::CorruptEvidence("missed schedule count is invalid".to_owned()))?;
+        if first_scheduled_at < 0 || latest_scheduled_at < first_scheduled_at || missed_count == 0 || reason.trim().is_empty() {
+            return Err(StorageError::CorruptEvidence(
+                "missed schedule notice contains invalid values".to_owned(),
+            ));
+        }
+        Ok(MissedScheduleNotice {
+            notice_id,
+            profile_id: SyncProfileId::new(profile_id),
+            run_id: RunId::new(run_id),
+            first_scheduled_at_unix_seconds: first_scheduled_at,
+            latest_scheduled_at_unix_seconds: latest_scheduled_at,
+            reason,
+            decision: MissedScheduleDecision::from_str(&decision)?,
+            missed_count,
+        })
     }
 
     pub fn next_run_id(&mut self) -> Result<RunId, StorageError> {
@@ -5422,7 +5742,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
         assert!(
             migrated
                 .connection
@@ -5473,7 +5793,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
         for table in ["application_settings", "sync_profiles", "sync_profile_exclusions"] {
             assert!(
                 migrated
@@ -5526,7 +5846,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            17
+            18
         );
     }
 

@@ -7,7 +7,8 @@ use syncplus_core::{
     ConflictDecision,
     ConflictEntry, ConflictEntryKey, ConflictResolution, ConflictReview, DeletionMethod,
     FreshAnalysis, LocalPrecheckProbe, MetadataRequirements, OneWaySource, PartialTransferPolicy,
-    Peer, PeerEndpoint, PersistedSyncProfile, PrecheckErrorKind, PrecheckResult,
+    MissedScheduleDecision, MissedScheduleNotice, Peer, PeerEndpoint, PersistedSyncProfile,
+    PrecheckErrorKind, PrecheckResult,
     RemotePrecheckRequest, ResolutionRun, RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId,
     RecoveryMethod, RunLifecycle, RunPrecheck, RunReport, RunReportStatus, SavedSecretReference, SecretStore,
     SecretStoreError,
@@ -60,6 +61,9 @@ pub enum UiValidationError {
     Analysis(String),
     Core(String),
 }
+
+const MISSED_SCHEDULE_RUN_NOW_LABEL: &str = "Yes, Run Now";
+const MISSED_SCHEDULE_NOT_NOW_LABEL: &str = "No, Not Now";
 
 impl std::fmt::Display for UiValidationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1110,6 +1114,7 @@ pub struct SyncPlusApp {
     status: String,
     review: Option<PlanReviewState>,
     run_reports: Vec<RunReport>,
+    missed_schedule_notices: Vec<MissedScheduleNotice>,
     selected_run_report: Option<RunId>,
     pending_report_action: Option<PendingReportAction>,
     help_topic: HelpTopic,
@@ -1131,6 +1136,7 @@ impl SyncPlusApp {
         let settings = store.load_settings()?;
         let profiles = store.list_profiles()?;
         let run_reports = store.list_run_reports()?;
+        let missed_schedule_notices = store.list_missed_schedule_notices()?;
         let selected_run_report = run_reports.first().map(RunReport::run_id);
         Ok(Self {
             store,
@@ -1141,6 +1147,7 @@ impl SyncPlusApp {
             status: "Ready. Create a Sync Profile to begin.".to_owned(),
             review: None,
             run_reports,
+            missed_schedule_notices,
             selected_run_report,
             pending_report_action: None,
             help_topic: HelpTopic::Modes,
@@ -1165,6 +1172,10 @@ impl SyncPlusApp {
 
     pub fn run_reports(&self) -> &[RunReport] {
         &self.run_reports
+    }
+
+    pub fn missed_schedule_notices(&self) -> &[MissedScheduleNotice] {
+        &self.missed_schedule_notices
     }
 
     pub fn selected_run_report(&self) -> Option<&RunReport> {
@@ -1197,6 +1208,10 @@ impl SyncPlusApp {
             .filter(|run_id| reports.iter().any(|report| report.run_id() == *run_id))
             .or_else(|| reports.first().map(RunReport::run_id));
         self.run_reports = reports;
+        self.missed_schedule_notices = self
+            .store
+            .list_missed_schedule_notices()
+            .map_err(|error| UiValidationError::Core(error.to_string()))?;
         self.selected_run_report = selected;
         if self
             .pending_report_action
@@ -1209,6 +1224,49 @@ impl SyncPlusApp {
         {
             self.pending_report_action = None;
         }
+        Ok(())
+    }
+
+    pub fn request_missed_schedule_run_now(
+        &mut self,
+        notice_id: u64,
+    ) -> Result<(), UiValidationError> {
+        let notice = self
+            .store
+            .load_missed_schedule_notice(notice_id)
+            .map_err(map_storage_error)?
+            .ok_or_else(|| UiValidationError::Core(format!("missed schedule notice {notice_id} was not found")))?;
+        if notice.decision() != MissedScheduleDecision::Pending {
+            return Err(UiValidationError::Core(format!(
+                "missed schedule notice {notice_id} already has a decision"
+            )));
+        }
+        let profile_id = notice.profile_id();
+        self.store
+            .mark_missed_schedule_decision(notice_id, MissedScheduleDecision::RunNow)
+            .map_err(map_storage_error)?;
+        self.profiles = self
+            .store
+            .list_profiles()
+            .map_err(|error| UiValidationError::Core(error.to_string()))?;
+        self.select_profile(profile_id);
+        let result = self.analyze_profile();
+        self.refresh_run_reports()?;
+        if result.is_ok() {
+            self.status = "Run Now selected. Fresh Analysis and Run Precheck completed; review and request normal Execution Confirmation before any filesystem mutation.".to_owned();
+        }
+        result
+    }
+
+    pub fn record_missed_schedule_not_now(
+        &mut self,
+        notice_id: u64,
+    ) -> Result<(), UiValidationError> {
+        self.store
+            .mark_missed_schedule_decision(notice_id, MissedScheduleDecision::NotNow)
+            .map_err(map_storage_error)?;
+        self.refresh_run_reports()?;
+        self.status = "No, Not Now recorded. Synchronization did not succeed; the missed schedule remains visible in the durable notice history.".to_owned();
         Ok(())
     }
 
@@ -2479,6 +2537,56 @@ impl SyncPlusApp {
             }
         }
     }
+
+    fn draw_missed_schedule_notices(&mut self, ui: &mut egui::Ui) {
+        if self.missed_schedule_notices.is_empty() {
+            return;
+        }
+        let notices = self.missed_schedule_notices.clone();
+        let mut run_now = None;
+        let mut not_now = None;
+        ui.separator();
+        ui.heading("Missed Schedule Notices");
+        ui.label("A notice records why a Scheduled Run did not complete. Choosing Run Now starts a fresh interactive review; it never reuses an old plan.");
+        for notice in notices {
+            ui.group(|ui| {
+                ui.label(format!(
+                    "Sync Profile {} — {} missed occurrence{}",
+                    notice.profile_id().value(),
+                    notice.missed_count(),
+                    if notice.missed_count() == 1 { "" } else { "s" }
+                ));
+                ui.label(notice.reason());
+                match notice.decision() {
+                    MissedScheduleDecision::Pending => {
+                        ui.horizontal(|ui| {
+                            if ui.button(MISSED_SCHEDULE_RUN_NOW_LABEL).clicked() {
+                                run_now = Some(notice.notice_id());
+                            }
+                            if ui.button(MISSED_SCHEDULE_NOT_NOW_LABEL).clicked() {
+                                not_now = Some(notice.notice_id());
+                            }
+                        });
+                    }
+                    MissedScheduleDecision::RunNow => {
+                        ui.label("Decision recorded: Run Now selected; the interactive review must still be completed.");
+                    }
+                    MissedScheduleDecision::NotNow => {
+                        ui.label("Decision recorded: Not Now. Synchronization did not succeed.");
+                    }
+                }
+            });
+        }
+        if let Some(notice_id) = run_now {
+            if let Err(error) = self.request_missed_schedule_run_now(notice_id) {
+                self.status = format!("Run Now was not started: {error}");
+            }
+        } else if let Some(notice_id) = not_now {
+            if let Err(error) = self.record_missed_schedule_not_now(notice_id) {
+                self.status = format!("Not Now was not recorded: {error}");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3021,6 +3129,7 @@ impl eframe::App for SyncPlusApp {
         egui::Panel::top("settings").show(ui, |ui| self.draw_settings(ui));
         egui::Panel::left("profiles").show(ui, |ui| self.draw_profile_list(ui));
         egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| self.draw_missed_schedule_notices(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_profile_form(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_review(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_run_reports(ui));
@@ -3451,6 +3560,13 @@ mod tests {
     fn app() -> SyncPlusApp {
         SyncPlusApp::new_with_store(RunEvidenceStore::open_in_memory().expect("database"))
             .expect("app")
+    }
+
+    #[test]
+    fn missed_schedule_notice_exposes_exactly_the_two_catch_up_choices() {
+        assert_eq!(MISSED_SCHEDULE_RUN_NOW_LABEL, "Yes, Run Now");
+        assert_eq!(MISSED_SCHEDULE_NOT_NOW_LABEL, "No, Not Now");
+        assert_ne!(MISSED_SCHEDULE_RUN_NOW_LABEL, MISSED_SCHEDULE_NOT_NOW_LABEL);
     }
 
     fn report_store() -> (RunEvidenceStore, syncplus_core::RunId, syncplus_core::RunId) {

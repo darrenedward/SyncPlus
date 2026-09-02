@@ -6,7 +6,8 @@ use std::{
 use crate::storage::{ClaimedScheduledRun, SyncProfileId};
 use crate::{
     CredentialResolver, PrecheckProbe, RemotePrecheckPermit,
-    RunEvidenceStore, RunReport, RunSnapshot, RunWorkflow, SecretStore, SshHostTrustPermit,
+    MissedScheduleDecision, PersistedSyncProfile, RunEvidenceStore, RunReport, RunSnapshot,
+    RunWorkflow, SecretStore, SshHostTrustPermit,
     SshRunBackend, SshRunMode, StorageError, WorkflowError, PeerScopeLockRegistry,
 };
 use crate::workflow::mark_unattended_blocked;
@@ -100,14 +101,18 @@ impl ScheduledRun {
         P: PrecheckProbe,
         F: Fn() -> bool,
     {
-        workflow.execute_unattended(
+        let result = workflow.execute_unattended(
             self.run_id,
             self.snapshot.profile(),
             self.snapshot.authorizations(),
             probe,
             store,
             should_cancel,
-        )
+        );
+        if let Err(error) = &result {
+            self.record_missed_schedule(store, error)?;
+        }
+        result
     }
 
     /// Resolve the profile's selected SSH credential in unattended mode and
@@ -139,6 +144,7 @@ impl ScheduledRun {
                     "scheduled SSH execution requires exactly one SSH peer".to_owned(),
                 );
                 mark_unattended_blocked(store, self.run_id, self.snapshot().profile(), &error)?;
+                self.record_missed_schedule(store, &error)?;
                 return Err(error);
             }
             (Some(_), Some(_)) => {
@@ -146,6 +152,7 @@ impl ScheduledRun {
                     "scheduled SSH execution does not support two SSH peers".to_owned(),
                 );
                 mark_unattended_blocked(store, self.run_id, self.snapshot().profile(), &error)?;
+                self.record_missed_schedule(store, &error)?;
                 return Err(error);
             }
         };
@@ -156,10 +163,11 @@ impl ScheduledRun {
                     "scheduled SSH credential is unavailable: {error}"
                 ));
                 mark_unattended_blocked(store, self.run_id, self.snapshot().profile(), &error)?;
+                self.record_missed_schedule(store, &error)?;
                 return Err(error);
             }
         };
-        workflow.execute_ssh_unattended(
+        let result = workflow.execute_ssh_unattended(
             self.run_id,
             self.snapshot().profile(),
             self.snapshot().authorizations(),
@@ -167,6 +175,65 @@ impl ScheduledRun {
             host_permit,
             precheck,
             backend,
+            store,
+            should_cancel,
+        );
+        if let Err(error) = &result {
+            self.record_missed_schedule(store, error)?;
+        }
+        result
+    }
+
+    fn record_missed_schedule(
+        &self,
+        store: &mut RunEvidenceStore,
+        error: &WorkflowError,
+    ) -> Result<(), WorkflowError> {
+        let reason = format!(
+            "{error}. The Scheduled Run did not complete. Next action: choose Yes, Run Now for a fresh interactive analysis, precheck, and confirmation, or No, Not Now."
+        );
+        store.record_missed_schedule(
+            self.profile_id,
+            self.run_id,
+            self.scheduled_at_unix_seconds,
+            &reason,
+        )?;
+        Ok(())
+    }
+}
+
+impl crate::MissedScheduleNotice {
+    /// Start one safe interactive catch-up from the current persisted profile.
+    /// The missed Scheduled Run snapshot is never reused: this allocates a new
+    /// Sync Run and delegates to the normal interactive workflow, including
+    /// Fresh Analysis, Run Precheck, and the caller's confirmation callback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_now<P, C, F>(
+        &self,
+        workflow: &RunWorkflow,
+        current_profile: &PersistedSyncProfile,
+        probe: &P,
+        confirm: C,
+        store: &mut RunEvidenceStore,
+        should_cancel: F,
+    ) -> Result<RunReport, WorkflowError>
+    where
+        P: PrecheckProbe,
+        C: FnOnce(&crate::ConfirmedPlan) -> bool,
+        F: Fn() -> bool,
+    {
+        if current_profile.id() != self.profile_id() {
+            return Err(WorkflowError::InvalidRun(
+                "missed schedule catch-up profile does not match the notice".to_owned(),
+            ));
+        }
+        store.mark_missed_schedule_decision(self.notice_id(), MissedScheduleDecision::RunNow)?;
+        let run_id = store.next_run_id()?;
+        workflow.execute(
+            run_id,
+            current_profile.profile(),
+            probe,
+            confirm,
             store,
             should_cancel,
         )
@@ -255,8 +322,8 @@ mod tests {
     use super::{BackgroundScheduler, SchedulerClock, SchedulerError};
     use crate::{
         ApplicationMode, DeletionMethod, LocalPrecheckProbe, Peer, RecoveryMethod,
-        PeerScope, PeerScopeLockRegistry, ProcessSupervisor, RunEvidenceStore, RunId,
-        RunReportStatus, ScopeLockOwner, SyncOptions, SyncProfile,
+        MissedScheduleDecision, PeerScope, PeerScopeLockRegistry, ProcessSupervisor,
+        RunEvidenceStore, RunId, RunReportStatus, ScopeLockOwner, SyncOptions, SyncProfile,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
@@ -426,6 +493,140 @@ mod tests {
         assert!(reason.contains("active profile"), "reason: {reason}");
         assert!(!scheduled_destination.join("must-remain.txt").exists());
         assert!(scheduled_source.join("must-remain.txt").exists());
+        fs::remove_dir_all(root).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn unavailable_scheduled_runs_create_one_coalesced_missed_notice() {
+        let root = fixture_root();
+        let source = root.join("source-that-is-unavailable");
+        let destination = root.join("destination");
+        fs::create_dir_all(&destination).expect("destination");
+        let profile = SyncProfile::new(
+            "missed schedule profile",
+            Peer::new("source", source.clone()),
+            Peer::new("destination", destination),
+        );
+        let mut store = RunEvidenceStore::open_in_memory().expect("store");
+        let persisted = store.create_profile(&profile).expect("profile");
+        let schedule = crate::ScheduleDefinition::new_with_next_run_at(1, "UTC", true, Some(100))
+            .expect("schedule");
+        store
+            .update_schedule_at(persisted.id(), Some(schedule), ApplicationMode::Advanced, 100)
+            .expect("schedule update");
+        let workflow = crate::RunWorkflow::new(RecoveryMethod::trash(root.join("trash")));
+
+        for (now, expected_scheduled_at) in [(100, 100), (160, 160)] {
+            let scheduler = BackgroundScheduler::with_clock(FixedClock(now));
+            let claim = scheduler
+                .poll_due(&mut store)
+                .expect("due poll")
+                .pop()
+                .expect("claim");
+            assert_eq!(claim.scheduled_at_unix_seconds(), expected_scheduled_at);
+            assert!(claim
+                .execute(&workflow, &LocalPrecheckProbe::default(), &mut store, || false)
+                .is_err());
+        }
+
+        let notices = store
+            .list_missed_schedule_notices()
+            .expect("missed notices");
+        assert_eq!(notices.len(), 1);
+        let notice = &notices[0];
+        assert_eq!(notice.decision(), MissedScheduleDecision::Pending);
+        assert_eq!(notice.missed_count(), 2);
+        assert_eq!(notice.latest_scheduled_at_unix_seconds(), 160);
+        assert!(notice.reason().contains("source-that-is-unavailable"));
+        assert!(notice.reason().contains("Next action:"));
+        store
+            .mark_missed_schedule_decision(notice.notice_id(), MissedScheduleDecision::NotNow)
+            .expect("Not Now decision");
+        assert_eq!(
+            store
+                .load_missed_schedule_notice(notice.notice_id())
+                .expect("notice lookup")
+                .expect("notice remains visible")
+                .decision(),
+            MissedScheduleDecision::NotNow
+        );
+        fs::remove_dir_all(root).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn run_now_uses_a_new_interactive_run_and_current_profile() {
+        let root = fixture_root();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&destination).expect("destination");
+        let profile = SyncProfile::new(
+            "interactive catch-up profile",
+            Peer::new("source", source.clone()),
+            Peer::new("destination", destination.clone()),
+        );
+        let mut store = RunEvidenceStore::open_in_memory().expect("store");
+        let persisted = store.create_profile(&profile).expect("profile");
+        let schedule = crate::ScheduleDefinition::new_with_next_run_at(1, "UTC", true, Some(100))
+            .expect("schedule");
+        store
+            .update_schedule_at(persisted.id(), Some(schedule), ApplicationMode::Advanced, 100)
+            .expect("schedule update");
+        let scheduler = BackgroundScheduler::with_clock(FixedClock(100));
+        let claim = scheduler
+            .poll_due(&mut store)
+            .expect("due poll")
+            .pop()
+            .expect("claim");
+        let workflow = crate::RunWorkflow::new(RecoveryMethod::trash(root.join("trash")));
+        assert!(claim
+            .execute(&workflow, &LocalPrecheckProbe::default(), &mut store, || false)
+            .is_err());
+        let notice = store
+            .list_missed_schedule_notices()
+            .expect("missed notices")
+            .pop()
+            .expect("notice");
+
+        fs::create_dir_all(&source).expect("source becomes available");
+        fs::write(source.join("catch-up.txt"), b"fresh catch-up data").expect("source file");
+        let current_profile = store
+            .load_profile(persisted.id())
+            .expect("current profile lookup")
+            .expect("current profile");
+        let confirmation_called = std::cell::Cell::new(false);
+        let report = notice
+            .run_now(
+                &workflow,
+                &current_profile,
+                &LocalPrecheckProbe::default(),
+                |_| {
+                    confirmation_called.set(true);
+                    true
+                },
+                &mut store,
+                || false,
+            )
+            .expect("interactive catch-up");
+
+        assert!(confirmation_called.get(), "normal confirmation must run");
+        assert_ne!(report.run_id(), claim.run_id());
+        assert_eq!(report.status(), RunReportStatus::Completed);
+        assert_eq!(
+            fs::read(destination.join("catch-up.txt")).expect("catch-up destination"),
+            b"fresh catch-up data"
+        );
+        assert_eq!(
+            store
+                .load_missed_schedule_notice(notice.notice_id())
+                .expect("notice lookup")
+                .expect("notice remains visible")
+                .decision(),
+            MissedScheduleDecision::RunNow
+        );
+        assert_eq!(
+            store.load_report(claim.run_id()).expect("old report").status(),
+            RunReportStatus::Blocked
+        );
         fs::remove_dir_all(root).expect("fixture cleanup");
     }
 }
