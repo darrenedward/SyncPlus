@@ -18,7 +18,7 @@ command -v dpkg-architecture >/dev/null 2>&1 || {
 }
 
 package_id=$(cargo pkgid --package syncplus)
-version=${package_id##*#}
+version=${SYNCPLUS_PACKAGE_VERSION:-${package_id##*#}}
 case "$version" in
     ''|*[!0-9A-Za-z.+:~_-]*)
         echo "SyncPlus version is not a valid Debian version: $version" >&2
@@ -42,6 +42,18 @@ case "$SOURCE_DATE_EPOCH" in
         ;;
 esac
 export SOURCE_DATE_EPOCH
+
+cargo_home=${CARGO_HOME:-${HOME:-}/.cargo}
+case "$cargo_home" in
+    /*)
+        ;;
+    *)
+        echo "CARGO_HOME must be an absolute path when set" >&2
+        exit 1
+        ;;
+esac
+RUSTFLAGS="--remap-path-prefix=$ROOT=. --remap-path-prefix=$cargo_home=/.cargo"
+export RUSTFLAGS
 
 build_root="$ROOT/target/debian"
 staging="$build_root/syncplus"
@@ -77,7 +89,8 @@ printf '%s\n' \
     'Priority: optional' \
     "Architecture: $architecture" \
     'Maintainer: SyncPlus maintainers <maintainers@syncplus.invalid>' \
-    'Depends: libc6, libgcc-s1, libstdc++6' \
+    'Depends: libc6, libgcc-s1, libstdc++6, rsync, openssh-client' \
+    'Suggests: systemd' \
     'Description: Safety-first Linux file synchronization' \
     ' SyncPlus provides reviewed, verified, and recoverable local and SSH synchronization.' \
     >"$staging/DEBIAN/control"
