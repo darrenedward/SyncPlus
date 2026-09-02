@@ -790,7 +790,7 @@ impl RunEvidenceStore {
 }
 
 impl SyncProfileId {
-    fn value_as_i64(self) -> Result<i64, StorageError> {
+    pub(crate) fn value_as_i64(self) -> Result<i64, StorageError> {
         i64::try_from(self.0)
             .map_err(|_| StorageError::CorruptEvidence("profile identifier is out of range".to_owned()))
     }
