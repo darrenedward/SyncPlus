@@ -639,6 +639,15 @@ impl RunEvidenceStore {
             return Ok(None);
         }
         RunEvidenceStore::begin_run_in_transaction(&transaction, &snapshot)?;
+        RunEvidenceStore::insert_scheduler_event_in_transaction(
+            &transaction,
+            id,
+            run_id,
+            crate::SchedulerEventKind::ScheduledRunClaimed,
+            now_unix_seconds,
+            None,
+            None,
+        )?;
         transaction.commit()?;
         Ok(Some(ClaimedScheduledRun {
             profile_id: id,

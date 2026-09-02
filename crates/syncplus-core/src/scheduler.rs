@@ -7,7 +7,8 @@ use crate::storage::{ClaimedScheduledRun, SyncProfileId};
 use crate::{
     CredentialResolver, PrecheckProbe, RemotePrecheckPermit,
     MissedScheduleDecision, PersistedSyncProfile, RunEvidenceStore, RunReport, RunSnapshot,
-    RunWorkflow, SecretStore, SshHostTrustPermit,
+    RunWorkflow, RunReportStatus, PrecheckFailure, SecretStore, SshHostTrustPermit,
+    SchedulerEventKind,
     SshRunBackend, SshRunMode, StorageError, WorkflowError, PeerScopeLockRegistry,
 };
 use crate::workflow::mark_unattended_blocked;
@@ -109,8 +110,12 @@ impl ScheduledRun {
             store,
             should_cancel,
         );
-        if let Err(error) = &result {
-            self.record_missed_schedule(store, error)?;
+        match &result {
+            Ok(report) => self.record_outcome_event(store, report.status())?,
+            Err(error) => {
+                self.record_error_event(store, error)?;
+                self.record_missed_schedule(store, error)?;
+            }
         }
         result
     }
@@ -145,6 +150,7 @@ impl ScheduledRun {
                 );
                 mark_unattended_blocked(store, self.run_id, self.snapshot().profile(), &error)?;
                 self.record_missed_schedule(store, &error)?;
+                self.record_error_event(store, &error)?;
                 return Err(error);
             }
             (Some(_), Some(_)) => {
@@ -153,6 +159,7 @@ impl ScheduledRun {
                 );
                 mark_unattended_blocked(store, self.run_id, self.snapshot().profile(), &error)?;
                 self.record_missed_schedule(store, &error)?;
+                self.record_error_event(store, &error)?;
                 return Err(error);
             }
         };
@@ -178,10 +185,63 @@ impl ScheduledRun {
             store,
             should_cancel,
         );
-        if let Err(error) = &result {
-            self.record_missed_schedule(store, error)?;
+        match &result {
+            Ok(report) => self.record_outcome_event(store, report.status())?,
+            Err(error) => {
+                self.record_error_event(store, error)?;
+                self.record_missed_schedule(store, error)?;
+            }
         }
         result
+    }
+
+    fn record_outcome_event(
+        &self,
+        store: &mut RunEvidenceStore,
+        status: RunReportStatus,
+    ) -> Result<(), WorkflowError> {
+        let kind = match status {
+            RunReportStatus::Completed => SchedulerEventKind::Completed,
+            RunReportStatus::Failed => SchedulerEventKind::Failed,
+            RunReportStatus::Cancelled => SchedulerEventKind::Cancelled,
+            RunReportStatus::Interrupted => SchedulerEventKind::Interrupted,
+            RunReportStatus::CompletedWithReviewRequired | RunReportStatus::RecoveryReview => {
+                SchedulerEventKind::PendingReview
+            }
+            RunReportStatus::ReviewCleared => SchedulerEventKind::ReviewCleared,
+            RunReportStatus::Blocked => SchedulerEventKind::BlockedPreflight,
+            RunReportStatus::InProgress => SchedulerEventKind::Failed,
+        };
+        store.record_scheduler_event(self.profile_id, self.run_id, kind)?;
+        Ok(())
+    }
+
+    fn record_error_event(
+        &self,
+        store: &mut RunEvidenceStore,
+        error: &WorkflowError,
+    ) -> Result<(), WorkflowError> {
+        let kind = if matches!(error, WorkflowError::Precheck(PrecheckFailure::ScopeLocked(_))) {
+            SchedulerEventKind::SkippedOverlap
+        } else {
+            store
+                .load_report(self.run_id)
+                .map(|report| match report.status() {
+                    RunReportStatus::Blocked => SchedulerEventKind::BlockedPreflight,
+                    RunReportStatus::Cancelled => SchedulerEventKind::Cancelled,
+                    RunReportStatus::Interrupted => SchedulerEventKind::Interrupted,
+                    RunReportStatus::CompletedWithReviewRequired | RunReportStatus::RecoveryReview => {
+                        SchedulerEventKind::PendingReview
+                    }
+                    RunReportStatus::Failed | RunReportStatus::InProgress => SchedulerEventKind::Failed,
+                    RunReportStatus::Completed | RunReportStatus::ReviewCleared => {
+                        SchedulerEventKind::Failed
+                    }
+                })
+                .unwrap_or(SchedulerEventKind::BlockedPreflight)
+        };
+        store.record_scheduler_event(self.profile_id, self.run_id, kind)?;
+        Ok(())
     }
 
     fn record_missed_schedule(
@@ -323,7 +383,8 @@ mod tests {
     use crate::{
         ApplicationMode, DeletionMethod, LocalPrecheckProbe, Peer, RecoveryMethod,
         MissedScheduleDecision, PeerScope, PeerScopeLockRegistry, ProcessSupervisor,
-        RunEvidenceStore, RunId, RunReportStatus, ScopeLockOwner, SyncOptions, SyncProfile,
+        RunEvidenceStore, RunId, RunReportStatus, SchedulerEventKind,
+        SchedulerNotificationSink, ScopeLockOwner, SyncOptions, SyncProfile,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
@@ -390,6 +451,80 @@ mod tests {
         let snapshot = store.load_snapshot(claim.run_id()).expect("snapshot");
         assert!(snapshot.peer_a_volume_identity().is_some());
         assert!(snapshot.peer_b_volume_identity().is_some());
+        let events = store.list_scheduler_events().expect("scheduler events");
+        assert!(events.iter().any(|event| {
+            event.run_id() == claim.run_id() && event.kind() == SchedulerEventKind::Completed
+        }));
+        fs::remove_dir_all(root).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn scheduler_notification_uses_only_a_safe_report_intent() {
+        let root = fixture_root();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).expect("source");
+        fs::create_dir_all(&destination).expect("destination");
+        fs::write(source.join("scheduled.txt"), b"scheduled data").expect("source file");
+        let profile = SyncProfile::new(
+            "notification profile",
+            Peer::new("source", source.clone()),
+            Peer::new("destination", destination),
+        );
+        let mut store = RunEvidenceStore::open_in_memory().expect("store");
+        let persisted = store.create_profile(&profile).expect("profile");
+        let schedule = crate::ScheduleDefinition::new_with_next_run_at(1, "UTC", true, Some(100))
+            .expect("schedule");
+        store
+            .update_schedule_at(persisted.id(), Some(schedule), ApplicationMode::Advanced, 100)
+            .expect("schedule update");
+        let scheduler = BackgroundScheduler::with_clock(FixedClock(100));
+        let claim = scheduler
+            .poll_due(&mut store)
+            .expect("due poll")
+            .pop()
+            .expect("claim");
+        let workflow = crate::RunWorkflow::new(RecoveryMethod::trash(root.join("trash")));
+        claim
+            .execute(&workflow, &LocalPrecheckProbe::default(), &mut store, || false)
+            .expect("scheduled run");
+
+        let event = store
+            .list_scheduler_events()
+            .expect("events")
+            .into_iter()
+            .find(|event| event.kind() == SchedulerEventKind::Completed)
+            .expect("completed event");
+        let notification = event.notification();
+        assert_eq!(notification.event_id(), event.event_id());
+        assert_eq!(notification.action(), crate::SchedulerNotificationAction::OpenReport(claim.run_id()));
+        assert!(!notification.reason().is_empty());
+        assert!(!notification.next_action().is_empty());
+        assert!(!notification.reason().contains("scheduled data"));
+        assert!(!notification.next_action().contains("scheduled data"));
+
+        struct FailingSink;
+        impl SchedulerNotificationSink for FailingSink {
+            fn deliver(
+                &mut self,
+                _notification: &crate::SchedulerNotification,
+            ) -> Result<(), crate::NotificationDeliveryError> {
+                Err(crate::NotificationDeliveryError::Unavailable)
+            }
+        }
+        let report_before = store.load_report(claim.run_id()).expect("report before delivery");
+        assert!(store
+            .deliver_scheduler_notification(event.event_id(), &mut FailingSink)
+            .is_err());
+        assert_eq!(
+            store.load_report(claim.run_id()).expect("report after delivery").status(),
+            report_before.status()
+        );
+        assert!(store
+            .list_scheduler_events()
+            .expect("events after delivery")
+            .iter()
+            .any(|candidate| candidate.event_id() == event.event_id()));
         fs::remove_dir_all(root).expect("fixture cleanup");
     }
 
@@ -437,6 +572,25 @@ mod tests {
         assert!(blocked_reason.contains("Next action:"));
         assert!(!blocked_reason.contains("source data"));
         assert!(source.join("must-remain.txt").exists());
+        let events = store.list_scheduler_events().expect("scheduler events");
+        assert!(events.iter().any(|event| {
+            event.run_id() == claim.run_id() && event.kind() == SchedulerEventKind::BlockedPreflight
+        }));
+        let missed = events
+            .iter()
+            .find(|event| event.run_id() == claim.run_id() && event.kind() == SchedulerEventKind::Missed)
+            .expect("missed event");
+        assert_eq!(
+            missed.notification().action(),
+            crate::SchedulerNotificationAction::StartInteractiveCatchUp(
+                store
+                    .list_missed_schedule_notices()
+                    .expect("missed notices")
+                    .first()
+                    .expect("notice")
+                    .notice_id()
+            )
+        );
         fs::remove_dir_all(root).expect("fixture cleanup");
     }
 

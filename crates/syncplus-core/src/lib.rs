@@ -89,7 +89,9 @@ pub use evidence::{
     JournalEvent, PlanRecord, PreActionState, RecoveryEvidence, RecoveryResolution,
     ApplicationDatabase, RemovalResult, RunEvidenceStore, RunExecutionResult, RunLifecycle, RunReport, RunReportItem,
     MirrorResolutionOutcome, MirrorResolutionReportItem, MirrorResolutionReviewState,
-    MissedScheduleDecision, MissedScheduleNotice, RunReportStatus, RunSnapshot, StorageError,
+    MissedScheduleDecision, MissedScheduleNotice, NotificationDeliveryError, RunReportStatus,
+    RunSnapshot, SchedulerEvent, SchedulerEventKind, SchedulerNotification,
+    SchedulerNotificationAction, SchedulerNotificationSink, StorageError,
 };
 pub use backup::{BackupError, DatabaseBackupManager, ValidatedBackup};
 pub use storage::{
