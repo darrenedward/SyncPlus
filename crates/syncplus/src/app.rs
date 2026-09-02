@@ -1,17 +1,29 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender, TryRecvError},
+        Arc, Mutex,
+    },
+    thread,
+    time::Duration,
+};
 
 use eframe::egui;
+use notify_rust::Notification;
 use syncplus_core::{
     ActionOutcome, AnalysisOutcome, ApplicationMode, ApplicationSettings, AuthorizationSnapshot,
     BackgroundScheduler,
     ConflictDecision,
-    ConflictEntry, ConflictEntryKey, ConflictResolution, ConflictReview, DeletionMethod,
+    ConfirmedPlan, ConflictEntry, ConflictEntryKey, ConflictResolution, ConflictReview,
+    DeletionMethod,
     FreshAnalysis, LocalPrecheckProbe, MetadataRequirements, OneWaySource, PartialTransferPolicy,
     MissedScheduleDecision, MissedScheduleNotice, Peer, PeerEndpoint, PersistedSyncProfile,
     PrecheckErrorKind, PrecheckResult,
     RemotePrecheckRequest, ResolutionRun, RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId,
     RecoveryMethod, RunLifecycle, RunPrecheck, RunReport, RunReportStatus, SavedSecretReference, SecretStore,
-    SecretStoreError,
+    SecretStoreError, SchedulerNotification, SchedulerNotificationSink,
     ScheduleDefinition, SchedulerEvent, SchedulerNotificationAction,
     SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
     SyncProfileId, ThemePreference,
@@ -65,6 +77,267 @@ pub enum UiValidationError {
 
 const MISSED_SCHEDULE_RUN_NOW_LABEL: &str = "Yes, Run Now";
 const MISSED_SCHEDULE_NOT_NOW_LABEL: &str = "No, Not Now";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowCloseDecision {
+    HideToTray,
+    KeepVisible,
+}
+
+fn window_close_decision(tray_available: bool) -> WindowCloseDecision {
+    if tray_available {
+        WindowCloseDecision::HideToTray
+    } else {
+        WindowCloseDecision::KeepVisible
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuitDecision {
+    Exit,
+    AskBeforeStopping,
+}
+
+fn quit_decision(manual_run_active: bool) -> QuitDecision {
+    if manual_run_active {
+        QuitDecision::AskBeforeStopping
+    } else {
+        QuitDecision::Exit
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NotificationTemplate {
+    title: &'static str,
+    reason: &'static str,
+    next_action: &'static str,
+}
+
+fn notification_template_for_status(status: RunReportStatus) -> NotificationTemplate {
+    match status {
+        RunReportStatus::Completed => NotificationTemplate {
+            title: "Sync Run completed",
+            reason: "All approved actions passed verification and reconciliation.",
+            next_action: "Open the Run Report to review the safety evidence.",
+        },
+        RunReportStatus::Failed => NotificationTemplate {
+            title: "Sync Run failed",
+            reason: "At least one approved action did not complete safely.",
+            next_action: "Open the Run Report and resolve the failure before retrying.",
+        },
+        RunReportStatus::Cancelled => NotificationTemplate {
+            title: "Sync Run cancelled",
+            reason: "The run stopped before all approved actions completed.",
+            next_action: "Open the Run Report and review unfinished actions before retrying.",
+        },
+        RunReportStatus::Interrupted => NotificationTemplate {
+            title: "Sync Run interrupted",
+            reason: "The run stopped at an unexpected process or connection boundary.",
+            next_action: "Open Recovery Review before resuming or retrying.",
+        },
+        RunReportStatus::CompletedWithReviewRequired | RunReportStatus::RecoveryReview => {
+            NotificationTemplate {
+                title: "Sync Run needs review",
+                reason: "Work remains unresolved or crossed an uncertain filesystem boundary.",
+                next_action: "Open the Run Report and complete Recovery Review before clearing it.",
+            }
+        }
+        RunReportStatus::ReviewCleared => NotificationTemplate {
+            title: "Sync Run review cleared",
+            reason: "The required review was explicitly completed after reconciliation.",
+            next_action: "Open the Run Report to review the final safety evidence.",
+        },
+        RunReportStatus::Blocked => NotificationTemplate {
+            title: "Sync Run blocked",
+            reason: "A safety precheck prevented filesystem mutation.",
+            next_action: "Open the Run Report, resolve the blocker, and analyze again.",
+        },
+        RunReportStatus::InProgress => NotificationTemplate {
+            title: "Sync Run started",
+            reason: "The approved run is in progress.",
+            next_action: "Keep the source protected and review the Run Report when it settles.",
+        },
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiNotification {
+    title: String,
+    reason: String,
+    next_action: String,
+    run_id: Option<RunId>,
+}
+
+impl UiNotification {
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub fn next_action(&self) -> &str {
+        &self.next_action
+    }
+
+    pub const fn run_id(&self) -> Option<RunId> {
+        self.run_id
+    }
+}
+
+fn notification_for_report(report: &RunReport) -> UiNotification {
+    let template = notification_template_for_status(report.status());
+    UiNotification {
+        title: template.title.to_owned(),
+        reason: template.reason.to_owned(),
+        next_action: template.next_action.to_owned(),
+        run_id: Some(report.run_id()),
+    }
+}
+
+fn notification_for_scheduler_event(event: &SchedulerEvent) -> UiNotification {
+    let notification = event.notification();
+    UiNotification {
+        title: notification.title().to_owned(),
+        reason: notification.reason().to_owned(),
+        next_action: notification.next_action().to_owned(),
+        run_id: Some(notification.run_id()),
+    }
+}
+
+struct DesktopNotificationSink;
+
+impl SchedulerNotificationSink for DesktopNotificationSink {
+    fn deliver(
+        &mut self,
+        notification: &SchedulerNotification,
+    ) -> Result<(), syncplus_core::NotificationDeliveryError> {
+        deliver_desktop_notification(
+            notification.title(),
+            notification.reason(),
+            notification.next_action(),
+        )
+        .map_err(|_| syncplus_core::NotificationDeliveryError::Unavailable)
+    }
+}
+
+fn deliver_desktop_notification(title: &str, reason: &str, next_action: &str) -> Result<(), ()> {
+    Notification::new()
+        .appname("SyncPlus")
+        .summary(title)
+        .body(&format!("Reason: {reason}\nNext action: {next_action}"))
+        .show()
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayCommand {
+    ShowWindow,
+    Quit,
+}
+
+struct SyncPlusTray {
+    commands: Sender<TrayCommand>,
+    repaint_context: Arc<Mutex<Option<egui::Context>>>,
+}
+
+impl SyncPlusTray {
+    fn dispatch(&self, command: TrayCommand) {
+        let _ = self.commands.send(command);
+        if let Ok(context) = self.repaint_context.lock() {
+            if let Some(context) = context.as_ref() {
+                context.request_repaint();
+            }
+        }
+    }
+}
+
+impl ksni::Tray for SyncPlusTray {
+    const MENU_ON_ACTIVATE: bool = true;
+
+    fn id(&self) -> String {
+        "syncplus".to_owned()
+    }
+
+    fn title(&self) -> String {
+        "SyncPlus".to_owned()
+    }
+
+    fn icon_name(&self) -> String {
+        "folder".to_owned()
+    }
+
+    fn status(&self) -> ksni::Status {
+        ksni::Status::Active
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::{MenuItem, StandardItem};
+
+        vec![
+            StandardItem {
+                label: "_Show SyncPlus".to_owned(),
+                shortcut: vec![vec!["Control".to_owned(), "S".to_owned()]],
+                activate: Box::new(|tray: &mut SyncPlusTray| tray.dispatch(TrayCommand::ShowWindow)),
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
+            StandardItem {
+                label: "_Quit SyncPlus".to_owned(),
+                shortcut: vec![vec!["Control".to_owned(), "Q".to_owned()]],
+                activate: Box::new(|tray: &mut SyncPlusTray| tray.dispatch(TrayCommand::Quit)),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
+}
+
+struct TrayRuntime {
+    _handle: ksni::blocking::Handle<SyncPlusTray>,
+    receiver: Receiver<TrayCommand>,
+    repaint_context: Arc<Mutex<Option<egui::Context>>>,
+}
+
+impl TrayRuntime {
+    fn start() -> Result<Self, String> {
+        use ksni::blocking::TrayMethods;
+
+        let (commands, receiver) = mpsc::channel();
+        let repaint_context = Arc::new(Mutex::new(None));
+        let tray = SyncPlusTray {
+            commands,
+            repaint_context: repaint_context.clone(),
+        };
+        let handle = tray.spawn().map_err(|error| error.to_string())?;
+        Ok(Self {
+            _handle: handle,
+            receiver,
+            repaint_context,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuitFlow {
+    None,
+    ConfirmActive(RunId),
+    Stopping(RunId),
+}
+
+struct ManualRunCompletion {
+    run_id: RunId,
+    result: Result<RunReport, String>,
+}
+
+struct ActiveManualRun {
+    run_id: RunId,
+    cancel: Arc<AtomicBool>,
+    receiver: Receiver<ManualRunCompletion>,
+}
 
 impl std::fmt::Display for UiValidationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -155,6 +428,12 @@ pub fn run_background_scheduler_once() -> Result<usize, String> {
         .ok_or_else(|| "canonical database has no XDG data parent".to_owned())?
         .to_path_buf();
     let mut store = RunEvidenceStore::open_canonical().map_err(|error| error.to_string())?;
+    let known_event_ids = store
+        .list_scheduler_events()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|event| event.event_id())
+        .collect::<BTreeSet<_>>();
     let scheduler = BackgroundScheduler::new();
     let scope_locks = scheduler.scope_lock_registry();
     let due_runs = scheduler
@@ -183,6 +462,14 @@ pub fn run_background_scheduler_once() -> Result<usize, String> {
         ) {
             Ok(_) => launched += 1,
             Err(error) => failures.push(format!("Sync Run {}: {error}", scheduled_run.run_id().value())),
+        }
+    }
+    if let Ok(events) = store.list_scheduler_events() {
+        let mut sink = DesktopNotificationSink;
+        for event in events {
+            if !known_event_ids.contains(&event.event_id()) {
+                let _ = store.deliver_scheduler_notification(event.event_id(), &mut sink);
+            }
         }
     }
     if failures.is_empty() {
@@ -1120,6 +1407,14 @@ pub struct SyncPlusApp {
     selected_run_report: Option<RunId>,
     pending_report_action: Option<PendingReportAction>,
     help_topic: HelpTopic,
+    tray: Option<TrayRuntime>,
+    tray_attempted: bool,
+    window_hidden_to_tray: bool,
+    quit_flow: QuitFlow,
+    exit_requested: bool,
+    active_manual_run: Option<ActiveManualRun>,
+    notifications: Vec<UiNotification>,
+    known_scheduler_event_ids: BTreeSet<u64>,
 }
 
 impl SyncPlusApp {
@@ -1141,6 +1436,10 @@ impl SyncPlusApp {
         let missed_schedule_notices = store.list_missed_schedule_notices()?;
         let scheduler_events = store.list_scheduler_events()?;
         let selected_run_report = run_reports.first().map(RunReport::run_id);
+        let known_scheduler_event_ids = scheduler_events
+            .iter()
+            .map(SchedulerEvent::event_id)
+            .collect();
         Ok(Self {
             store,
             secret_store: Box::new(secret_store),
@@ -1155,6 +1454,14 @@ impl SyncPlusApp {
             selected_run_report,
             pending_report_action: None,
             help_topic: HelpTopic::Modes,
+            tray: None,
+            tray_attempted: false,
+            window_hidden_to_tray: false,
+            quit_flow: QuitFlow::None,
+            exit_requested: false,
+            active_manual_run: None,
+            notifications: Vec::new(),
+            known_scheduler_event_ids,
         })
     }
 
@@ -1184,6 +1491,18 @@ impl SyncPlusApp {
 
     pub fn scheduler_events(&self) -> &[SchedulerEvent] {
         &self.scheduler_events
+    }
+
+    pub fn notifications(&self) -> &[UiNotification] {
+        &self.notifications
+    }
+
+    pub const fn window_hidden_to_tray(&self) -> bool {
+        self.window_hidden_to_tray
+    }
+
+    pub fn active_manual_run_id(&self) -> Option<RunId> {
+        self.active_manual_run.as_ref().map(|run| run.run_id)
     }
 
     pub fn selected_run_report(&self) -> Option<&RunReport> {
@@ -1220,10 +1539,12 @@ impl SyncPlusApp {
             .store
             .list_missed_schedule_notices()
             .map_err(|error| UiValidationError::Core(error.to_string()))?;
-        self.scheduler_events = self
+        let scheduler_events = self
             .store
             .list_scheduler_events()
             .map_err(|error| UiValidationError::Core(error.to_string()))?;
+        self.record_new_scheduler_notifications(&scheduler_events);
+        self.scheduler_events = scheduler_events;
         self.selected_run_report = selected;
         if self
             .pending_report_action
@@ -1237,6 +1558,334 @@ impl SyncPlusApp {
             self.pending_report_action = None;
         }
         Ok(())
+    }
+
+    fn record_new_scheduler_notifications(&mut self, events: &[SchedulerEvent]) {
+        for event in events {
+            if !self.known_scheduler_event_ids.insert(event.event_id()) {
+                continue;
+            }
+            let message = notification_for_scheduler_event(event);
+            let mut sink = DesktopNotificationSink;
+            let _ = self
+                .store
+                .deliver_scheduler_notification(event.event_id(), &mut sink);
+            self.remember_notification(message);
+        }
+    }
+
+    fn push_notification(&mut self, notification: UiNotification) {
+        let _ = deliver_desktop_notification(
+            &notification.title,
+            &notification.reason,
+            &notification.next_action,
+        );
+        self.remember_notification(notification);
+    }
+
+    fn remember_notification(&mut self, notification: UiNotification) {
+        self.notifications.insert(0, notification);
+        self.notifications.truncate(20);
+    }
+
+    pub fn start_manual_run(&mut self) -> Result<(), UiValidationError> {
+        if self.active_manual_run.is_some() {
+            return Err(UiValidationError::Core(
+                "a manual Sync Run is already active".to_owned(),
+            ));
+        }
+        let (profile, expected) = {
+            let review = self.review.as_ref().ok_or(UiValidationError::ReviewNotReady)?;
+            if !review.confirmed {
+                return Err(UiValidationError::ReviewNotReady);
+            }
+            let profile = review.profile.clone();
+            let expected = review
+                .analysis
+                .as_ref()
+                .ok_or(UiValidationError::ReviewNotReady)?
+                .confirm(&profile)
+                .map_err(|error| UiValidationError::Analysis(error.to_string()))?;
+            (profile, expected)
+        };
+        let run_id = self
+            .store
+            .next_run_id()
+            .map_err(|error| UiValidationError::Core(error.to_string()))?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name(format!("syncplus-manual-run-{}", run_id.value()))
+            .spawn(move || {
+                let result = execute_manual_run(run_id, profile, expected, worker_cancel);
+                let _ = sender.send(ManualRunCompletion { run_id, result });
+            })
+            .map_err(|error| UiValidationError::Core(format!("could not start Sync Run: {error}")))?;
+        self.active_manual_run = Some(ActiveManualRun {
+            run_id,
+            cancel,
+            receiver,
+        });
+        self.status = format!(
+            "Manual Sync Run {} is active. Closing the window hides SyncPlus and leaves this run active.",
+            run_id.value()
+        );
+        Ok(())
+    }
+
+    fn request_manual_cancel(&mut self, run_id: RunId) {
+        if let Some(active) = self
+            .active_manual_run
+            .as_ref()
+            .filter(|active| active.run_id == run_id)
+        {
+            active.cancel.store(true, Ordering::Release);
+            self.status = format!(
+                "Cancellation requested for Manual Sync Run {}. The core workflow is settling its durable boundary; source data remains protected until verification.",
+                run_id.value()
+            );
+        }
+    }
+
+    fn poll_manual_run(&mut self, context: &egui::Context) {
+        let completion = match self
+            .active_manual_run
+            .as_ref()
+            .map(|active| active.receiver.try_recv())
+        {
+            Some(Ok(completion)) => completion,
+            Some(Err(TryRecvError::Empty)) => return,
+            Some(Err(TryRecvError::Disconnected)) => {
+                let run_id = self
+                    .active_manual_run
+                    .take()
+                    .expect("active run checked")
+                    .run_id;
+                self.quit_flow = QuitFlow::None;
+                self.status = format!(
+                    "Manual Sync Run {} ended without a completion message. Keep the source preserved and inspect any available Run Report or Recovery Review evidence.",
+                    run_id.value()
+                );
+                return;
+            }
+            None => return,
+        };
+        let waiting_to_quit = self.quit_flow == QuitFlow::Stopping(completion.run_id);
+        self.active_manual_run = None;
+        let error_message = match completion.result {
+            Ok(report) => {
+                self.status = format!(
+                    "Manual Sync Run {} settled as {}.",
+                    completion.run_id.value(),
+                    run_report_status_label(report.status())
+                );
+                None
+            }
+            Err(error) => {
+                self.status = format!(
+                    "Manual Sync Run {} did not settle normally: {error}",
+                    completion.run_id.value()
+                );
+                Some(error)
+            }
+        };
+        if let Err(error) = self.refresh_run_reports() {
+            self.status = format!("Run Reports are unavailable: {error}");
+        }
+        let durable_terminal_report = self
+            .run_reports
+            .iter()
+            .find(|report| report.run_id() == completion.run_id)
+            .is_some_and(|report| report.status() != RunReportStatus::InProgress);
+        if let Some(report) = self
+            .run_reports
+            .iter()
+            .find(|report| report.run_id() == completion.run_id)
+        {
+            self.push_notification(notification_for_report(report));
+        } else if error_message.is_some() {
+            self.push_notification(UiNotification {
+                title: "Sync Run did not settle".to_owned(),
+                reason: "The workflow ended before a settled Run Report was available.".to_owned(),
+                next_action: "Open Run Reports and inspect any available recovery evidence.".to_owned(),
+                run_id: Some(completion.run_id),
+            });
+        }
+        if waiting_to_quit && durable_terminal_report {
+            self.quit_flow = QuitFlow::None;
+            self.exit_requested = true;
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if waiting_to_quit {
+            self.quit_flow = QuitFlow::None;
+            self.status = format!(
+                "Cancellation for Manual Sync Run {} could not be confirmed in a durable terminal Run Report; SyncPlus remains open for Recovery Review.",
+                completion.run_id.value()
+            );
+        }
+    }
+
+    fn ensure_tray(&mut self, context: &egui::Context) {
+        if let Some(tray) = self.tray.as_ref() {
+            if let Ok(mut repaint_context) = tray.repaint_context.lock() {
+                *repaint_context = Some(context.clone());
+            }
+            return;
+        }
+        if self.tray_attempted {
+            return;
+        }
+        self.tray_attempted = true;
+        match TrayRuntime::start() {
+            Ok(tray) => {
+                if let Ok(mut repaint_context) = tray.repaint_context.lock() {
+                    *repaint_context = Some(context.clone());
+                }
+                self.tray = Some(tray);
+            }
+            Err(error) => {
+                self.status = format!(
+                    "System tray is unavailable ({error}); the window will remain visible so SyncPlus stays reachable."
+                );
+            }
+        }
+    }
+
+    fn process_tray_commands(&mut self, context: &egui::Context) {
+        let commands = self
+            .tray
+            .as_ref()
+            .map(|tray| tray.receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for command in commands {
+            match command {
+                TrayCommand::ShowWindow => self.show_window(context),
+                TrayCommand::Quit => self.request_quit(context),
+            }
+        }
+    }
+
+    fn show_window(&mut self, context: &egui::Context) {
+        self.window_hidden_to_tray = false;
+        context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        context.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn hide_to_tray(&mut self, context: &egui::Context) {
+        if window_close_decision(self.tray.is_some()) == WindowCloseDecision::KeepVisible {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.status = "The system tray is unavailable, so SyncPlus remains visible and the run was not stopped.".to_owned();
+            return;
+        }
+        self.window_hidden_to_tray = true;
+        context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        self.status = if let Some(active) = self.active_manual_run.as_ref() {
+            format!(
+                "SyncPlus is hidden in the system tray. Manual Sync Run {} continues; use the tray menu to show the window.",
+                active.run_id.value()
+            )
+        } else {
+            "SyncPlus is hidden in the system tray. Scheduled work remains owned by the per-user background scheduler.".to_owned()
+        };
+    }
+
+    fn request_quit(&mut self, context: &egui::Context) {
+        match quit_decision(self.active_manual_run.is_some()) {
+            QuitDecision::Exit => {
+                self.exit_requested = true;
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            QuitDecision::AskBeforeStopping => {
+                let run_id = self
+                    .active_manual_run
+                    .as_ref()
+                    .expect("active run checked")
+                    .run_id;
+                self.quit_flow = QuitFlow::ConfirmActive(run_id);
+                self.show_window(context);
+            }
+        }
+    }
+
+    fn handle_close_request(&mut self, context: &egui::Context) {
+        if !self.exit_requested {
+            self.hide_to_tray(context);
+        }
+    }
+
+    fn draw_app_menu(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        let mut request_quit = false;
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("_SyncPlus", |ui| {
+                if ui.button("_Show SyncPlus").clicked() {
+                    self.show_window(context);
+                    ui.close();
+                }
+                if ui.button("_Quit SyncPlus    Ctrl+Q").clicked() {
+                    request_quit = true;
+                    ui.close();
+                }
+            });
+        });
+        if context.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Q)) {
+            request_quit = true;
+        }
+        if request_quit {
+            self.request_quit(context);
+        }
+    }
+
+    fn draw_quit_dialog(&mut self, context: &egui::Context) {
+        let mut keep_running = false;
+        let mut stop_and_quit = false;
+        let mut cancel = false;
+        match self.quit_flow {
+            QuitFlow::None => return,
+            QuitFlow::ConfirmActive(run_id) => {
+                egui::Window::new("Quit SyncPlus")
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(context, |ui| {
+                        ui.heading("A manual Sync Run is active");
+                        ui.label(format!("Manual Sync Run {} is still running.", run_id.value()));
+                        ui.label("Keep running and hide leaves the run active and moves SyncPlus to the tray.");
+                        ui.label("Stop and Quit requests cancellation. The core workflow records the cancellation boundary, preserves affected source data, and may leave the Run Report in Recovery Review.");
+                        ui.horizontal(|ui| {
+                            if ui.button("Keep running and hide").clicked() {
+                                keep_running = true;
+                            }
+                            if ui.button("Stop and Quit").clicked() {
+                                stop_and_quit = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+            }
+            QuitFlow::Stopping(run_id) => {
+                egui::Window::new("Stopping SyncPlus")
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(context, |ui| {
+                        ui.heading("Waiting for the active Sync Run to settle");
+                        ui.label(format!("Cancellation is settling for Manual Sync Run {}.", run_id.value()));
+                        ui.label("SyncPlus will quit only after the durable cancellation boundary is recorded. The Run Report remains available for Recovery Review.");
+                    });
+            }
+        }
+        if cancel {
+            self.quit_flow = QuitFlow::None;
+        } else if keep_running {
+            self.quit_flow = QuitFlow::None;
+            self.hide_to_tray(context);
+        } else if stop_and_quit {
+            if let QuitFlow::ConfirmActive(run_id) = self.quit_flow {
+                self.request_manual_cancel(run_id);
+                self.quit_flow = QuitFlow::Stopping(run_id);
+            }
+        }
     }
 
     pub fn request_missed_schedule_run_now(
@@ -1325,6 +1974,14 @@ impl SyncPlusApp {
             .mark_review_cleared(run_id)
             .map_err(map_storage_error)?;
         self.refresh_run_reports()?;
+        if let Some(report) = self
+            .run_reports
+            .iter()
+            .find(|report| report.run_id() == run_id)
+            .cloned()
+        {
+            self.push_notification(notification_for_report(&report));
+        }
         self.status = format!(
             "Marked Sync Run {} as Review Cleared. No source or destination files were changed.",
             run_id.value()
@@ -2259,6 +2916,7 @@ impl SyncPlusApp {
 
     fn draw_review(&mut self, ui: &mut egui::Ui) {
         let mut request_confirmation = false;
+        let mut request_start = false;
         let mut request_resolution_start = false;
         let mut request_resolution_confirmation = false;
         ui.separator();
@@ -2381,6 +3039,11 @@ impl SyncPlusApp {
                     }
                     if review.confirmed {
                         ui.label("Execution Confirmation recorded. No filesystem mutation has started.");
+                        if self.active_manual_run.is_some() {
+                            ui.label("A Manual Sync Run is active. Closing the window hides SyncPlus and leaves it running.");
+                        } else if ui.button("Start Manual Sync Run").clicked() {
+                            request_start = true;
+                        }
                     } else if ui
                         .add_enabled(
                             can_confirm,
@@ -2422,11 +3085,17 @@ impl SyncPlusApp {
                 self.status = format!("Execution Confirmation was not recorded: {error}");
             }
         }
+        if request_start {
+            if let Err(error) = self.start_manual_run() {
+                self.status = format!("Manual Sync Run was not started: {error}");
+            }
+        }
     }
 
     fn draw_run_reports(&mut self, ui: &mut egui::Ui) {
         let mut action_to_run = None;
         let mut cancel_pending = false;
+        let mut manual_cancel = None;
         let mut review_to_clear = None;
         let mut requested_help = None;
         ui.separator();
@@ -2510,7 +3179,14 @@ impl SyncPlusApp {
                         }
                     }
                     RunReportStatus::InProgress => {
-                        columns[1].label("This active Sync Run cannot be discarded. Let it settle or cancel it first so its durable boundary remains available for Recovery Review.");
+                        if self.active_manual_run_id() == Some(report.run_id()) {
+                            if columns[1].button("Request cancellation").clicked() {
+                                manual_cancel = Some(report.run_id());
+                            }
+                            columns[1].label("Cancellation stops new actions and preserves the durable boundary for Recovery Review.");
+                        } else {
+                            columns[1].label("This active Scheduled Run is owned by the per-user background scheduler and is not cancelled when the visible UI is hidden or closed.");
+                        }
                     }
                     _ => {
                         if columns[1].button("Discard Unresolved Run").clicked() {
@@ -2529,6 +3205,9 @@ impl SyncPlusApp {
 
         if cancel_pending {
             self.pending_report_action = None;
+        }
+        if let Some(run_id) = manual_cancel {
+            self.request_manual_cancel(run_id);
         }
         if let Some(action) = action_to_run {
             self.pending_report_action = None;
@@ -2629,6 +3308,26 @@ impl SyncPlusApp {
                         ));
                     }
                 }
+            });
+        }
+    }
+
+    fn draw_notifications(&self, ui: &mut egui::Ui) {
+        if self.notifications.is_empty() {
+            return;
+        }
+        ui.separator();
+        ui.heading("Notifications");
+        ui.label("Notifications contain only safe status and next-action text. Open the Run Report to inspect paths and evidence; no notification bypasses confirmation or Recovery Review.");
+        for notification in &self.notifications {
+            ui.group(|ui| {
+                let run = notification
+                    .run_id
+                    .map(|run_id| format!(" — Sync Run {}", run_id.value()))
+                    .unwrap_or_default();
+                ui.label(format!("{}{}", notification.title, run));
+                ui.label(format!("Reason: {}", notification.reason));
+                ui.label(format!("Next action: {}", notification.next_action));
             });
         }
     }
@@ -3161,12 +3860,60 @@ fn map_storage_error(error: syncplus_core::StorageError) -> UiValidationError {
     }
 }
 
+fn execute_manual_run(
+    run_id: RunId,
+    profile: SyncProfile,
+    expected: ConfirmedPlan,
+    cancel: Arc<AtomicBool>,
+) -> Result<RunReport, String> {
+    let database_path = RunEvidenceStore::canonical_path().map_err(|error| error.to_string())?;
+    let data_home = database_path
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or_else(|| "canonical database has no XDG data parent".to_owned())?
+        .to_path_buf();
+    let recovery_method = if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval) {
+        RecoveryMethod::permanent_removal()
+    } else {
+        RecoveryMethod::native_trash(data_home)
+    };
+    let workflow = syncplus_core::RunWorkflow::new(recovery_method);
+    let mut store = RunEvidenceStore::open_canonical().map_err(|error| error.to_string())?;
+    workflow
+        .execute(
+            run_id,
+            &profile,
+            &LocalPrecheckProbe::default(),
+            move |fresh| fresh == &expected,
+            &mut store,
+            move || cancel.load(Ordering::Acquire),
+        )
+        .map_err(|error| error.to_string())
+}
+
 impl eframe::App for SyncPlusApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let context = ui.ctx().clone();
+        self.ensure_tray(&context);
+        self.process_tray_commands(&context);
+        self.poll_manual_run(&context);
+        if context.input(|input| input.viewport().close_requested()) {
+            self.handle_close_request(&context);
+        }
+        if self.exit_requested {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        context.request_repaint_after(Duration::from_millis(if self.active_manual_run.is_some() {
+            200
+        } else {
+            1_000
+        }));
         self.apply_theme(ui.ctx());
         if let Err(error) = self.refresh_run_reports() {
             self.status = format!("Run Reports are unavailable: {error}");
         }
+        egui::Panel::top("app-menu").show(ui, |ui| self.draw_app_menu(ui, &context));
         egui::Panel::right("help")
             .resizable(true)
             .default_size(360.0)
@@ -3174,6 +3921,7 @@ impl eframe::App for SyncPlusApp {
         egui::Panel::top("settings").show(ui, |ui| self.draw_settings(ui));
         egui::Panel::left("profiles").show(ui, |ui| self.draw_profile_list(ui));
         egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| self.draw_notifications(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_missed_schedule_notices(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_scheduler_events(ui));
             egui::ScrollArea::vertical().show(ui, |ui| self.draw_profile_form(ui));
@@ -3182,6 +3930,7 @@ impl eframe::App for SyncPlusApp {
             ui.separator();
             ui.label(egui::RichText::new(&self.status).strong());
         });
+        self.draw_quit_dialog(&context);
     }
 }
 
@@ -3613,6 +4362,45 @@ mod tests {
         assert_eq!(MISSED_SCHEDULE_RUN_NOW_LABEL, "Yes, Run Now");
         assert_eq!(MISSED_SCHEDULE_NOT_NOW_LABEL, "No, Not Now");
         assert_ne!(MISSED_SCHEDULE_RUN_NOW_LABEL, MISSED_SCHEDULE_NOT_NOW_LABEL);
+    }
+
+    #[test]
+    fn window_close_hides_to_tray_without_stopping_work() {
+        assert_eq!(
+            window_close_decision(true),
+            WindowCloseDecision::HideToTray
+        );
+        assert_eq!(
+            window_close_decision(false),
+            WindowCloseDecision::KeepVisible
+        );
+    }
+
+    #[test]
+    fn quit_requires_a_choice_only_for_an_active_manual_run() {
+        assert_eq!(quit_decision(false), QuitDecision::Exit);
+        assert_eq!(quit_decision(true), QuitDecision::AskBeforeStopping);
+    }
+
+    #[test]
+    fn lifecycle_notification_copy_has_reason_and_safe_next_action() {
+        for status in [
+            RunReportStatus::Completed,
+            RunReportStatus::Failed,
+            RunReportStatus::Cancelled,
+            RunReportStatus::Interrupted,
+            RunReportStatus::CompletedWithReviewRequired,
+            RunReportStatus::ReviewCleared,
+        ] {
+            let message = notification_template_for_status(status);
+            assert!(!message.title.is_empty());
+            assert!(!message.reason.is_empty());
+            assert!(!message.next_action.is_empty());
+            assert!(!message.reason.contains('/'));
+            assert!(!message.next_action.contains('/'));
+            assert!(!message.reason.contains("password"));
+            assert!(!message.next_action.contains("password"));
+        }
     }
 
     fn report_store() -> (RunEvidenceStore, syncplus_core::RunId, syncplus_core::RunId) {
