@@ -4,6 +4,7 @@ Name=SyncPlus
 Comment=Safety-first local and SSH synchronization
 Exec=/usr/bin/syncplus
 Icon=syncplus
+StartupWMClass=syncplus
 Terminal=false
 Categories=Utility;
 Keywords=sync;backup;recovery;rsync;

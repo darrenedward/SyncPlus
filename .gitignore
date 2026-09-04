@@ -18,3 +18,8 @@
 .DS_Store
 .idea/
 .vscode/
+.sandcastle/.env
+.sandcastle/logs/
+.sandcastle/worktrees/
+.sandcastle/build-context/
+.playwright-mcp/

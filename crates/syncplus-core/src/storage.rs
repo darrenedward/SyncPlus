@@ -4,15 +4,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, OptionalExtension, Row, Transaction};
+use rusqlite::{OptionalExtension, Row, Transaction, params};
 
-use crate::{
-    AuthorizationSnapshot, DeletionMethod,
-    MetadataRequirements, OneWaySource, Peer, PeerEndpoint, PartialTransferPolicy,
-    ProcessSpecification, SavedSecretReference, SpecialistMetadataRequirements,
-    RetryPolicy, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
-};
 use crate::evidence::{RunEvidenceStore, RunSnapshot, StorageError};
+use crate::{
+    AuthorizationSnapshot, DeletionMethod, MetadataRequirements, OneWaySource,
+    PartialTransferPolicy, Peer, PeerEndpoint, ProcessSpecification, RetryPolicy,
+    SavedSecretReference, SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions,
+    SyncProfile,
+};
 
 /// A stable identifier for a persisted Sync Profile. The display name is
 /// editable and therefore is not used as the profile identity.
@@ -42,11 +42,21 @@ pub enum ApplicationMode {
 pub struct ApplicationSettings {
     mode: ApplicationMode,
     theme: ThemePreference,
+    hide_to_tray_on_window_close: bool,
 }
 
 impl ApplicationSettings {
     pub const fn new(mode: ApplicationMode, theme: ThemePreference) -> Self {
-        Self { mode, theme }
+        Self {
+            mode,
+            theme,
+            hide_to_tray_on_window_close: true,
+        }
+    }
+
+    pub const fn with_hide_to_tray_on_window_close(mut self, enabled: bool) -> Self {
+        self.hide_to_tray_on_window_close = enabled;
+        self
     }
 
     pub const fn mode(self) -> ApplicationMode {
@@ -55,6 +65,10 @@ impl ApplicationSettings {
 
     pub const fn theme(self) -> ThemePreference {
         self.theme
+    }
+
+    pub const fn hide_to_tray_on_window_close(self) -> bool {
+        self.hide_to_tray_on_window_close
     }
 }
 
@@ -277,7 +291,19 @@ impl RunEvidenceStore {
             .map(|value| decode_theme_preference(&value))
             .transpose()?
             .unwrap_or_default();
-        Ok(ApplicationSettings::new(mode, theme))
+        let hide_to_tray_on_window_close = self
+            .connection()
+            .query_row(
+                "SELECT value FROM application_settings WHERE key = 'hide_to_tray_on_close'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| decode_bool_text(&value, "hide_to_tray_on_close"))
+            .transpose()?
+            .unwrap_or(true);
+        Ok(ApplicationSettings::new(mode, theme)
+            .with_hide_to_tray_on_window_close(hide_to_tray_on_window_close))
     }
 
     pub fn save_settings(&mut self, settings: &ApplicationSettings) -> Result<(), StorageError> {
@@ -291,6 +317,11 @@ impl RunEvidenceStore {
             "INSERT INTO application_settings (key, value) VALUES ('theme', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![encode_theme_preference(settings.theme())],
+        )?;
+        transaction.execute(
+            "INSERT INTO application_settings (key, value) VALUES ('hide_to_tray_on_close', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![encode_bool_text(settings.hide_to_tray_on_window_close())],
         )?;
         transaction.commit()?;
         Ok(())
@@ -344,6 +375,13 @@ impl RunEvidenceStore {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![encode_theme_preference(configuration.settings.theme())],
         )?;
+        transaction.execute(
+            "INSERT INTO application_settings (key, value) VALUES ('hide_to_tray_on_close', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![encode_bool_text(
+                configuration.settings.hide_to_tray_on_window_close()
+            )],
+        )?;
 
         for imported in configuration.profiles {
             let values = ProfileValues::from_profile(&imported.profile);
@@ -382,9 +420,10 @@ impl RunEvidenceStore {
         let id = insert_profile(&transaction, &values, authorizations)?;
         insert_exclusions(&transaction, id, profile)?;
         transaction.commit()?;
-        let id = SyncProfileId::new(
-            u64::try_from(id).map_err(|_| StorageError::CorruptEvidence("invalid profile identifier".to_owned()))?,
-        );
+        let id =
+            SyncProfileId::new(u64::try_from(id).map_err(|_| {
+                StorageError::CorruptEvidence("invalid profile identifier".to_owned())
+            })?);
         Ok(PersistedSyncProfile {
             id,
             profile: profile.clone(),
@@ -444,7 +483,8 @@ impl RunEvidenceStore {
             return Err(StorageError::ConcurrentProfileUpdate);
         }
         self.reject_duplicate_endpoint_pair(profile, Some(id))?;
-        let authorizations = if unattended_authorization_scope_changed(existing.profile(), profile) {
+        let authorizations = if unattended_authorization_scope_changed(existing.profile(), profile)
+        {
             AuthorizationSnapshot::default()
         } else {
             authorizations
@@ -454,7 +494,8 @@ impl RunEvidenceStore {
         let transaction = self
             .connection_mut()
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let changed = update_profile_row(&transaction, id, &values, authorizations, expected_revision)?;
+        let changed =
+            update_profile_row(&transaction, id, &values, authorizations, expected_revision)?;
         if changed != 1 {
             return Err(StorageError::ConcurrentProfileUpdate);
         }
@@ -464,10 +505,9 @@ impl RunEvidenceStore {
         )?;
         insert_exclusions(&transaction, id.value_as_i64()?, profile)?;
         transaction.commit()?;
-        let revision = existing
-            .revision()
-            .checked_add(1)
-            .ok_or_else(|| StorageError::CorruptEvidence("profile revision is exhausted".to_owned()))?;
+        let revision = existing.revision().checked_add(1).ok_or_else(|| {
+            StorageError::CorruptEvidence("profile revision is exhausted".to_owned())
+        })?;
         Ok(PersistedSyncProfile {
             id,
             profile: profile.clone(),
@@ -526,10 +566,9 @@ impl RunEvidenceStore {
         let existing = self
             .load_profile(id)?
             .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
-        let revision = existing
-            .revision()
-            .checked_add(1)
-            .ok_or_else(|| StorageError::CorruptEvidence("profile revision is exhausted".to_owned()))?;
+        let revision = existing.revision().checked_add(1).ok_or_else(|| {
+            StorageError::CorruptEvidence("profile revision is exhausted".to_owned())
+        })?;
         let transaction = self
             .connection_mut()
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -572,7 +611,8 @@ impl RunEvidenceStore {
             )?;
         }
         transaction.commit()?;
-        self.load_profile(id)?.ok_or(StorageError::ProfileNotFound { id: id.value() })
+        self.load_profile(id)?
+            .ok_or(StorageError::ProfileNotFound { id: id.value() })
     }
 
     pub(crate) fn claim_due_schedule(
@@ -600,9 +640,9 @@ impl RunEvidenceStore {
         let interval = i64::from(schedule.interval_minutes())
             .checked_mul(60)
             .ok_or_else(|| StorageError::InvalidSchedule("interval is out of range".to_owned()))?;
-        let elapsed = now_unix_seconds
-            .checked_sub(scheduled_at)
-            .ok_or_else(|| StorageError::InvalidSchedule("schedule time is out of range".to_owned()))?;
+        let elapsed = now_unix_seconds.checked_sub(scheduled_at).ok_or_else(|| {
+            StorageError::InvalidSchedule("schedule time is out of range".to_owned())
+        })?;
         let occurrences = elapsed
             .checked_div(interval)
             .and_then(|value| value.checked_add(1))
@@ -626,7 +666,8 @@ impl RunEvidenceStore {
             return Ok(None);
         }
         let run_id = RunEvidenceStore::allocate_run_id_in_transaction(&transaction)?;
-        let snapshot = RunSnapshot::from_profile(run_id, existing.profile(), existing.authorizations())?;
+        let snapshot =
+            RunSnapshot::from_profile(run_id, existing.profile(), existing.authorizations())?;
         let changed = transaction.execute(
             "UPDATE sync_profile_schedules
              SET next_run_at_unix_seconds = ?1
@@ -678,7 +719,8 @@ impl RunEvidenceStore {
 
     pub fn list_profiles(&self) -> Result<Vec<PersistedSyncProfile>, StorageError> {
         let transaction = self.connection().unchecked_transaction()?;
-        let mut statement = transaction.prepare(&format!("{PROFILE_SELECT} ORDER BY profile_id"))?;
+        let mut statement =
+            transaction.prepare(&format!("{PROFILE_SELECT} ORDER BY profile_id"))?;
         let rows = statement.query_map([], RawProfile::from_row)?;
         let raw_profiles = rows.collect::<Result<Vec<_>, _>>()?;
         drop(statement);
@@ -723,10 +765,10 @@ impl RunEvidenceStore {
         raw: RawProfile,
     ) -> Result<PersistedSyncProfile, StorageError> {
         let exclusions = Self::load_exclusions(connection, raw.id)?;
-        let id = SyncProfileId::new(
-            u64::try_from(raw.id)
-                .map_err(|_| StorageError::CorruptEvidence("invalid profile identifier".to_owned()))?,
-        );
+        let id =
+            SyncProfileId::new(u64::try_from(raw.id).map_err(|_| {
+                StorageError::CorruptEvidence("invalid profile identifier".to_owned())
+            })?);
         let schedule_enabled = decode_profile_bool(raw.schedule_enabled)?;
         let schedule = Self::load_schedule(connection, raw.id)?;
         if schedule.as_ref().is_some_and(|schedule| schedule.enabled()) != schedule_enabled {
@@ -771,15 +813,18 @@ impl RunEvidenceStore {
                 },
             )
             .optional()?;
-        raw.map(|(interval_minutes, timezone, enabled, next_run_at_unix_seconds)| {
-            ScheduleDefinition::new_with_next_run_at(
-                u32::try_from(interval_minutes)
-                    .map_err(|_| StorageError::InvalidSchedule("invalid interval".to_owned()))?,
-                timezone,
-                decode_profile_bool(enabled)?,
-                next_run_at_unix_seconds,
-            )
-        })
+        raw.map(
+            |(interval_minutes, timezone, enabled, next_run_at_unix_seconds)| {
+                ScheduleDefinition::new_with_next_run_at(
+                    u32::try_from(interval_minutes).map_err(|_| {
+                        StorageError::InvalidSchedule("invalid interval".to_owned())
+                    })?,
+                    timezone,
+                    decode_profile_bool(enabled)?,
+                    next_run_at_unix_seconds,
+                )
+            },
+        )
         .transpose()
     }
 
@@ -800,15 +845,18 @@ impl RunEvidenceStore {
 
 impl SyncProfileId {
     pub(crate) fn value_as_i64(self) -> Result<i64, StorageError> {
-        i64::try_from(self.0)
-            .map_err(|_| StorageError::CorruptEvidence("profile identifier is out of range".to_owned()))
+        i64::try_from(self.0).map_err(|_| {
+            StorageError::CorruptEvidence("profile identifier is out of range".to_owned())
+        })
     }
 }
 
 fn current_unix_seconds() -> Result<i64, StorageError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| StorageError::InvalidSchedule(format!("system clock is before Unix epoch: {error}")))
+        .map_err(|error| {
+            StorageError::InvalidSchedule(format!("system clock is before Unix epoch: {error}"))
+        })
         .and_then(|duration| {
             i64::try_from(duration.as_secs()).map_err(|_| {
                 StorageError::InvalidSchedule("system clock is out of range".to_owned())
@@ -888,10 +936,14 @@ impl ProfileValues {
                 metadata_ownership: i64::from(specialist.ownership()),
                 metadata_access_control_lists: i64::from(specialist.access_control_lists()),
                 metadata_extended_attributes: i64::from(specialist.extended_attributes()),
-                partial_transfer_policy: encode_partial_transfer_policy(options.partial_transfer_policy),
+                partial_transfer_policy: encode_partial_transfer_policy(
+                    options.partial_transfer_policy,
+                ),
                 retry_max_attempts: i64::from(options.retry_policy.max_attempts()),
-                retry_initial_delay_millis: i64::try_from(options.retry_policy.initial_delay().as_millis())
-                    .unwrap_or(i64::MAX),
+                retry_initial_delay_millis: i64::try_from(
+                    options.retry_policy.initial_delay().as_millis(),
+                )
+                .unwrap_or(i64::MAX),
             },
         }
     }
@@ -930,8 +982,12 @@ fn insert_profile(
     authorizations: AuthorizationSnapshot,
 ) -> Result<i64, StorageError> {
     let mut parameters = profile_params(values);
-    parameters.push(Box::new(i64::from(authorizations.allow_unattended_destructive())));
-    parameters.push(Box::new(i64::from(authorizations.allow_unattended_permanent_removal())));
+    parameters.push(Box::new(i64::from(
+        authorizations.allow_unattended_destructive(),
+    )));
+    parameters.push(Box::new(i64::from(
+        authorizations.allow_unattended_permanent_removal(),
+    )));
     transaction.execute(
         "INSERT INTO sync_profiles (
             name, mode, source,
@@ -965,8 +1021,12 @@ fn update_profile_row(
     expected_revision: u64,
 ) -> Result<usize, StorageError> {
     let mut parameters = profile_params(values);
-    parameters.push(Box::new(i64::from(authorizations.allow_unattended_destructive())));
-    parameters.push(Box::new(i64::from(authorizations.allow_unattended_permanent_removal())));
+    parameters.push(Box::new(i64::from(
+        authorizations.allow_unattended_destructive(),
+    )));
+    parameters.push(Box::new(i64::from(
+        authorizations.allow_unattended_permanent_removal(),
+    )));
     parameters.push(Box::new(id.value_as_i64()?));
     parameters.push(Box::new(expected_revision));
     Ok(transaction.execute(
@@ -1070,14 +1130,17 @@ fn validate_authorizations(
         && !options.destination_cleanup
     {
         return Err(StorageError::InvalidAuthorization(
-            "unattended destructive authorization requires Safe Delete or Destination Cleanup".to_owned(),
+            "unattended destructive authorization requires Safe Delete or Destination Cleanup"
+                .to_owned(),
         ));
     }
     if authorizations.allow_unattended_permanent_removal()
-        && (!options.safe_delete || options.deletion_method != Some(DeletionMethod::PermanentRemoval))
+        && (!options.safe_delete
+            || options.deletion_method != Some(DeletionMethod::PermanentRemoval))
     {
         return Err(StorageError::InvalidAuthorization(
-            "unattended Permanent Removal requires Safe Delete with Permanent Removal selected".to_owned(),
+            "unattended Permanent Removal requires Safe Delete with Permanent Removal selected"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -1202,8 +1265,7 @@ impl RawProfile {
             )),
             partial_transfer_policy: decode_partial_transfer_policy(&self.partial_transfer_policy)?,
             retry_policy: RetryPolicy::new(
-                u8::try_from(self.retry_max_attempts)
-                    .map_err(|_| corrupt_profile())?,
+                u8::try_from(self.retry_max_attempts).map_err(|_| corrupt_profile())?,
                 Duration::from_millis(
                     u64::try_from(self.retry_initial_delay_millis)
                         .map_err(|_| corrupt_profile())?,
@@ -1246,7 +1308,9 @@ fn decode_peer(raw: RawPeer) -> Result<Peer, StorageError> {
                 server,
                 username,
                 port,
-                raw.identity.map(|identity| blob_to_path(&identity)).transpose()?,
+                raw.identity
+                    .map(|identity| blob_to_path(&identity))
+                    .transpose()?,
                 authentication,
                 remote_path,
             )
@@ -1263,7 +1327,9 @@ fn decode_authentication(value: Option<&str>) -> Result<SshAuthentication, Stora
         Some("agent") => Ok(SshAuthentication::Agent),
         Some("interactive_password") => Ok(SshAuthentication::InteractivePassword),
         Some(value) => {
-            let reference = value.strip_prefix("saved_password:").ok_or_else(corrupt_profile)?;
+            let reference = value
+                .strip_prefix("saved_password:")
+                .ok_or_else(corrupt_profile)?;
             SavedSecretReference::new(reference)
                 .map(SshAuthentication::SavedPassword)
                 .map_err(|_| corrupt_profile())
@@ -1295,7 +1361,9 @@ fn decode_application_mode(value: &str) -> Result<ApplicationMode, StorageError>
     match value {
         "simple" => Ok(ApplicationMode::Simple),
         "advanced" => Ok(ApplicationMode::Advanced),
-        _ => Err(StorageError::CorruptEvidence("corrupt application settings".to_owned())),
+        _ => Err(StorageError::CorruptEvidence(
+            "corrupt application settings".to_owned(),
+        )),
     }
 }
 
@@ -1312,7 +1380,23 @@ fn decode_theme_preference(value: &str) -> Result<ThemePreference, StorageError>
         "system" => Ok(ThemePreference::System),
         "light" => Ok(ThemePreference::Light),
         "dark" => Ok(ThemePreference::Dark),
-        _ => Err(StorageError::CorruptEvidence("corrupt application settings".to_owned())),
+        _ => Err(StorageError::CorruptEvidence(
+            "corrupt application settings".to_owned(),
+        )),
+    }
+}
+
+fn encode_bool_text(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
+fn decode_bool_text(value: &str, field: &str) -> Result<bool, StorageError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(StorageError::CorruptEvidence(format!(
+            "corrupt application setting {field}"
+        ))),
     }
 }
 

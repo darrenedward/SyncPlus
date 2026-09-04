@@ -2,9 +2,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender, TryRecvError},
-        Arc, Mutex,
     },
     thread,
     time::Duration,
@@ -12,33 +12,26 @@ use std::{
 
 use eframe::egui;
 use notify_rust::Notification;
+use rfd::FileDialog;
 use syncplus_core::{
     ActionOutcome, AnalysisOutcome, ApplicationMode, ApplicationSettings, AuthorizationSnapshot,
-    BackgroundScheduler,
-    ConflictDecision,
-    ConfirmedPlan, ConflictEntry, ConflictEntryKey, ConflictResolution, ConflictReview,
-    DeletionMethod,
-    FreshAnalysis, LocalPrecheckProbe, MetadataRequirements, OneWaySource, PartialTransferPolicy,
-    MissedScheduleDecision, MissedScheduleNotice, Peer, PeerEndpoint, PersistedSyncProfile,
-    PrecheckErrorKind, PrecheckResult,
-    RemotePrecheckRequest, ResolutionRun, RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId,
-    RecoveryMethod, RunLifecycle, RunPrecheck, RunReport, RunReportStatus, SavedSecretReference, SecretStore,
-    SecretStoreError, SchedulerNotification, SchedulerNotificationSink,
-    ScheduleDefinition, SchedulerEvent, SchedulerNotificationAction,
-    SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
-    SyncProfileId, ThemePreference,
+    BackgroundScheduler, ConfirmedPlan, ConflictDecision, ConflictEntry, ConflictEntryKey,
+    ConflictResolution, ConflictReview, DeletionMethod, FreshAnalysis, LocalPrecheckProbe,
+    MetadataRequirements, MissedScheduleDecision, MissedScheduleNotice, OneWaySource,
+    PartialTransferPolicy, Peer, PeerEndpoint, PersistedSyncProfile, PrecheckErrorKind,
+    PrecheckResult, RecoveryMethod, RemotePrecheckRequest, ResolutionRun, RetryPolicy,
+    RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle, RunPrecheck, RunReport,
+    RunReportStatus, SavedSecretReference, ScheduleDefinition, SchedulerEvent,
+    SchedulerNotification, SchedulerNotificationAction, SchedulerNotificationSink, SecretStore,
+    SecretStoreError, SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions,
+    SyncProfile, SyncProfileId, ThemePreference,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EndpointKind {
+    #[default]
     Local,
     Ssh,
-}
-
-impl Default for EndpointKind {
-    fn default() -> Self {
-        Self::Local
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +96,155 @@ fn quit_decision(manual_run_active: bool) -> QuitDecision {
         QuitDecision::AskBeforeStopping
     } else {
         QuitDecision::Exit
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppView {
+    Welcome,
+    Profiles,
+    Settings,
+    Wizard,
+    Sync,
+    Reports,
+    Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarIcon {
+    Overview,
+    Profiles,
+    SyncWorkspace,
+    Reports,
+    Recovery,
+    Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileWizardStep {
+    SyncMethod,
+    SourceEndpoint,
+    DestinationEndpoint,
+    ReviewAndSave,
+}
+
+#[derive(Clone, Copy)]
+struct UiPalette {
+    canvas: egui::Color32,
+    surface: egui::Color32,
+    elevated: egui::Color32,
+    field: egui::Color32,
+    border: egui::Color32,
+    border_subtle: egui::Color32,
+    text: egui::Color32,
+    muted: egui::Color32,
+    accent: egui::Color32,
+    on_accent: egui::Color32,
+    accent_soft: egui::Color32,
+    secondary: egui::Color32,
+    hot: egui::Color32,
+    danger: egui::Color32,
+    danger_soft: egui::Color32,
+    on_danger_soft: egui::Color32,
+    amber: egui::Color32,
+    amber_soft: egui::Color32,
+    logo_background: egui::Color32,
+}
+
+fn ui_palette(ui: &egui::Ui) -> UiPalette {
+    ui_palette_for_dark_mode(ui.visuals().dark_mode)
+}
+
+fn ui_palette_for_dark_mode(dark_mode: bool) -> UiPalette {
+    if dark_mode {
+        UiPalette {
+            canvas: egui::Color32::from_rgb(13, 13, 13),
+            surface: egui::Color32::from_rgb(20, 22, 25),
+            elevated: egui::Color32::from_rgb(27, 31, 36),
+            field: egui::Color32::from_rgb(12, 15, 18),
+            border: egui::Color32::from_rgb(114, 133, 150),
+            border_subtle: egui::Color32::from_rgb(89, 104, 117),
+            text: egui::Color32::WHITE,
+            muted: egui::Color32::from_rgb(169, 181, 193),
+            accent: egui::Color32::from_rgb(0, 255, 133),
+            on_accent: egui::Color32::from_rgb(0, 27, 14),
+            accent_soft: egui::Color32::from_rgb(12, 62, 43),
+            secondary: egui::Color32::from_rgb(30, 144, 255),
+            hot: egui::Color32::from_rgb(255, 0, 153),
+            danger: egui::Color32::from_rgb(225, 83, 98),
+            danger_soft: egui::Color32::from_rgb(71, 24, 32),
+            on_danger_soft: egui::Color32::from_rgb(255, 237, 239),
+            amber: egui::Color32::from_rgb(255, 209, 102),
+            amber_soft: egui::Color32::from_rgb(72, 60, 30),
+            logo_background: egui::Color32::from_rgb(20, 24, 28),
+        }
+    } else {
+        UiPalette {
+            canvas: egui::Color32::from_rgb(244, 247, 250),
+            surface: egui::Color32::WHITE,
+            elevated: egui::Color32::from_rgb(238, 243, 248),
+            field: egui::Color32::from_rgb(247, 250, 252),
+            border: egui::Color32::from_rgb(96, 117, 134),
+            border_subtle: egui::Color32::from_rgb(114, 133, 150),
+            text: egui::Color32::from_rgb(16, 24, 32),
+            muted: egui::Color32::from_rgb(74, 91, 106),
+            accent: egui::Color32::from_rgb(0, 122, 71),
+            on_accent: egui::Color32::WHITE,
+            accent_soft: egui::Color32::from_rgb(222, 245, 235),
+            secondary: egui::Color32::from_rgb(20, 100, 184),
+            hot: egui::Color32::from_rgb(178, 0, 105),
+            danger: egui::Color32::from_rgb(183, 39, 56),
+            danger_soft: egui::Color32::from_rgb(253, 235, 238),
+            on_danger_soft: egui::Color32::from_rgb(111, 19, 31),
+            amber: egui::Color32::from_rgb(142, 93, 0),
+            amber_soft: egui::Color32::from_rgb(250, 239, 211),
+            logo_background: egui::Color32::from_rgb(20, 24, 28),
+        }
+    }
+}
+
+impl ProfileWizardStep {
+    const ALL: [Self; 4] = [
+        Self::SyncMethod,
+        Self::SourceEndpoint,
+        Self::DestinationEndpoint,
+        Self::ReviewAndSave,
+    ];
+
+    const fn number(self) -> usize {
+        match self {
+            Self::SyncMethod => 1,
+            Self::SourceEndpoint => 2,
+            Self::DestinationEndpoint => 3,
+            Self::ReviewAndSave => 4,
+        }
+    }
+
+    const fn title(self) -> &'static str {
+        match self {
+            Self::SyncMethod => "Sync method",
+            Self::SourceEndpoint => "Source folder",
+            Self::DestinationEndpoint => "Destination folder",
+            Self::ReviewAndSave => "Review & save",
+        }
+    }
+
+    const fn previous(self) -> Option<Self> {
+        match self {
+            Self::SyncMethod => None,
+            Self::SourceEndpoint => Some(Self::SyncMethod),
+            Self::DestinationEndpoint => Some(Self::SourceEndpoint),
+            Self::ReviewAndSave => Some(Self::DestinationEndpoint),
+        }
+    }
+
+    const fn next(self) -> Option<Self> {
+        match self {
+            Self::SyncMethod => Some(Self::SourceEndpoint),
+            Self::SourceEndpoint => Some(Self::DestinationEndpoint),
+            Self::DestinationEndpoint => Some(Self::ReviewAndSave),
+            Self::ReviewAndSave => None,
+        }
     }
 }
 
@@ -246,10 +388,10 @@ struct SyncPlusTray {
 impl SyncPlusTray {
     fn dispatch(&self, command: TrayCommand) {
         let _ = self.commands.send(command);
-        if let Ok(context) = self.repaint_context.lock() {
-            if let Some(context) = context.as_ref() {
-                context.request_repaint();
-            }
+        if let Ok(context) = self.repaint_context.lock()
+            && let Some(context) = context.as_ref()
+        {
+            context.request_repaint();
         }
     }
 }
@@ -280,7 +422,9 @@ impl ksni::Tray for SyncPlusTray {
             StandardItem {
                 label: "_Show SyncPlus".to_owned(),
                 shortcut: vec![vec!["Control".to_owned(), "S".to_owned()]],
-                activate: Box::new(|tray: &mut SyncPlusTray| tray.dispatch(TrayCommand::ShowWindow)),
+                activate: Box::new(|tray: &mut SyncPlusTray| {
+                    tray.dispatch(TrayCommand::ShowWindow)
+                }),
                 ..Default::default()
             }
             .into(),
@@ -331,6 +475,20 @@ enum QuitFlow {
 struct ManualRunCompletion {
     run_id: RunId,
     result: Result<RunReport, String>,
+}
+
+struct ProfileAnalysisResult {
+    profile: SyncProfile,
+    precheck: Result<PrecheckResult, String>,
+    analysis: Option<Result<FreshAnalysis, String>>,
+}
+
+struct AnalysisCompletion {
+    result: ProfileAnalysisResult,
+}
+
+struct ActiveAnalysis {
+    receiver: Receiver<AnalysisCompletion>,
 }
 
 struct ActiveManualRun {
@@ -412,7 +570,6 @@ impl std::fmt::Display for UiValidationError {
             Self::Core(message) => formatter.write_str(message),
         }
     }
-
 }
 
 impl std::error::Error for UiValidationError {}
@@ -461,7 +618,10 @@ pub fn run_background_scheduler_once() -> Result<usize, String> {
             || false,
         ) {
             Ok(_) => launched += 1,
-            Err(error) => failures.push(format!("Sync Run {}: {error}", scheduled_run.run_id().value())),
+            Err(error) => failures.push(format!(
+                "Sync Run {}: {error}",
+                scheduled_run.run_id().value()
+            )),
         }
     }
     if let Ok(events) = store.list_scheduler_events() {
@@ -493,19 +653,14 @@ struct EndpointForm {
     authentication: AuthenticationForm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum AuthenticationForm {
+    #[default]
     Key,
     Agent,
     InteractivePassword,
     SavedPassword,
     NeedsConfiguration,
-}
-
-impl Default for AuthenticationForm {
-    fn default() -> Self {
-        Self::Key
-    }
 }
 
 impl Default for EndpointForm {
@@ -560,7 +715,9 @@ impl EndpointForm {
                 form.authentication = match ssh.authentication() {
                     SshAuthentication::Key => AuthenticationForm::Key,
                     SshAuthentication::Agent => AuthenticationForm::Agent,
-                    SshAuthentication::InteractivePassword => AuthenticationForm::InteractivePassword,
+                    SshAuthentication::InteractivePassword => {
+                        AuthenticationForm::InteractivePassword
+                    }
                     SshAuthentication::SavedPassword(reference) => {
                         form.secret_reference = reference.as_str().to_owned();
                         AuthenticationForm::SavedPassword
@@ -598,8 +755,8 @@ impl EndpointForm {
                 if self.remote_path.trim().is_empty() {
                     return Err(UiValidationError::EmptySshRemotePath);
                 }
-                let entered_identity = (!self.identity.trim().is_empty())
-                    .then(|| PathBuf::from(self.identity.trim()));
+                let entered_identity =
+                    (!self.identity.trim().is_empty()).then(|| PathBuf::from(self.identity.trim()));
                 let authentication = match self.authentication {
                     AuthenticationForm::Key => {
                         if entered_identity.is_none() {
@@ -608,14 +765,16 @@ impl EndpointForm {
                         SshAuthentication::Key
                     }
                     AuthenticationForm::Agent => SshAuthentication::Agent,
-                    AuthenticationForm::InteractivePassword => SshAuthentication::InteractivePassword,
+                    AuthenticationForm::InteractivePassword => {
+                        SshAuthentication::InteractivePassword
+                    }
                     AuthenticationForm::SavedPassword => {
                         let reference = SavedSecretReference::new(self.secret_reference.trim())
                             .map_err(|_| UiValidationError::InvalidSavedSecretReference)?;
                         SshAuthentication::SavedPassword(reference)
                     }
                     AuthenticationForm::NeedsConfiguration => {
-                        return Err(UiValidationError::SshAuthenticationRequired)
+                        return Err(UiValidationError::SshAuthenticationRequired);
                     }
                 };
                 let identity = matches!(&authentication, SshAuthentication::Key)
@@ -702,7 +861,10 @@ impl Default for ProfileForm {
             extended_attributes: false,
             partial_transfer_policy: PartialTransferPolicy::Cleanup,
             retry_attempts: RetryPolicy::default().max_attempts().to_string(),
-            retry_delay_millis: RetryPolicy::default().initial_delay().as_millis().to_string(),
+            retry_delay_millis: RetryPolicy::default()
+                .initial_delay()
+                .as_millis()
+                .to_string(),
             schedule_enabled: false,
             schedule_interval_minutes: "60".to_owned(),
             schedule_timezone: "UTC".to_owned(),
@@ -779,18 +941,24 @@ impl ProfileForm {
             .ok()
             .filter(|delay| *delay <= 3_600_000)
             .ok_or(UiValidationError::InvalidRetryDelay)?;
-        let mut options = SyncOptions::default();
-        options.safe_delete = self.safe_delete;
-        options.destination_cleanup = self.destination_cleanup;
-        options.deletion_method = self.safe_delete.then(|| self.deletion_method.unwrap_or(DeletionMethod::Trash));
-        options.metadata = MetadataRequirements::new(true, true, true, self.timestamps)
-            .with_specialist_metadata(SpecialistMetadataRequirements::new(
-                self.ownership,
-                self.access_control_lists,
-                self.extended_attributes,
-            ));
-        options.partial_transfer_policy = self.partial_transfer_policy;
-        options.retry_policy = RetryPolicy::new(retry_attempts, Duration::from_millis(retry_delay_millis));
+        let options = SyncOptions {
+            safe_delete: self.safe_delete,
+            destination_cleanup: self.destination_cleanup,
+            deletion_method: self
+                .safe_delete
+                .then(|| self.deletion_method.unwrap_or(DeletionMethod::Trash)),
+            metadata: MetadataRequirements::new(true, true, true, self.timestamps)
+                .with_specialist_metadata(SpecialistMetadataRequirements::new(
+                    self.ownership,
+                    self.access_control_lists,
+                    self.extended_attributes,
+                )),
+            partial_transfer_policy: self.partial_transfer_policy,
+            retry_policy: RetryPolicy::new(
+                retry_attempts,
+                Duration::from_millis(retry_delay_millis),
+            ),
+        };
         let exclusions = self
             .exclusions
             .lines()
@@ -870,6 +1038,7 @@ enum PendingReportAction {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelpTopic {
+    GettingStarted,
     Modes,
     OneWaySync,
     SafeDelete,
@@ -908,6 +1077,7 @@ pub struct HelpEntry {
 }
 
 const HELP_TOPICS: &[HelpTopic] = &[
+    HelpTopic::GettingStarted,
     HelpTopic::Modes,
     HelpTopic::OneWaySync,
     HelpTopic::SafeDelete,
@@ -926,12 +1096,63 @@ const HELP_TOPICS: &[HelpTopic] = &[
     HelpTopic::CloneProfile,
 ];
 
+const HELP_GROUPS: &[(&str, &[HelpTopic])] = &[
+    (
+        "Start here",
+        &[
+            HelpTopic::GettingStarted,
+            HelpTopic::Modes,
+            HelpTopic::PlanAndConfirmation,
+        ],
+    ),
+    (
+        "Sync modes",
+        &[
+            HelpTopic::OneWaySync,
+            HelpTopic::SafeDelete,
+            HelpTopic::MirrorSync,
+            HelpTopic::ConflictReview,
+            HelpTopic::Exclusions,
+        ],
+    ),
+    (
+        "Safety & recovery",
+        &[
+            HelpTopic::DestructiveActions,
+            HelpTopic::Recovery,
+            HelpTopic::ProgressAndCancellation,
+            HelpTopic::RunReports,
+        ],
+    ),
+    (
+        "Troubleshooting",
+        &[
+            HelpTopic::Diagnostics,
+            HelpTopic::PrecheckBlockers,
+            HelpTopic::ExecutionFailures,
+            HelpTopic::SshAuthentication,
+        ],
+    ),
+    ("Profiles & advanced", &[HelpTopic::CloneProfile]),
+];
+
 pub fn help_topics() -> &'static [HelpTopic] {
     HELP_TOPICS
 }
 
 pub fn help_entry(topic: HelpTopic) -> HelpEntry {
     match topic {
+        HelpTopic::GettingStarted => HelpEntry {
+            topic,
+            title: "Getting started",
+            what: "SyncPlus moves files through a named Sync Profile with a visible source, destination, reviewable plan, and explicit confirmation step.",
+            why: "The first run should teach you what will happen before it changes anything. Saving a profile never starts a Sync Run.",
+            how: "Create a profile, choose the sync type, select the source and destination folders, review the saved profile, then open the Sync workspace for Fresh Analysis and confirmation.",
+            when: "Start here when SyncPlus is new to you or when you want a quick reminder of the safe workflow.",
+            consequences: "A new profile defaults to Simple Mode and non-destructive One-Way Sync. Nothing changes until the exact reviewed plan is explicitly confirmed.",
+            limitations: "SyncPlus does not accept arbitrary shell or rsync commands, silently resolve conflicts, or treat transfer counts as proof of completion.",
+            next_action: "Create your first Sync Profile, then follow the four-step wizard through sync method, source, destination, and review.",
+        },
         HelpTopic::Modes => HelpEntry {
             topic,
             title: "Simple and Advanced Mode",
@@ -1266,8 +1487,7 @@ fn format_profile_diagnostic(
 
 fn format_form_validation_diagnostic(form: &ProfileForm, error: &UiValidationError) -> String {
     let (peer, endpoint) = match error {
-        UiValidationError::EmptyPeerName { peer }
-        | UiValidationError::EmptyLocalPath { peer } => {
+        UiValidationError::EmptyPeerName { peer } | UiValidationError::EmptyLocalPath { peer } => {
             if *peer == "Source" {
                 ("Source", &form.peer_a)
             } else {
@@ -1315,7 +1535,10 @@ fn format_form_validation_diagnostic(form: &ProfileForm, error: &UiValidationErr
     )
 }
 
-fn format_precheck_diagnostic(profile: &SyncProfile, blocker: &syncplus_core::PrecheckBlocker) -> String {
+fn format_precheck_diagnostic(
+    profile: &SyncProfile,
+    blocker: &syncplus_core::PrecheckBlocker,
+) -> String {
     format_profile_diagnostic(
         profile,
         Some(blocker.path()),
@@ -1354,7 +1577,7 @@ fn format_ssh_precheck_boundary_diagnostic(profile: &SyncProfile) -> String {
                 None,
                 format!("SSH precheck profile could not be derived: {error}"),
                 "Correct the typed SSH profile fields and run Fresh Analysis again.",
-            )
+            );
         }
     };
     let access = request.access();
@@ -1372,7 +1595,10 @@ fn format_ssh_precheck_boundary_diagnostic(profile: &SyncProfile) -> String {
     )
 }
 
-fn format_warning_diagnostic(profile: &SyncProfile, warning: &syncplus_core::PathRiskWarning) -> String {
+fn format_warning_diagnostic(
+    profile: &SyncProfile,
+    warning: &syncplus_core::PathRiskWarning,
+) -> String {
     format_profile_diagnostic(
         profile,
         Some(warning.source()),
@@ -1388,7 +1614,10 @@ fn format_naming_conflict_diagnostic(
     format_profile_diagnostic(
         profile,
         Some(conflict.destination_path()),
-        format!("destination naming rule {:?} prevents a safe mapping", conflict.rule()),
+        format!(
+            "destination naming rule {:?} prevents a safe mapping",
+            conflict.rule()
+        ),
         "Rename or exclude the item, or choose compatible destination storage, then run Fresh Analysis again.",
     )
 }
@@ -1398,6 +1627,8 @@ pub struct SyncPlusApp {
     secret_store: Box<dyn SecretStore>,
     settings: ApplicationSettings,
     profiles: Vec<PersistedSyncProfile>,
+    view: AppView,
+    wizard_step: Option<ProfileWizardStep>,
     form: ProfileForm,
     status: String,
     review: Option<PlanReviewState>,
@@ -1412,6 +1643,7 @@ pub struct SyncPlusApp {
     window_hidden_to_tray: bool,
     quit_flow: QuitFlow,
     exit_requested: bool,
+    active_analysis: Option<ActiveAnalysis>,
     active_manual_run: Option<ActiveManualRun>,
     notifications: Vec<UiNotification>,
     known_scheduler_event_ids: BTreeSet<u64>,
@@ -1440,25 +1672,41 @@ impl SyncPlusApp {
             .iter()
             .map(SchedulerEvent::event_id)
             .collect();
+        let (view, form, status) = if let Some(profile) = profiles.first() {
+            (
+                AppView::Sync,
+                ProfileForm::from_persisted(profile),
+                format!("Ready to review {}.", profile.profile().name()),
+            )
+        } else {
+            (
+                AppView::Welcome,
+                ProfileForm::default(),
+                "Ready. Create a Sync Profile to begin.".to_owned(),
+            )
+        };
         Ok(Self {
             store,
             secret_store: Box::new(secret_store),
             settings,
             profiles,
-            form: ProfileForm::default(),
-            status: "Ready. Create a Sync Profile to begin.".to_owned(),
+            view,
+            wizard_step: None,
+            form,
+            status,
             review: None,
             run_reports,
             missed_schedule_notices,
             scheduler_events,
             selected_run_report,
             pending_report_action: None,
-            help_topic: HelpTopic::Modes,
+            help_topic: HelpTopic::GettingStarted,
             tray: None,
             tray_attempted: false,
             window_hidden_to_tray: false,
             quit_flow: QuitFlow::None,
             exit_requested: false,
+            active_analysis: None,
             active_manual_run: None,
             notifications: Vec::new(),
             known_scheduler_event_ids,
@@ -1525,6 +1773,45 @@ impl SyncPlusApp {
         self.help_topic = topic;
     }
 
+    fn show_welcome(&mut self) {
+        self.view = AppView::Welcome;
+        self.wizard_step = None;
+    }
+
+    fn show_profiles(&mut self) {
+        self.view = AppView::Profiles;
+        self.wizard_step = None;
+    }
+
+    fn show_settings(&mut self) {
+        self.view = AppView::Settings;
+        self.wizard_step = None;
+    }
+
+    fn show_sync_workspace(&mut self) {
+        self.view = AppView::Sync;
+        self.wizard_step = None;
+    }
+
+    fn open_sync_workspace(&mut self) {
+        if self.form.id.is_some() {
+            self.show_sync_workspace();
+        } else {
+            self.start_new_profile();
+        }
+    }
+
+    fn show_reports(&mut self) {
+        self.view = AppView::Reports;
+        self.wizard_step = None;
+    }
+
+    fn show_help(&mut self, topic: HelpTopic) {
+        self.help_topic = topic;
+        self.view = AppView::Help;
+        self.wizard_step = None;
+    }
+
     pub fn refresh_run_reports(&mut self) -> Result<(), UiValidationError> {
         let reports = self
             .store
@@ -1550,9 +1837,10 @@ impl SyncPlusApp {
             .pending_report_action
             .is_some_and(|action| match action {
                 PendingReportAction::RemoveCompletedReport(run_id)
-                | PendingReportAction::DiscardUnresolvedRun(run_id) => {
-                    self.run_reports.iter().all(|report| report.run_id() != run_id)
-                }
+                | PendingReportAction::DiscardUnresolvedRun(run_id) => self
+                    .run_reports
+                    .iter()
+                    .all(|report| report.run_id() != run_id),
             })
         {
             self.pending_report_action = None;
@@ -1595,7 +1883,10 @@ impl SyncPlusApp {
             ));
         }
         let (profile, expected) = {
-            let review = self.review.as_ref().ok_or(UiValidationError::ReviewNotReady)?;
+            let review = self
+                .review
+                .as_ref()
+                .ok_or(UiValidationError::ReviewNotReady)?;
             if !review.confirmed {
                 return Err(UiValidationError::ReviewNotReady);
             }
@@ -1621,7 +1912,9 @@ impl SyncPlusApp {
                 let result = execute_manual_run(run_id, profile, expected, worker_cancel);
                 let _ = sender.send(ManualRunCompletion { run_id, result });
             })
-            .map_err(|error| UiValidationError::Core(format!("could not start Sync Run: {error}")))?;
+            .map_err(|error| {
+                UiValidationError::Core(format!("could not start Sync Run: {error}"))
+            })?;
         self.active_manual_run = Some(ActiveManualRun {
             run_id,
             cancel,
@@ -1632,6 +1925,43 @@ impl SyncPlusApp {
             run_id.value()
         );
         Ok(())
+    }
+
+    fn request_synchronise(&mut self) {
+        if self.active_manual_run.is_some() {
+            self.status =
+                "A Manual Sync Run is already active. Review its Run Report for progress."
+                    .to_owned();
+            return;
+        }
+
+        match self.review.as_ref() {
+            Some(review) if review.confirmed => {
+                if let Err(error) = self.start_manual_run() {
+                    self.status = format!("Synchronise was not started: {error}");
+                }
+            }
+            Some(_) => {
+                self.status = "Review the current read-only plan and complete Execution Confirmation before Synchronise can change files.".to_owned();
+            }
+            None => {
+                if let Err(error) = self.analyze_profile() {
+                    self.status = format_form_validation_diagnostic(&self.form, &error);
+                } else {
+                    self.status = "Fresh Analysis completed. Review the plan, pass Run Precheck, and confirm the exact scope before Synchronise can change files.".to_owned();
+                }
+            }
+        }
+    }
+
+    fn request_synchronise_async(&mut self, context: &egui::Context) {
+        if self.review.is_none() {
+            if let Err(error) = self.start_analysis(context) {
+                self.status = format_form_validation_diagnostic(&self.form, &error);
+            }
+        } else {
+            self.request_synchronise();
+        }
     }
 
     fn request_manual_cancel(&mut self, run_id: RunId) {
@@ -1708,7 +2038,8 @@ impl SyncPlusApp {
             self.push_notification(UiNotification {
                 title: "Sync Run did not settle".to_owned(),
                 reason: "The workflow ended before a settled Run Report was available.".to_owned(),
-                next_action: "Open Run Reports and inspect any available recovery evidence.".to_owned(),
+                next_action: "Open Run Reports and inspect any available recovery evidence."
+                    .to_owned(),
                 run_id: Some(completion.run_id),
             });
         }
@@ -1809,29 +2140,21 @@ impl SyncPlusApp {
     }
 
     fn handle_close_request(&mut self, context: &egui::Context) {
-        if !self.exit_requested {
+        if !self.exit_requested && self.settings.hide_to_tray_on_window_close() {
             self.hide_to_tray(context);
+        } else if !self.exit_requested {
+            self.request_quit(context);
         }
     }
 
-    fn draw_app_menu(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        let mut request_quit = false;
-        egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("_SyncPlus", |ui| {
-                if ui.button("_Show SyncPlus").clicked() {
-                    self.show_window(context);
-                    ui.close();
-                }
-                if ui.button("_Quit SyncPlus    Ctrl+Q").clicked() {
-                    request_quit = true;
-                    ui.close();
-                }
-            });
-        });
-        if context.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Q)) {
-            request_quit = true;
+    fn draw_sidebar_actions(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        ui.separator();
+        ui.add_space(8.0);
+        if sidebar_exit_button(ui, "Exit").clicked() {
+            self.request_quit(context);
         }
-        if request_quit {
+        ui.add_space(12.0);
+        if context.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Q)) {
             self.request_quit(context);
         }
     }
@@ -1880,11 +2203,9 @@ impl SyncPlusApp {
         } else if keep_running {
             self.quit_flow = QuitFlow::None;
             self.hide_to_tray(context);
-        } else if stop_and_quit {
-            if let QuitFlow::ConfirmActive(run_id) = self.quit_flow {
-                self.request_manual_cancel(run_id);
-                self.quit_flow = QuitFlow::Stopping(run_id);
-            }
+        } else if stop_and_quit && let QuitFlow::ConfirmActive(run_id) = self.quit_flow {
+            self.request_manual_cancel(run_id);
+            self.quit_flow = QuitFlow::Stopping(run_id);
         }
     }
 
@@ -1896,7 +2217,9 @@ impl SyncPlusApp {
             .store
             .load_missed_schedule_notice(notice_id)
             .map_err(map_storage_error)?
-            .ok_or_else(|| UiValidationError::Core(format!("missed schedule notice {notice_id} was not found")))?;
+            .ok_or_else(|| {
+                UiValidationError::Core(format!("missed schedule notice {notice_id} was not found"))
+            })?;
         if notice.decision() != MissedScheduleDecision::Pending {
             return Err(UiValidationError::Core(format!(
                 "missed schedule notice {notice_id} already has a decision"
@@ -1932,7 +2255,11 @@ impl SyncPlusApp {
     }
 
     pub fn select_run_report(&mut self, run_id: RunId) -> Result<(), UiValidationError> {
-        if self.run_reports.iter().any(|report| report.run_id() == run_id) {
+        if self
+            .run_reports
+            .iter()
+            .any(|report| report.run_id() == run_id)
+        {
             self.selected_run_report = Some(run_id);
             self.pending_report_action = None;
             self.status = format!("Viewing durable report for Sync Run {}.", run_id.value());
@@ -1992,7 +2319,10 @@ impl SyncPlusApp {
     pub fn start_new_profile(&mut self) {
         self.form = ProfileForm::default();
         self.review = None;
-        self.status = "New profile: One-Way Sync is selected and destructive actions are off.".to_owned();
+        self.view = AppView::Wizard;
+        self.wizard_step = Some(ProfileWizardStep::SyncMethod);
+        self.status =
+            "New profile: One-Way Sync is selected and destructive actions are off.".to_owned();
     }
 
     pub fn clone_profile(&mut self, id: SyncProfileId) -> Result<(), UiValidationError> {
@@ -2003,8 +2333,11 @@ impl SyncPlusApp {
             .cloned()
             .ok_or_else(|| UiValidationError::Core(format!("Sync Profile {id:?} was not found")))?;
         let source = persisted.profile();
-        let has_unattended_authorization = persisted.authorizations().allow_unattended_destructive()
-            || persisted.authorizations().allow_unattended_permanent_removal();
+        let has_unattended_authorization =
+            persisted.authorizations().allow_unattended_destructive()
+                || persisted
+                    .authorizations()
+                    .allow_unattended_permanent_removal();
         let mut form = ProfileForm::from_persisted(&persisted);
         form.id = None;
         form.profile_revision = None;
@@ -2028,7 +2361,8 @@ impl SyncPlusApp {
     }
 
     pub fn set_mode(&mut self, mode: ApplicationMode) {
-        self.settings = ApplicationSettings::new(mode, self.settings.theme());
+        self.settings = ApplicationSettings::new(mode, self.settings.theme())
+            .with_hide_to_tray_on_window_close(self.settings.hide_to_tray_on_window_close());
         if let Err(error) = self.store.save_settings(&self.settings) {
             self.status = format!("Could not save mode preference: {error}");
         } else {
@@ -2037,9 +2371,17 @@ impl SyncPlusApp {
     }
 
     pub fn set_theme(&mut self, theme: ThemePreference) {
-        self.settings = ApplicationSettings::new(self.settings.mode(), theme);
+        self.settings = ApplicationSettings::new(self.settings.mode(), theme)
+            .with_hide_to_tray_on_window_close(self.settings.hide_to_tray_on_window_close());
         if let Err(error) = self.store.save_settings(&self.settings) {
             self.status = format!("Could not save theme preference: {error}");
+        }
+    }
+
+    fn set_hide_to_tray_on_window_close(&mut self, enabled: bool) {
+        self.settings = self.settings.with_hide_to_tray_on_window_close(enabled);
+        if let Err(error) = self.store.save_settings(&self.settings) {
+            self.status = format!("Could not save window-close preference: {error}");
         }
     }
 
@@ -2074,7 +2416,8 @@ impl SyncPlusApp {
                     authorizations,
                     self.form.profile_revision.ok_or_else(|| {
                         UiValidationError::Core(
-                            "the selected profile has no revision; reload it before saving".to_owned(),
+                            "the selected profile has no revision; reload it before saving"
+                                .to_owned(),
                         )
                     })?,
                 )
@@ -2123,7 +2466,8 @@ impl SyncPlusApp {
         if has_unattended_authorization && !self.form.clone_authorization_confirmed {
             return Err(UiValidationError::CloneAuthorizationConfirmationRequired);
         }
-        if self.form.clone_authorization_choice == CloneAuthorizationChoice::CopyUnattendedDestructive
+        if self.form.clone_authorization_choice
+            == CloneAuthorizationChoice::CopyUnattendedDestructive
             && self.settings.mode() != ApplicationMode::Advanced
         {
             return Err(UiValidationError::CloneAuthorizationConfirmationRequired);
@@ -2132,18 +2476,28 @@ impl SyncPlusApp {
             == CloneAuthorizationChoice::CopyUnattendedDestructive;
         Ok(AuthorizationSnapshot::new(
             copy_destructive && source_authorizations.allow_unattended_destructive(),
-            self.form.profile_authorizations.allow_unattended_permanent_removal(),
+            self.form
+                .profile_authorizations
+                .allow_unattended_permanent_removal(),
         ))
     }
 
     fn next_clone_name(&self, source_name: &str) -> String {
         let base = format!("{source_name} copy");
-        if !self.profiles.iter().any(|profile| profile.profile().name() == base) {
+        if !self
+            .profiles
+            .iter()
+            .any(|profile| profile.profile().name() == base)
+        {
             return base;
         }
         for number in 2..=u32::MAX {
             let candidate = format!("{base} {number}");
-            if !self.profiles.iter().any(|profile| profile.profile().name() == candidate) {
+            if !self
+                .profiles
+                .iter()
+                .any(|profile| profile.profile().name() == candidate)
+            {
                 return candidate;
             }
         }
@@ -2155,26 +2509,46 @@ impl SyncPlusApp {
         syncplus_core::ProcessSpecification::from_profile(&profile)
             .map_err(|error| UiValidationError::Core(error.to_string()))?;
         for peer in [profile.peer_a(), profile.peer_b()] {
-            if let Some(ssh) = peer.ssh_peer() {
-                if let SshAuthentication::SavedPassword(reference) = ssh.authentication() {
-                    self.secret_store
-                        .load(&reference)
-                        .map(|_| ())
-                        .map_err(|error| match error {
-                            SecretStoreError::Missing | SecretStoreError::Unavailable => {
-                                UiValidationError::SavedSecretUnavailable
-                            }
-                        })?;
-                }
+            if let Some(ssh) = peer.ssh_peer()
+                && let SshAuthentication::SavedPassword(reference) = ssh.authentication()
+            {
+                self.secret_store
+                    .load(&reference)
+                    .map(|_| ())
+                    .map_err(|error| match error {
+                        SecretStoreError::Missing | SecretStoreError::Unavailable => {
+                            UiValidationError::SavedSecretUnavailable
+                        }
+                    })?;
             }
         }
         Ok(profile)
     }
 
-    pub fn analyze_profile(&mut self) -> Result<(), UiValidationError> {
-        let profile = self.validated_profile()?;
-        let precheck = match Self::fresh_local_precheck(&profile) {
-            Ok(result) => result,
+    fn analyze_profile_snapshot(profile: SyncProfile) -> ProfileAnalysisResult {
+        let precheck = Self::fresh_local_precheck(&profile);
+        let analysis = match &precheck {
+            Ok(_) => Some(FreshAnalysis::analyze(&profile).map_err(|error| error.to_string())),
+            Err(_) => None,
+        };
+        ProfileAnalysisResult {
+            profile,
+            precheck,
+            analysis,
+        }
+    }
+
+    fn apply_analysis_result(
+        &mut self,
+        result: ProfileAnalysisResult,
+    ) -> Result<(), UiValidationError> {
+        let ProfileAnalysisResult {
+            profile,
+            precheck,
+            analysis,
+        } = result;
+        let precheck = match precheck {
+            Ok(precheck) => precheck,
             Err(message) => {
                 self.store_review_failure(profile, None, message.clone());
                 self.status = format!("Fresh precheck could not complete: {message}");
@@ -2183,11 +2557,10 @@ impl SyncPlusApp {
         };
 
         if !precheck.can_execute() {
-            let analysis = FreshAnalysis::analyze(&profile).ok();
+            let analysis = analysis.and_then(Result::ok);
             let conflicts = analysis.as_ref().and_then(|analysis| {
-                (profile.mode() == SyncMode::Mirror).then(|| {
-                    ConflictReviewState::from_analysis(analysis)
-                })
+                (profile.mode() == SyncMode::Mirror)
+                    .then(|| ConflictReviewState::from_analysis(analysis))
             });
             self.review = Some(PlanReviewState {
                 profile,
@@ -2202,12 +2575,17 @@ impl SyncPlusApp {
             return Err(UiValidationError::PrecheckBlocked);
         }
 
-        let analysis = match FreshAnalysis::analyze(&profile) {
-            Ok(analysis) => analysis,
-            Err(error) => {
-                let message = error.to_string();
+        let analysis = match analysis {
+            Some(Ok(analysis)) => analysis,
+            Some(Err(message)) => {
                 self.store_review_failure(profile, Some(precheck), message.clone());
                 self.status = format!("Fresh Analysis could not complete: {message}");
+                return Err(UiValidationError::Analysis(message));
+            }
+            None => {
+                let message = "Fresh Analysis did not return a result.".to_owned();
+                self.store_review_failure(profile, Some(precheck), message.clone());
+                self.status = message.clone();
                 return Err(UiValidationError::Analysis(message));
             }
         };
@@ -2223,8 +2601,68 @@ impl SyncPlusApp {
             stronger_confirmation_path: String::new(),
             confirmed: false,
         });
-        self.status = "Fresh Analysis ready. Review the plan and consequences before confirmation.".to_owned();
+        self.status = "Fresh Analysis ready. Review the plan and consequences before confirmation."
+            .to_owned();
         Ok(())
+    }
+
+    fn start_analysis(&mut self, context: &egui::Context) -> Result<(), UiValidationError> {
+        if self.active_analysis.is_some() {
+            return Err(UiValidationError::Core(
+                "Fresh Analysis is already running.".to_owned(),
+            ));
+        }
+        let profile = self.validated_profile()?;
+        let profile_name = profile.name().to_owned();
+        let (sender, receiver) = mpsc::channel();
+        let repaint_context = context.clone();
+        thread::Builder::new()
+            .name("syncplus-fresh-analysis".to_owned())
+            .spawn(move || {
+                let result = SyncPlusApp::analyze_profile_snapshot(profile);
+                let _ = sender.send(AnalysisCompletion { result });
+                repaint_context.request_repaint();
+            })
+            .map_err(|error| {
+                UiValidationError::Core(format!("could not start Fresh Analysis: {error}"))
+            })?;
+        self.clear_review();
+        self.active_analysis = Some(ActiveAnalysis { receiver });
+        self.status =
+            format!("Fresh Analysis is running for {profile_name}. No files are being changed.");
+        Ok(())
+    }
+
+    fn poll_analysis(&mut self) {
+        let completion = {
+            let Some(active) = self.active_analysis.as_ref() else {
+                return;
+            };
+            match active.receiver.try_recv() {
+                Ok(completion) => completion,
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.active_analysis = None;
+                    self.status = "Fresh Analysis stopped before returning a result. Run it again."
+                        .to_owned();
+                    return;
+                }
+            }
+        };
+        self.active_analysis = None;
+
+        let current_profile = self.form.build().ok();
+        if current_profile.as_ref() != Some(&completion.result.profile) {
+            self.status = "Fresh Analysis finished for an older profile state; run it again to review the current fields.".to_owned();
+            return;
+        }
+        let _ = self.apply_analysis_result(completion.result);
+    }
+
+    pub fn analyze_profile(&mut self) -> Result<(), UiValidationError> {
+        let profile = self.validated_profile()?;
+        let result = Self::analyze_profile_snapshot(profile);
+        self.apply_analysis_result(result)
     }
 
     pub fn conflict_entries(&self) -> Option<&[ConflictEntry]> {
@@ -2234,7 +2672,10 @@ impl SyncPlusApp {
             .map(|conflicts| conflicts.review.entries())
     }
 
-    pub fn conflict_resolution(&self, relative_path: impl Into<PathBuf>) -> Option<ConflictResolution> {
+    pub fn conflict_resolution(
+        &self,
+        relative_path: impl Into<PathBuf>,
+    ) -> Option<ConflictResolution> {
         let relative_path = relative_path.into();
         let review = self.review.as_ref()?;
         let conflicts = review.conflicts.as_ref()?;
@@ -2249,10 +2690,7 @@ impl SyncPlusApp {
             .flatten()
     }
 
-    pub fn conflict_entry_resolution(
-        &self,
-        key: &ConflictEntryKey,
-    ) -> Option<ConflictResolution> {
+    pub fn conflict_entry_resolution(&self, key: &ConflictEntryKey) -> Option<ConflictResolution> {
         self.review
             .as_ref()
             .and_then(|review| review.conflicts.as_ref())
@@ -2279,9 +2717,12 @@ impl SyncPlusApp {
                 .entries()
                 .iter()
                 .filter(|entry| entry.relative_path() == relative_path);
-            let entry = entries
-                .next()
-                .ok_or_else(|| UiValidationError::Resolution(format!("no reviewed conflict exists for {}", relative_path.display())))?;
+            let entry = entries.next().ok_or_else(|| {
+                UiValidationError::Resolution(format!(
+                    "no reviewed conflict exists for {}",
+                    relative_path.display()
+                ))
+            })?;
             if entries.next().is_some() {
                 return Err(UiValidationError::Resolution(format!(
                     "multiple reviewed conflicts use {}; select the typed conflict row",
@@ -2345,7 +2786,8 @@ impl SyncPlusApp {
                 review.confirmed = false;
                 review.error = Some("fresh precheck found blockers".to_owned());
             }
-            self.status = "Fresh precheck found blockers; Resolution Run remains unavailable.".to_owned();
+            self.status =
+                "Fresh precheck found blockers; Resolution Run remains unavailable.".to_owned();
             return Err(UiValidationError::PrecheckBlocked);
         }
         let (reviewed_profile, reviewed_analysis, decisions) = {
@@ -2362,7 +2804,8 @@ impl SyncPlusApp {
             }
             if review.profile != current_profile {
                 return Err(UiValidationError::Resolution(
-                    "the profile changed; run Fresh Analysis again before reviewing conflicts".to_owned(),
+                    "the profile changed; run Fresh Analysis again before reviewing conflicts"
+                        .to_owned(),
                 ));
             }
             if !conflicts.has_all_decisions() {
@@ -2372,9 +2815,7 @@ impl SyncPlusApp {
                 .review
                 .entries()
                 .iter()
-                .map(|entry| {
-                    ConflictDecision::for_entry(entry, conflicts.decisions[&entry.key()])
-                })
+                .map(|entry| ConflictDecision::for_entry(entry, conflicts.decisions[&entry.key()]))
                 .collect::<Vec<_>>();
             let reviewed_analysis = review
                 .analysis
@@ -2392,11 +2833,11 @@ impl SyncPlusApp {
             let message = format!(
                 "the reviewed conflict state changed for {changed_paths:?}; run Fresh Analysis again"
             );
-            if let Some(review) = self.review.as_mut() {
-                if let Some(conflicts) = review.conflicts.as_mut() {
-                    conflicts.confirmed = false;
-                    conflicts.error = Some(message.clone());
-                }
+            if let Some(review) = self.review.as_mut()
+                && let Some(conflicts) = review.conflicts.as_mut()
+            {
+                conflicts.confirmed = false;
+                conflicts.error = Some(message.clone());
             }
             self.status = format!("Resolution Run was not started: {message}");
             return Err(UiValidationError::Resolution(message));
@@ -2432,7 +2873,9 @@ impl SyncPlusApp {
                     conflicts.error = Some("fresh precheck found blockers".to_owned());
                 }
             }
-            self.status = "Fresh precheck found blockers; Resolution Run confirmation remains unavailable.".to_owned();
+            self.status =
+                "Fresh precheck found blockers; Resolution Run confirmation remains unavailable."
+                    .to_owned();
             return Err(UiValidationError::PrecheckBlocked);
         }
         let resolution_run = self
@@ -2448,19 +2891,19 @@ impl SyncPlusApp {
         resolution_run
             .prepare(&current_profile, None, true)
             .map_err(|error| {
-                if let Some(review) = self.review.as_mut() {
-                    if let Some(conflicts) = review.conflicts.as_mut() {
-                        conflicts.confirmed = false;
-                        conflicts.error = Some(error.to_string());
-                    }
+                if let Some(review) = self.review.as_mut()
+                    && let Some(conflicts) = review.conflicts.as_mut()
+                {
+                    conflicts.confirmed = false;
+                    conflicts.error = Some(error.to_string());
                 }
                 UiValidationError::Resolution(error.to_string())
             })?;
-        if let Some(review) = self.review.as_mut() {
-            if let Some(conflicts) = review.conflicts.as_mut() {
-                conflicts.confirmed = true;
-                conflicts.error = None;
-            }
+        if let Some(review) = self.review.as_mut()
+            && let Some(conflicts) = review.conflicts.as_mut()
+        {
+            conflicts.confirmed = true;
+            conflicts.error = None;
         }
         self.status = "Resolution Run confirmation recorded for this exact reviewed scope; no filesystem mutation has started.".to_owned();
         Ok(())
@@ -2498,7 +2941,8 @@ impl SyncPlusApp {
             review.error = None;
         }
         if !precheck.can_execute() {
-            self.status = "Fresh precheck found blockers; execution remains unavailable.".to_owned();
+            self.status =
+                "Fresh precheck found blockers; execution remains unavailable.".to_owned();
             return Err(UiValidationError::PrecheckBlocked);
         }
 
@@ -2508,7 +2952,8 @@ impl SyncPlusApp {
             .and_then(|review| review.analysis.as_ref())
             .is_some_and(analysis_has_unresolved_items);
         if unresolved {
-            self.status = "Unresolved or unsupported items remain; execution is unavailable.".to_owned();
+            self.status =
+                "Unresolved or unsupported items remain; execution is unavailable.".to_owned();
             return Err(UiValidationError::UnresolvedItems);
         }
 
@@ -2577,11 +3022,63 @@ impl SyncPlusApp {
         self.review = None;
     }
 
+    fn wizard_step_validation(&self, step: ProfileWizardStep) -> Result<(), UiValidationError> {
+        match step {
+            ProfileWizardStep::SyncMethod => {
+                if self.form.name.trim().is_empty() {
+                    return Err(UiValidationError::EmptyProfileName);
+                }
+            }
+            ProfileWizardStep::SourceEndpoint => {
+                self.form.peer_a.build("Source")?;
+            }
+            ProfileWizardStep::DestinationEndpoint => {
+                self.form.peer_b.build("Destination")?;
+            }
+            ProfileWizardStep::ReviewAndSave => {
+                let profile = self.form.build()?;
+                let authorizations = self.validate_clone(&profile)?;
+                if self.settings.mode() == ApplicationMode::Advanced && self.form.schedule_enabled {
+                    self.form.build_schedule()?;
+                }
+                if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
+                    && self.settings.mode() != ApplicationMode::Advanced
+                {
+                    return Err(UiValidationError::PermanentRemovalRequiresAdvanced);
+                }
+                if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
+                    && !authorizations.allow_unattended_permanent_removal()
+                {
+                    return Err(UiValidationError::PermanentRemovalAuthorizationRequired);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_wizard_step(&mut self, step: ProfileWizardStep) -> Result<(), UiValidationError> {
+        self.wizard_step_validation(step)?;
+        if let Some(next) = step.next() {
+            self.wizard_step = Some(next);
+            self.clear_review();
+        }
+        Ok(())
+    }
+
+    fn retreat_wizard_step(&mut self, step: ProfileWizardStep) {
+        if let Some(previous) = step.previous() {
+            self.wizard_step = Some(previous);
+            self.clear_review();
+        }
+    }
+
     fn select_profile(&mut self, id: SyncProfileId) {
         if let Some(profile) = self.profiles.iter().find(|profile| profile.id() == id) {
             self.form = ProfileForm::from_persisted(profile);
             self.review = None;
-            self.status = format!("Editing {}. Changes apply to future runs.", profile.profile().name());
+            let name = profile.profile().name().to_owned();
+            self.show_sync_workspace();
+            self.status = format!("Editing {name}. Changes apply to future runs.");
         }
     }
 
@@ -2592,84 +3089,1493 @@ impl SyncPlusApp {
             ThemePreference::Dark => egui::ThemePreference::Dark,
         };
         context.set_theme(preference);
+        context.all_styles_mut(|style| {
+            let palette = ui_palette_for_dark_mode(style.visuals.dark_mode);
+            style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+            style.spacing.button_padding = egui::vec2(14.0, 8.0);
+            style.spacing.interact_size = egui::vec2(44.0, 36.0);
+            style.visuals.button_frame = true;
+            style.visuals.override_text_color = Some(palette.text);
+            style.visuals.weak_text_color = Some(palette.muted);
+            style.visuals.selection.bg_fill = palette.accent_soft;
+            style.visuals.selection.stroke = egui::Stroke::new(1.0, palette.accent);
+            style.visuals.hyperlink_color = palette.secondary;
+            style.visuals.warn_fg_color = palette.amber;
+            style.visuals.error_fg_color = palette.hot;
+            style.visuals.faint_bg_color = palette.elevated;
+            style.visuals.panel_fill = palette.canvas;
+            style.visuals.window_fill = palette.surface;
+            style.visuals.extreme_bg_color = palette.field;
+            style.visuals.text_edit_bg_color = Some(palette.field);
+            style.visuals.window_corner_radius = egui::CornerRadius::same(14);
+            style.visuals.menu_corner_radius = egui::CornerRadius::same(10);
+            style.visuals.widgets.noninteractive.bg_fill = palette.surface;
+            style.visuals.widgets.noninteractive.bg_stroke =
+                egui::Stroke::new(1.0, palette.border_subtle);
+            style.visuals.widgets.inactive.bg_fill = palette.elevated;
+            style.visuals.widgets.inactive.weak_bg_fill = palette.elevated;
+            style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette.border);
+            style.visuals.widgets.hovered.bg_fill = palette.accent_soft;
+            style.visuals.widgets.hovered.weak_bg_fill = palette.accent_soft;
+            style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, palette.hot);
+            style.visuals.widgets.active.bg_fill = palette.accent_soft;
+            style.visuals.widgets.active.weak_bg_fill = palette.accent_soft;
+            style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, palette.accent);
+            style.visuals.widgets.open.bg_fill = palette.accent_soft;
+            style.visuals.widgets.open.weak_bg_fill = palette.accent_soft;
+            style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, palette.accent);
+            style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
+            style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
+            style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
+            style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
+            style.visuals.widgets.open.corner_radius = egui::CornerRadius::same(8);
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Heading, egui::FontId::proportional(20.0));
+        });
     }
 
-    fn draw_settings(&mut self, ui: &mut egui::Ui) {
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
+        let palette = ui_palette(ui);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label("Mode:");
-            if ui
-                .radio(self.settings.mode() == ApplicationMode::Simple, "Simple")
-                .clicked()
-            {
-                self.set_mode(ApplicationMode::Simple);
-            }
-            if ui
-                .radio(self.settings.mode() == ApplicationMode::Advanced, "Advanced")
-                .clicked()
-            {
-                self.set_mode(ApplicationMode::Advanced);
-            }
-            ui.separator();
-            ui.label("Theme:");
-            for (theme, label) in [
-                (ThemePreference::System, "System"),
-                (ThemePreference::Light, "Light"),
-                (ThemePreference::Dark, "Dark"),
-            ] {
-                if ui.radio(self.settings.theme() == theme, label).clicked() {
-                    self.set_theme(theme);
+            Self::draw_brand_mark_sized(ui, 34.0);
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("SyncPlus").strong().size(17.0));
+                ui.label(
+                    egui::RichText::new("SAFETY-FIRST FILE SYNC")
+                        .small()
+                        .color(palette.muted),
+                );
+            });
+        });
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(14.0);
+        for (label, selected, action, icon, icon_color) in [
+            (
+                "Overview",
+                self.view == AppView::Welcome,
+                0,
+                SidebarIcon::Overview,
+                palette.accent,
+            ),
+            (
+                "Profiles",
+                self.view == AppView::Profiles,
+                1,
+                SidebarIcon::Profiles,
+                palette.secondary,
+            ),
+            (
+                "Sync workspace",
+                matches!(self.view, AppView::Sync | AppView::Wizard),
+                2,
+                SidebarIcon::SyncWorkspace,
+                palette.hot,
+            ),
+            (
+                "Run Reports",
+                self.view == AppView::Reports && self.help_topic != HelpTopic::Recovery,
+                3,
+                SidebarIcon::Reports,
+                palette.amber,
+            ),
+            (
+                "Recovery Review",
+                self.view == AppView::Reports && self.help_topic == HelpTopic::Recovery,
+                4,
+                SidebarIcon::Recovery,
+                palette.danger,
+            ),
+            (
+                "Help & Support",
+                self.view == AppView::Help,
+                5,
+                SidebarIcon::Help,
+                palette.muted,
+            ),
+        ] {
+            if sidebar_nav_button(ui, label, selected, icon, icon_color).clicked() {
+                match action {
+                    0 => self.show_welcome(),
+                    1 => self.show_profiles(),
+                    2 => self.open_sync_workspace(),
+                    3 => self.show_reports(),
+                    4 => {
+                        self.show_reports();
+                        self.help_topic = HelpTopic::Recovery;
+                    }
+                    5 => self.show_help(self.help_topic),
+                    _ => unreachable!(),
                 }
+            }
+        }
+    }
+
+    fn draw_profiles_page(&mut self, ui: &mut egui::Ui) {
+        let mut create_profile = false;
+        let mut open_profile = None;
+        let palette = ui_palette(ui);
+        let profile_entries = self
+            .profiles
+            .iter()
+            .map(|profile| {
+                let persisted = profile.profile();
+                let source = EndpointForm::from_peer(persisted.peer_a());
+                let destination = EndpointForm::from_peer(persisted.peer_b());
+                (
+                    profile.id(),
+                    persisted.name().to_owned(),
+                    sync_mode_label(persisted.mode()),
+                    endpoint_summary(&source),
+                    endpoint_summary(&destination),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        egui::ScrollArea::vertical()
+            .id_salt("profiles-content")
+            .show(ui, |ui| {
+                let available_width = ui.available_width();
+                let content_width = available_width.min(1040.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(((available_width - content_width) / 2.0).max(0.0));
+                    ui.vertical(|ui| {
+                        ui.set_width(content_width);
+                        ui.add_space(28.0);
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                section_intro(
+                                    ui,
+                                    "Workspace",
+                                    "Profiles",
+                                    "Choose a saved Sync Profile to continue where you left off.",
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Min),
+                                |ui| {
+                                    if primary_button(ui, "New Sync Profile").clicked() {
+                                        create_profile = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(20.0);
+
+                        if profile_entries.is_empty() {
+                            card_frame(ui).show(ui, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    Self::draw_brand_mark_sized(ui, 54.0);
+                                    ui.add_space(10.0);
+                                    ui.heading("No Sync Profiles yet");
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Create a named profile to define its sync method, source, destination, and safety settings.",
+                                        )
+                                        .color(palette.muted),
+                                    );
+                                    ui.add_space(14.0);
+                                    if primary_button(ui, "Create your first profile").clicked() {
+                                        create_profile = true;
+                                    }
+                                });
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} saved {}",
+                                        profile_entries.len(),
+                                        if profile_entries.len() == 1 {
+                                            "profile"
+                                        } else {
+                                            "profiles"
+                                        }
+                                    ))
+                                    .small()
+                                    .strong()
+                                    .color(palette.accent),
+                                );
+                                ui.label(
+                                    egui::RichText::new("Select one to open its Sync workspace.")
+                                        .small()
+                                        .color(palette.muted),
+                                );
+                            });
+                            ui.add_space(8.0);
+                            for (id, name, mode, source, destination) in profile_entries {
+                                let selected = self.form.id == Some(id);
+                                card_frame(ui).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.horizontal(|ui| {
+                                                status_dot(
+                                                    ui,
+                                                    if selected {
+                                                        palette.accent
+                                                    } else {
+                                                        palette.secondary
+                                                    },
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(&name)
+                                                        .size(17.0)
+                                                        .strong(),
+                                                );
+                                                if selected {
+                                                    status_badge(ui, "Active", true);
+                                                }
+                                            });
+                                            ui.label(
+                                                egui::RichText::new(mode)
+                                                    .small()
+                                                    .color(palette.muted),
+                                            );
+                                            ui.add_space(8.0);
+                                            ui.columns(2, |columns| {
+                                                columns[0].vertical(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("SOURCE")
+                                                            .small()
+                                                            .strong()
+                                                            .color(palette.accent),
+                                                    );
+                                                    ui.label(egui::RichText::new(source).monospace());
+                                                });
+                                                columns[1].vertical(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("DESTINATION")
+                                                            .small()
+                                                            .strong()
+                                                            .color(palette.secondary),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(destination).monospace(),
+                                                    );
+                                                });
+                                            });
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if secondary_button(ui, "Open workspace").clicked() {
+                                                    open_profile = Some(id);
+                                                }
+                                            },
+                                        );
+                                    });
+                                });
+                            }
+                        }
+
+                        ui.add_space(16.0);
+                        egui::Frame::new()
+                            .fill(palette.field)
+                            .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+                            .corner_radius(egui::CornerRadius::same(12))
+                            .inner_margin(egui::Margin::symmetric(16, 13))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    status_dot(ui, palette.accent);
+                                    ui.label(egui::RichText::new("Safe by default").strong());
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Selecting a profile only opens its configuration; every run still requires Fresh Analysis, precheck, and explicit confirmation.",
+                                        )
+                                        .color(palette.muted),
+                                    );
+                                });
+                            });
+                        ui.add_space(20.0);
+                    });
+                });
+            });
+
+        if create_profile {
+            self.start_new_profile();
+        } else if let Some(id) = open_profile {
+            self.select_profile(id);
+        }
+    }
+
+    fn draw_settings_page(&mut self, ui: &mut egui::Ui) {
+        let mut mode_change = None;
+        let mut theme_change = None;
+        let mut tray_change = None;
+        let palette = ui_palette(ui);
+
+        egui::ScrollArea::vertical()
+            .id_salt("settings-content")
+            .show(ui, |ui| {
+                let available_width = ui.available_width();
+                let content_width = available_width.min(900.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(((available_width - content_width) / 2.0).max(0.0));
+                    ui.vertical(|ui| {
+                        ui.set_width(content_width);
+                        ui.add_space(28.0);
+                        section_intro(
+                            ui,
+                            "Preferences",
+                            "Settings",
+                            "Control how SyncPlus presents the workflow. Safety gates remain enforced in every mode.",
+                        );
+                        ui.add_space(20.0);
+
+                        card_frame(ui).show(ui, |ui| {
+                            ui.heading("Workflow mode");
+                            ui.label(
+                                egui::RichText::new(
+                                    "Simple Mode keeps the safe path visible. Advanced Mode reveals additional reviewed controls; it never bypasses prechecks or confirmation.",
+                                )
+                                .color(palette.muted),
+                            );
+                            ui.add_space(12.0);
+                            ui.columns(2, |columns| {
+                                for (column, mode, title, description) in [
+                                    (
+                                        0,
+                                        ApplicationMode::Simple,
+                                        "Simple",
+                                        "Recommended for ordinary, non-destructive syncs.",
+                                    ),
+                                    (
+                                        1,
+                                        ApplicationMode::Advanced,
+                                        "Advanced",
+                                        "Shows reviewed options such as scheduling and recovery choices.",
+                                    ),
+                                ] {
+                                    let selected = self.settings.mode() == mode;
+                                    let width = columns[column].available_width();
+                                    columns[column].vertical(|ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new(title)
+                                                        .strong()
+                                                        .color(if selected {
+                                                            palette.text
+                                                        } else {
+                                                            palette.muted
+                                                        }),
+                                                )
+                                                .fill(if selected {
+                                                    palette.accent_soft
+                                                } else {
+                                                    palette.elevated
+                                                })
+                                                .stroke(egui::Stroke::new(
+                                                    1.0,
+                                                    if selected {
+                                                        palette.accent
+                                                    } else {
+                                                        palette.border_subtle
+                                                    },
+                                                ))
+                                                .corner_radius(egui::CornerRadius::same(9))
+                                                .min_size(egui::vec2(width, 44.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            mode_change = Some(mode);
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(description)
+                                                .small()
+                                                .color(palette.muted),
+                                        );
+                                    });
+                                }
+                            });
+                        });
+
+                        ui.add_space(12.0);
+                        card_frame(ui).show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            ui.heading("Window behavior");
+                            ui.label(
+                                egui::RichText::new(
+                                    "Choose what the window close control does. The sidebar Exit button always quits SyncPlus.",
+                                )
+                                .color(palette.muted),
+                            );
+                            ui.add_space(10.0);
+                            let mut hide_to_tray = self.settings.hide_to_tray_on_window_close();
+                            if ui
+                                .checkbox(
+                                    &mut hide_to_tray,
+                                    "Hide to system tray when the window is closed",
+                                )
+                                .changed()
+                            {
+                                tray_change = Some(hide_to_tray);
+                            }
+                            ui.label(
+                                egui::RichText::new(if hide_to_tray {
+                                    "Window close hides SyncPlus and leaves scheduled work running in the background."
+                                } else {
+                                    "Window close exits SyncPlus when no run is active; an active run still requires a quit decision."
+                                })
+                                .small()
+                                .color(palette.muted),
+                            );
+                        });
+
+                        ui.add_space(12.0);
+                        card_frame(ui).show(ui, |ui| {
+                            ui.heading("Appearance");
+                            ui.label(
+                                egui::RichText::new(
+                                    "Choose the canvas treatment that best suits your environment. Changes apply immediately and are remembered.",
+                                )
+                                .color(palette.muted),
+                            );
+                            ui.add_space(12.0);
+                            ui.columns(3, |columns| {
+                                for (column, theme, title, description) in [
+                                    (0, ThemePreference::System, "System", "Follow the desktop theme."),
+                                    (1, ThemePreference::Light, "Light", "Use a bright canvas."),
+                                    (2, ThemePreference::Dark, "Dark", "Use the dark canvas."),
+                                ] {
+                                    let selected = self.settings.theme() == theme;
+                                    let width = columns[column].available_width();
+                                    columns[column].vertical(|ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new(title)
+                                                        .strong()
+                                                        .color(if selected {
+                                                            palette.text
+                                                        } else {
+                                                            palette.muted
+                                                        }),
+                                                )
+                                                .fill(if selected {
+                                                    palette.accent_soft
+                                                } else {
+                                                    palette.elevated
+                                                })
+                                                .stroke(egui::Stroke::new(
+                                                    1.0,
+                                                    if selected {
+                                                        palette.accent
+                                                    } else {
+                                                        palette.border_subtle
+                                                    },
+                                                ))
+                                                .corner_radius(egui::CornerRadius::same(9))
+                                                .min_size(egui::vec2(width, 44.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            theme_change = Some(theme);
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(description)
+                                                .small()
+                                                .color(palette.muted),
+                                        );
+                                    });
+                                }
+                            });
+                        });
+
+                        ui.add_space(12.0);
+                        card_frame(ui).show(ui, |ui| {
+                            ui.heading("Safety guarantees");
+                            ui.label(
+                                egui::RichText::new(
+                                    "These protections are deliberately enforced rather than optional toggles. They keep the product predictable when data is unavailable, changed, or ambiguous.",
+                                )
+                                .color(palette.muted),
+                            );
+                            ui.add_space(12.0);
+                            for (title, description, color) in [
+                                (
+                                    "Fresh Analysis before every run",
+                                    "The current filesystem state is reviewed before a plan can be confirmed.",
+                                    palette.accent,
+                                ),
+                                (
+                                    "Explicit confirmation before mutation",
+                                    "No copy, overwrite, or removal begins from navigation or a stale plan.",
+                                    palette.secondary,
+                                ),
+                                (
+                                    "Preserve data when verification is uncertain",
+                                    "Failures and unexplained changes stay open for Recovery Review.",
+                                    palette.amber,
+                                ),
+                            ] {
+                                inset_frame(ui).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        status_dot(ui, color);
+                                        ui.vertical(|ui| {
+                                            ui.label(egui::RichText::new(title).strong());
+                                            ui.label(
+                                                egui::RichText::new(description)
+                                                    .small()
+                                                    .color(palette.muted),
+                                            );
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| status_badge(ui, "Enforced", true),
+                                        );
+                                    });
+                                });
+                            }
+                        });
+                        ui.add_space(20.0);
+                    });
+                });
+            });
+
+        if let Some(mode) = mode_change {
+            self.set_mode(mode);
+        }
+        if let Some(theme) = theme_change {
+            self.set_theme(theme);
+        }
+        if let Some(enabled) = tray_change {
+            self.set_hide_to_tray_on_window_close(enabled);
+        }
+    }
+
+    fn draw_brand_mark_sized(ui: &mut egui::Ui, size: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+        let painter = ui.painter();
+        let palette = ui_palette(ui);
+        let radius = (size * 0.22).round().clamp(6.0, 20.0) as u8;
+        painter.rect_filled(
+            rect,
+            egui::CornerRadius::same(radius),
+            palette.logo_background,
+        );
+        let margin = size * 0.2;
+        let left = rect.left() + margin;
+        let right = rect.right() - margin;
+        let upper = rect.center().y - size * 0.13;
+        let lower = rect.center().y + size * 0.13;
+        let stroke = (size * 0.055).max(2.0);
+        painter.line_segment(
+            [
+                egui::pos2(left, upper),
+                egui::pos2(right - size * 0.045, upper),
+            ],
+            egui::Stroke::new(stroke, palette.accent),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(right - size * 0.045, upper),
+                egui::pos2(right - size * 0.155, upper - size * 0.09),
+            ],
+            egui::Stroke::new(stroke, palette.accent),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(right - size * 0.045, upper),
+                egui::pos2(right - size * 0.155, upper + size * 0.09),
+            ],
+            egui::Stroke::new(stroke, palette.accent),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(right, lower),
+                egui::pos2(left + size * 0.045, lower),
+            ],
+            egui::Stroke::new(stroke, palette.hot),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(left + size * 0.045, lower),
+                egui::pos2(left + size * 0.155, lower - size * 0.09),
+            ],
+            egui::Stroke::new(stroke, palette.hot),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(left + size * 0.045, lower),
+                egui::pos2(left + size * 0.155, lower + size * 0.09),
+            ],
+            egui::Stroke::new(stroke, palette.hot),
+        );
+    }
+
+    fn draw_empty_welcome(&mut self, ui: &mut egui::Ui) {
+        let mut open_wizard = false;
+        let mut open_help = false;
+        let mut open_settings = false;
+        let palette = ui_palette(ui);
+        egui::ScrollArea::vertical()
+            .id_salt("empty-welcome-content")
+            .show(ui, |ui| {
+                let available_width = ui.available_width();
+                let content_width = available_width.min(1180.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(((available_width - content_width) / 2.0).max(0.0));
+                    ui.vertical(|ui| {
+                        ui.set_width(content_width);
+                        ui.add_space(28.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("WELCOME TO SYNCPLUS")
+                                    .small()
+                                    .strong()
+                                    .color(palette.accent),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    active_mode_badge(ui, self.settings.mode());
+                                    ui.add_space(8.0);
+                                    if ui.link("Change mode in Settings").clicked() {
+                                        open_settings = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(8.0);
+                        egui::Frame::new()
+                            .fill(palette.surface)
+                            .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+                            .corner_radius(egui::CornerRadius::same(18))
+                            .inner_margin(egui::Margin::symmetric(26, 24))
+                            .shadow(if ui.visuals().dark_mode {
+                                egui::Shadow {
+                                    offset: [0, 8],
+                                    blur: 22,
+                                    spread: 1,
+                                    color: egui::Color32::from_black_alpha(90),
+                                }
+                            } else {
+                                egui::Shadow {
+                                    offset: [0, 5],
+                                    blur: 14,
+                                    spread: 0,
+                                    color: egui::Color32::from_black_alpha(22),
+                                }
+                            })
+                            .show(ui, |ui| {
+                                ui.columns(2, |columns| {
+                                    columns[0].vertical(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("SAFE FILE SYNCHRONIZATION")
+                                                .small()
+                                                .strong()
+                                                .color(palette.secondary),
+                                        );
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            egui::RichText::new("A calmer way to\nmove your files.")
+                                                .size(38.0)
+                                                .strong(),
+                                        );
+                                        ui.add_space(10.0);
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Define the path, review the plan, and confirm only what you understand. Nothing changes until you say so.",
+                                            )
+                                            .size(16.0)
+                                            .color(palette.muted),
+                                        );
+                                        ui.add_space(20.0);
+                                        ui.horizontal(|ui| {
+                                            if primary_button(ui, "Create your first profile").clicked() {
+                                                open_wizard = true;
+                                            }
+                                            if secondary_button(ui, "See how it works").clicked() {
+                                                open_help = true;
+                                            }
+                                        });
+                                    });
+                                    columns[1].vertical_centered(|ui| {
+                                        sync_illustration(ui, palette);
+                                    });
+                                });
+                            });
+
+                        ui.add_space(24.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("YOUR FIRST SYNC").small().strong().color(palette.accent));
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new("Three deliberate steps. Nothing runs before review.").color(palette.muted));
+                        });
+                        ui.add_space(10.0);
+                        ui.columns(3, |columns| {
+                            for (index, (title, description, color)) in [
+                                ("Choose a method", "Start with safe, source-authoritative One-Way Sync.", palette.accent),
+                                ("Set two endpoints", "Select the source and destination with visible labels.", palette.secondary),
+                                ("Review and sync", "Fresh Analysis and confirmation happen before mutation.", palette.amber),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                egui::Frame::new()
+                                    .fill(palette.elevated)
+                                    .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+                                    .corner_radius(egui::CornerRadius::same(12))
+                                    .inner_margin(egui::Margin::symmetric(16, 15))
+                                    .show(&mut columns[index], |ui| {
+                                        ui.horizontal(|ui| {
+                                            egui::Frame::new()
+                                                .fill(palette.field)
+                                                .stroke(egui::Stroke::new(1.0, color))
+                                                .corner_radius(egui::CornerRadius::same(8))
+                                                .inner_margin(egui::Margin::symmetric(9, 6))
+                                                .show(ui, |ui| {
+                                                    ui.label(egui::RichText::new(format!("0{}", index + 1)).strong().color(color));
+                                                });
+                                            ui.label(egui::RichText::new(title).strong());
+                                        });
+                                        ui.add_space(10.0);
+                                        ui.label(egui::RichText::new(description).color(palette.muted));
+                                    });
+                            }
+                        });
+
+                        ui.add_space(18.0);
+                        egui::Frame::new()
+                            .fill(palette.field)
+                            .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+                            .corner_radius(egui::CornerRadius::same(12))
+                            .inner_margin(egui::Margin::symmetric(16, 13))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    status_dot(ui, palette.accent);
+                                    ui.label(egui::RichText::new("Safe by default").strong());
+                                    ui.label(egui::RichText::new("Simple Mode starts non-destructive, keeps both endpoints visible, and explains the next safe action.").color(palette.muted));
+                                });
+                            });
+                        ui.add_space(20.0);
+                    });
+                });
+            });
+        if open_wizard {
+            self.start_new_profile();
+        } else if open_help {
+            self.show_help(HelpTopic::Modes);
+        } else if open_settings {
+            self.show_settings();
+        }
+    }
+
+    fn draw_welcome(&mut self, ui: &mut egui::Ui) {
+        let mut create_profile = false;
+        let mut open_sync = false;
+        let mut request_sync = false;
+        let mut open_settings = false;
+        let has_profile = self.form.id.is_some();
+        if !has_profile {
+            self.draw_empty_welcome(ui);
+            return;
+        }
+        let source = endpoint_summary(&self.form.peer_a);
+        let destination = endpoint_summary(&self.form.peer_b);
+        let mode = sync_mode_label(self.form.mode);
+        let report_count = self.run_reports.len();
+        egui::ScrollArea::vertical()
+            .id_salt("welcome-content")
+            .show(ui, |ui| {
+                ui.add_space(28.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(if has_profile {
+                            "OVERVIEW · ACTIVE PROFILE"
+                        } else {
+                            "OVERVIEW · START HERE"
+                        }).small().strong().color(ui_palette(ui).accent));
+                        ui.label(egui::RichText::new("Your files,").size(46.0).strong());
+                        ui.label(egui::RichText::new("in rhythm.").size(46.0).strong().color(ui_palette(ui).accent));
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(
+                            "A clear, reviewable path between your folders. SyncPlus keeps the important decision visible before work begins.",
+                        ).size(17.0).color(ui_palette(ui).muted));
+                    });
+                    ui.add_space(20.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        active_mode_badge(ui, self.settings.mode());
+                        ui.add_space(8.0);
+                        if ui.link("Change mode in Settings").clicked() {
+                            open_settings = true;
+                        }
+                        ui.add_space(12.0);
+                        if has_profile {
+                            if primary_button(ui, "Synchronise").clicked() {
+                                request_sync = true;
+                            }
+                            if secondary_button(ui, "Edit profile").clicked() {
+                                open_sync = true;
+                            }
+                        } else if primary_button(ui, "Create a Sync Profile").clicked() {
+                            create_profile = true;
+                        }
+                    });
+                });
+                ui.add_space(24.0);
+                neon_gradient(ui, ui.available_width(), 3.0);
+                ui.add_space(20.0);
+
+                card_frame(ui).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.heading("Sync path");
+                            ui.label(egui::RichText::new(if has_profile {
+                                format!("{mode} · source-authoritative · no destructive actions enabled")
+                            } else {
+                                "Create a profile to define a source-authoritative path.".to_owned()
+                            }).color(ui_palette(ui).muted));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            info_badge(ui, if has_profile { "Fresh analysis required" } else { "Profile not configured" });
+                        });
+                    });
+                    ui.add_space(14.0);
+                    let palette = ui_palette(ui);
+                    ui.columns(3, |columns| {
+                        egui::Frame::new()
+                            .fill(palette.field)
+                            .stroke(egui::Stroke::new(1.0, palette.border))
+                            .corner_radius(egui::CornerRadius::same(10))
+                            .inner_margin(egui::Margin::symmetric(14, 12))
+                            .show(&mut columns[0], |ui| {
+                                ui.horizontal(|ui| {
+                                    status_dot(ui, palette.accent);
+                                    ui.label(egui::RichText::new("Source folder").strong());
+                                });
+                                ui.label(egui::RichText::new(&source).monospace());
+                                ui.label(egui::RichText::new(if has_profile { "Authoritative" } else { "Not selected" }).small().color(palette.muted));
+                            });
+                        columns[1].vertical_centered(|ui| {
+                            sync_path_arrow(ui, palette.accent);
+                            ui.label(egui::RichText::new("SYNC PATH").small().color(palette.secondary));
+                        });
+                        egui::Frame::new()
+                            .fill(palette.field)
+                            .stroke(egui::Stroke::new(1.0, palette.border))
+                            .corner_radius(egui::CornerRadius::same(10))
+                            .inner_margin(egui::Margin::symmetric(14, 12))
+                            .show(&mut columns[2], |ui| {
+                                ui.horizontal(|ui| {
+                                    status_dot(ui, palette.secondary);
+                                    ui.label(egui::RichText::new("Destination folder").strong());
+                                });
+                                ui.label(egui::RichText::new(&destination).monospace());
+                                ui.label(egui::RichText::new(if has_profile { "Protected" } else { "Not selected" }).small().color(palette.muted));
+                            });
+                    });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(if has_profile {
+                            "Last run · Review the current plan before starting"
+                        } else {
+                            "Next · Create a profile, then review the current plan"
+                        }).color(ui_palette(ui).muted));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if has_profile {
+                                if secondary_button(ui, "Review plan").clicked() {
+                                    request_sync = true;
+                                }
+                            } else if secondary_button(ui, "Open the wizard").clicked() {
+                                create_profile = true;
+                            }
+                        });
+                    });
+                });
+
+                ui.add_space(12.0);
+                let palette = ui_palette(ui);
+                let report_count_label = report_count.to_string();
+                ui.columns(2, |columns| {
+                    let left_frame = card_frame(&columns[0]);
+                    left_frame.show(&mut columns[0], |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("Next safe action");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                status_badge(ui, if has_profile { "Protected" } else { "Start here" }, true);
+                            });
+                        });
+                        ui.label(egui::RichText::new(if has_profile {
+                            "Everything is ready for a fresh read-only analysis."
+                        } else {
+                            "Build the safe path before any sync can be considered."
+                        }).color(palette.muted));
+                        for (step, title, body, color) in [
+                            ("STEP 1", "Fresh Analysis", "Build the current explainable action plan.", palette.accent),
+                            ("STEP 2", "Run Precheck", "Confirm both endpoints and the approved scope.", palette.secondary),
+                            ("STEP 3", "Execution Confirmation", "Approve the exact reviewed work immediately before mutation.", palette.amber),
+                        ] {
+                            inset_frame(ui).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    status_dot(ui, color);
+                                    ui.vertical(|ui| {
+                                        ui.label(egui::RichText::new(title).strong());
+                                        ui.label(egui::RichText::new(body).small().color(palette.muted));
+                                    });
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.label(egui::RichText::new(step).small().strong().color(palette.secondary));
+                                    });
+                                });
+                            });
+                        }
+                    });
+                    let right_frame = card_frame(&columns[1]);
+                    right_frame.show(&mut columns[1], |ui| {
+                        ui.heading("Profile health");
+                        ui.label(egui::RichText::new("Quiet evidence, always available.").color(palette.muted));
+                        ui.add_space(10.0);
+                        ui.columns(2, |metrics| {
+                            for (index, (metric, value)) in [
+                                ("unresolved items", "0"),
+                                ("saved reports", report_count_label.as_str()),
+                                ("sync mode", mode),
+                                ("safety", "Gated"),
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                egui::Frame::new()
+                                    .fill(palette.field)
+                                    .stroke(egui::Stroke::new(1.0, palette.border))
+                                    .corner_radius(egui::CornerRadius::same(9))
+                                    .inner_margin(egui::Margin::symmetric(10, 10))
+                                    .show(&mut metrics[index % 2], |ui| {
+                                        ui.label(egui::RichText::new(value).size(22.0).strong());
+                                        ui.label(egui::RichText::new(metric).small().color(palette.muted));
+                                    });
+                            }
+                        });
+                    });
+                });
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new("Need guidance? Open Help & Support from the menu or the contextual links in the Sync workspace.").color(ui_palette(ui).muted));
+        });
+        if create_profile {
+            self.start_new_profile();
+        } else if open_sync {
+            self.show_sync_workspace();
+        } else if open_settings {
+            self.show_settings();
+        } else if request_sync {
+            self.show_sync_workspace();
+            self.request_synchronise_async(ui.ctx());
+        }
+    }
+
+    fn draw_wizard_stepper(&self, ui: &mut egui::Ui, current: ProfileWizardStep) {
+        let palette = ui_palette(ui);
+        ui.columns(4, |columns| {
+            for (index, step) in ProfileWizardStep::ALL.into_iter().enumerate() {
+                let completed = step.number() < current.number();
+                let selected = step == current;
+                let color = if selected || completed {
+                    palette.accent
+                } else {
+                    palette.amber
+                };
+                egui::Frame::new()
+                    .fill(if selected || completed {
+                        palette.accent_soft
+                    } else {
+                        palette.amber_soft
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        if selected || completed {
+                            palette.accent
+                        } else {
+                            palette.amber
+                        },
+                    ))
+                    .corner_radius(egui::CornerRadius::same(9))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(&mut columns[index], |ui| {
+                        ui.horizontal(|ui| {
+                            egui::Frame::new()
+                                .fill(if selected || completed {
+                                    palette.accent
+                                } else {
+                                    palette.amber
+                                })
+                                .stroke(egui::Stroke::new(1.0, color))
+                                .corner_radius(egui::CornerRadius::same(7))
+                                .inner_margin(egui::Margin::symmetric(7, 4))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(step.number().to_string())
+                                            .strong()
+                                            .color(palette.on_accent),
+                                    );
+                                });
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(step.title()).strong().color(color));
+                                ui.label(
+                                    egui::RichText::new(if selected {
+                                        "Current step"
+                                    } else if completed {
+                                        "Complete"
+                                    } else {
+                                        "Required"
+                                    })
+                                    .small()
+                                    .color(
+                                        if selected || completed {
+                                            palette.muted
+                                        } else {
+                                            palette.amber
+                                        },
+                                    ),
+                                );
+                            });
+                        });
+                    });
             }
         });
     }
 
-    fn draw_profile_list(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Sync Profiles");
-        if ui.button("New profile").clicked() {
-            self.start_new_profile();
-        }
-        ui.separator();
-        let profiles = self
-            .profiles
-            .iter()
-            .map(|profile| (profile.id(), profile.profile().name().to_owned()))
-            .collect::<Vec<_>>();
-        for (id, name) in &profiles {
-            ui.push_id(id.value(), |ui| {
+    fn draw_wizard(&mut self, ui: &mut egui::Ui) {
+        let step = self.wizard_step.unwrap_or(ProfileWizardStep::SyncMethod);
+        let step_ready = self.wizard_step_validation(step).is_ok();
+        let form_before_draw = self.form.clone();
+        let palette = ui_palette(ui);
+        let mut cancel = false;
+        let mut previous = false;
+        let mut next = false;
+        let mut save = false;
+        let mut profile_saved = false;
+        egui::ScrollArea::vertical()
+            .id_salt("profile-wizard")
+            .show(ui, |ui| {
+                let available_width = ui.available_width();
+                let content_width = available_width.min(1040.0);
                 ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(self.form.id == Some(*id), name)
-                        .clicked()
-                    {
-                        self.select_profile(*id);
-                    }
-                    if ui.button("Clone").clicked() {
-                        if let Err(error) = self.clone_profile(*id) {
-                            self.status = format!("Profile could not be cloned: {error}");
+                    ui.add_space(((available_width - content_width) / 2.0).max(0.0));
+                    ui.vertical(|ui| {
+                        ui.set_width(content_width);
+                        ui.add_space(24.0);
+                        card_frame(ui).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    section_intro(
+                                        ui,
+                                        "New profile",
+                                        "Create a Sync Profile",
+                                        "Set up the safe path once, then fine-tune it from the Sync workspace.",
+                                    );
+                                });
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                    if secondary_button(ui, "Cancel").clicked() {
+                                        cancel = true;
+                                    }
+                                });
+                            });
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Saving only stores the profile; it never starts a Sync Run.").color(palette.muted));
+                        });
+                        egui::Frame::new()
+                            .fill(palette.surface)
+                            .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+                            .corner_radius(egui::CornerRadius::same(12))
+                            .inner_margin(egui::Margin::symmetric(12, 10))
+                            .outer_margin(egui::Margin::symmetric(0, 6))
+                            .show(ui, |ui| self.draw_wizard_stepper(ui, step));
+                        card_frame(ui).show(ui, |ui| match step {
+                            ProfileWizardStep::SyncMethod => {
+                                section_intro(
+                                    ui,
+                                    "Step 1 · Sync method",
+                                    "Choose the sync type",
+                                    "Start with the safe default, then name the profile so its future runs are easy to identify.",
+                                );
+                                ui.add_space(14.0);
+                                ui.label(egui::RichText::new("Profile name").strong());
+                                ui.label(egui::RichText::new("A short name such as “Home archive” or “Work files”.").small().color(palette.muted));
+                                ui.add_space(6.0);
+                                ui.add_sized(
+                                    egui::vec2(ui.available_width(), 42.0),
+                                    egui::TextEdit::singleline(&mut self.form.name),
+                                );
+                                ui.add_space(18.0);
+                                ui.label(egui::RichText::new("Sync method").strong());
+                                ui.label(egui::RichText::new("Choose the direction model for this profile.").small().color(palette.muted));
+                                ui.add_space(6.0);
+                                egui::ComboBox::from_id_salt("wizard-sync-method")
+                                    .selected_text(sync_mode_label(self.form.mode))
+                                    .width(ui.available_width())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.form.mode,
+                                            SyncMode::OneWay,
+                                            "One-Way Sync (recommended)",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.form.mode,
+                                            SyncMode::Mirror,
+                                            "Mirror Sync (review required)",
+                                        );
+                                    });
+                                ui.add_space(16.0);
+                                ui.label(egui::RichText::new(match self.form.mode {
+                                    SyncMode::OneWay => "One-Way Sync copies from the authoritative source endpoint to the other endpoint.",
+                                    SyncMode::Mirror => "Mirror Sync keeps both endpoints populated and requires explicit conflict review.",
+                                }).color(palette.muted));
+                                if self.form.mode == SyncMode::OneWay {
+                                    ui.add_space(8.0);
+                                    egui::Frame::new()
+                                        .fill(palette.field)
+                                        .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+                                        .corner_radius(egui::CornerRadius::same(10))
+                                        .inner_margin(egui::Margin::symmetric(12, 10))
+                                        .show(ui, |ui| {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.label(egui::RichText::new("Authoritative source").strong());
+                                                ui.radio_value(&mut self.form.source, OneWaySource::PeerA, "Source endpoint");
+                                                ui.radio_value(&mut self.form.source, OneWaySource::PeerB, "Destination endpoint");
+                                            });
+                                        });
+                                }
+                            }
+                            ProfileWizardStep::SourceEndpoint => {
+                                section_intro(
+                                    ui,
+                                    "Step 2 · Source",
+                                    "Select the source folder for this sync",
+                                    "Choose the folder whose contents should be copied. The selected path is kept as a validated endpoint, not a shell command.",
+                                );
+                                ui.add_space(12.0);
+                                draw_endpoint(ui, "Source endpoint", &mut self.form.peer_a);
+                                inset_frame(ui).show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        status_dot(ui, palette.secondary);
+                                        ui.label(egui::RichText::new("Next").strong());
+                                    });
+                                    ui.label(egui::RichText::new("When the source folder is selected, continue to choose the destination folder.").color(palette.muted));
+                                });
+                            }
+                            ProfileWizardStep::DestinationEndpoint => {
+                                section_intro(
+                                    ui,
+                                    "Step 3 · Destination",
+                                    "Select the destination folder for this sync",
+                                    "Choose where the selected source should be synchronized. SyncPlus verifies the destination before any Safe Delete or overwrite action can proceed.",
+                                );
+                                ui.add_space(12.0);
+                                inset_frame(ui).show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Source selected").strong());
+                                    ui.label(egui::RichText::new(endpoint_summary(&self.form.peer_a)).monospace().color(palette.muted));
+                                });
+                                draw_endpoint(ui, "Destination endpoint", &mut self.form.peer_b);
+                            }
+                            ProfileWizardStep::ReviewAndSave => {
+                                section_intro(
+                                    ui,
+                                    "Step 4 · Review",
+                                    "Review your Sync Profile",
+                                    "Check the summary, then save. Additional options remain available from the Sync workspace.",
+                                );
+                                ui.add_space(12.0);
+                                ui.columns(2, |columns| {
+                                    columns[0].vertical(|ui| {
+                                        inset_frame(ui).show(ui, |ui| {
+                                            ui.label(egui::RichText::new("Profile summary").strong());
+                                            ui.add_space(8.0);
+                                            ui.label(format!("Name: {}", if self.form.name.trim().is_empty() { "Not entered" } else { self.form.name.trim() }));
+                                            ui.label(format!("Sync type: {}", sync_mode_label(self.form.mode)));
+                                            if self.form.mode == SyncMode::OneWay {
+                                                ui.label(format!("Authoritative source: {}", match self.form.source {
+                                                    OneWaySource::PeerA => "Source endpoint",
+                                                    OneWaySource::PeerB => "Destination endpoint",
+                                                }));
+                                            }
+                                            ui.label(format!("Source: {}", endpoint_summary(&self.form.peer_a)));
+                                            ui.label(format!("Destination: {}", endpoint_summary(&self.form.peer_b)));
+                                        });
+                                    });
+                                    columns[1].vertical(|ui| {
+                                        inset_frame(ui).show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                status_dot(ui, palette.accent);
+                                                ui.label(egui::RichText::new("What happens next").strong());
+                                            });
+                                            ui.add_space(8.0);
+                                            ui.label(egui::RichText::new("After saving, the Sync workspace opens with this profile populated. Choose any additional options there, then press Synchronise to begin the required review flow.").color(palette.muted));
+                                            ui.add_space(8.0);
+                                            ui.label(egui::RichText::new("Synchronise will not change files until Fresh Analysis, Run Precheck, and explicit Execution Confirmation are complete.").color(palette.muted));
+                                        });
+                                    });
+                                });
+                            }
+                        });
+                        if step == ProfileWizardStep::SyncMethod {
+                            full_width_inset_frame(ui, |ui| {
+                                let one_way = self.form.mode == SyncMode::OneWay;
+                                ui.horizontal_wrapped(|ui| {
+                                    status_dot(ui, if one_way { palette.accent } else { palette.amber });
+                                    ui.label(egui::RichText::new(if one_way {
+                                        "Simple default:"
+                                    } else {
+                                        "Review required:"
+                                    }).strong());
+                                    ui.label(egui::RichText::new(match self.form.mode {
+                                        SyncMode::OneWay => "One-Way Sync copies from one authoritative folder to the other endpoint.",
+                                        SyncMode::Mirror => "Mirror Sync keeps both endpoints in view and requires Conflict Review.",
+                                    }).color(palette.muted));
+                                });
+                                ui.add_space(2.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    status_dot(ui, palette.accent);
+                                    ui.label(egui::RichText::new("No changes yet:").strong());
+                                    ui.label(egui::RichText::new("SyncPlus will first run Fresh Analysis and a precheck. You confirm the exact reviewed work immediately before mutation.").color(palette.muted));
+                                });
+                            });
                         }
-                    }
+                        egui::Frame::new()
+                            .fill(palette.surface)
+                            .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+                            .corner_radius(egui::CornerRadius::same(12))
+                            .inner_margin(egui::Margin::symmetric(14, 10))
+                            .outer_margin(egui::Margin::symmetric(0, 6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("Step {} of 4", step.number())).color(palette.muted));
+                                    if !step_ready {
+                                        ui.label(
+                                            egui::RichText::new("Complete the required fields to continue.")
+                                                .small()
+                                                .color(palette.amber),
+                                        );
+                                    }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if step.next().is_some() {
+                                            let next_label = match step {
+                                                ProfileWizardStep::SyncMethod => "Next: choose source folder",
+                                                ProfileWizardStep::SourceEndpoint => "Next: choose destination folder",
+                                                ProfileWizardStep::DestinationEndpoint => "Next: review and save",
+                                                ProfileWizardStep::ReviewAndSave => unreachable!(),
+                                            };
+                                            if primary_button_enabled(ui, next_label, step_ready).clicked() {
+                                                next = true;
+                                            }
+                                        } else if primary_button_enabled(
+                                            ui,
+                                            "Save profile & open Sync workspace",
+                                            step_ready,
+                                        )
+                                        .clicked()
+                                        {
+                                            save = true;
+                                        }
+                                        if step.previous().is_some() && secondary_button(ui, "Back").clicked() {
+                                            previous = true;
+                                        }
+                                    });
+                                });
+                            });
+                        ui.add_space(20.0);
+                    });
                 });
             });
+        if cancel {
+            self.show_welcome();
+        } else if next {
+            if let Err(error) = self.advance_wizard_step(step) {
+                self.status = format_form_validation_diagnostic(&self.form, &error);
+            }
+        } else if save {
+            match self.save_profile() {
+                Ok(_) => {
+                    profile_saved = true;
+                    self.show_sync_workspace();
+                    self.status = "Profile saved. Run Fresh Analysis to review the intended work before confirmation.".to_owned();
+                }
+                Err(error) => {
+                    self.status = format_form_validation_diagnostic(&self.form, &error);
+                }
+            }
+        } else if previous {
+            self.retreat_wizard_step(step);
         }
-        if profiles.is_empty() {
-            ui.label("No profiles saved yet.");
+        if !profile_saved && self.form != form_before_draw {
+            self.clear_review();
+            self.status = "Profile changed. Complete the wizard, then run Fresh Analysis before confirmation.".to_owned();
         }
     }
 
     fn draw_profile_form(&mut self, ui: &mut egui::Ui) {
         let form_before_draw = self.form.clone();
-        ui.heading("Sync Profile");
-        ui.label("Define named endpoints and safety settings. SyncPlus never accepts arbitrary rsync arguments.");
-        draw_contextual_help_link(
-            ui,
-            "Profile guidance",
-            help_topic_for_surface(HelpSurface::Profile),
-            &mut self.help_topic,
-        );
+        let mut request_analyze = false;
+        let mut request_validate = false;
+        let mut request_save = false;
+        let mut request_synchronise = false;
+        let mut profile_to_select = None;
+        let profile_options = self
+            .profiles
+            .iter()
+            .map(|profile| (profile.id(), profile.profile().name().to_owned()))
+            .collect::<Vec<_>>();
+        let selected_profile_name = self
+            .form
+            .id
+            .and_then(|id| {
+                profile_options
+                    .iter()
+                    .find(|(profile_id, _)| *profile_id == id)
+                    .map(|(_, name)| name.as_str())
+            })
+            .unwrap_or("Unsaved profile draft");
+        let review_confirmed = self.review.as_ref().is_some_and(|review| review.confirmed);
+        let review_exists = self.review.is_some();
+        let review_blocked = self
+            .review
+            .as_ref()
+            .is_some_and(|review| review.error.is_some());
+        let analysis_active = self.active_analysis.is_some();
+        let synchronise_enabled =
+            review_confirmed && self.active_manual_run.is_none() && !analysis_active;
+        let (phase_label, phase_description, phase_positive) = if analysis_active {
+            (
+                "Analysis in progress",
+                "Fresh Analysis is hashing the selected scope in the background. The workspace remains available.",
+                false,
+            )
+        } else if self.active_manual_run.is_some() {
+            (
+                "Sync Run active",
+                "The reviewed Sync Run is executing. Progress and durable evidence are shown below.",
+                true,
+            )
+        } else if review_confirmed {
+            (
+                "Ready to synchronise",
+                "Execution Confirmation is recorded for this exact reviewed scope.",
+                true,
+            )
+        } else if review_blocked {
+            (
+                "Review blocked",
+                "Correct the named profile or endpoint problem, then run the dry run again.",
+                false,
+            )
+        } else if review_exists {
+            (
+                "Review required",
+                "The read-only plan is ready. Inspect it, resolve any blockers, and confirm the exact scope.",
+                false,
+            )
+        } else {
+            (
+                "Ready for dry run",
+                "Dry run performs Fresh Analysis and Run Precheck. It does not change files.",
+                false,
+            )
+        };
+        let palette = ui_palette(ui);
+        card_frame(ui).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    section_intro(
+                        ui,
+                        "Active Sync Profile",
+                        "Sync workspace",
+                        "Run a read-only dry run, review the exact plan, then confirm before anything changes.",
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    status_badge(ui, phase_label, phase_positive);
+                });
+            });
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Active profile").strong());
+                egui::ComboBox::from_id_salt("workspace-profile-selector")
+                    .selected_text(selected_profile_name)
+                    .width(280.0)
+                    .show_ui(ui, |ui| {
+                        for (id, name) in &profile_options {
+                            ui.selectable_value(
+                                &mut profile_to_select,
+                                Some(*id),
+                                name,
+                            );
+                        }
+                    });
+                ui.label(egui::RichText::new(phase_description).color(palette.muted));
+            });
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                if primary_button_enabled(
+                    ui,
+                    if review_exists { "Run dry run again" } else { "Dry run · Analyze" },
+                    !analysis_active,
+                )
+                .clicked()
+                {
+                    request_analyze = true;
+                }
+                if secondary_button(ui, "Validate profile").clicked() {
+                    request_validate = true;
+                }
+                if secondary_button(ui, "Save profile").clicked() {
+                    request_save = true;
+                }
+                if primary_button_enabled(ui, "Synchronise", synchronise_enabled).clicked() {
+                    request_synchronise = true;
+                }
+            });
+            ui.add_space(10.0);
+            egui::Frame::new()
+                .fill(palette.field)
+                .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+                .corner_radius(egui::CornerRadius::same(9))
+                .inner_margin(egui::Margin::symmetric(12, 9))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        status_dot(ui, palette.secondary);
+                        ui.label(egui::RichText::new("No arbitrary commands").strong());
+                        ui.label(egui::RichText::new("SyncPlus uses validated profile fields and the same reviewed process specification for analysis and execution.").color(palette.muted));
+                    });
+                });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                status_dot(
+                    ui,
+                    if review_blocked {
+                        palette.danger
+                    } else if review_confirmed {
+                        palette.accent
+                    } else {
+                        palette.amber
+                    },
+                );
+                ui.label(egui::RichText::new("Latest status").strong());
+                ui.label(egui::RichText::new(&self.status).color(palette.muted));
+            });
+            draw_contextual_help_link(
+                ui,
+                "Profile guidance",
+                help_topic_for_surface(HelpSurface::Profile),
+                &mut self.help_topic,
+            );
+        });
         if let Some(source_id) = self.form.clone_source {
             let clone_authorization_choice_before = self.form.clone_authorization_choice;
-            ui.group(|ui| {
-                ui.heading("Clone Profile safeguards");
+            card_frame(ui).show(ui, |ui| {
+                section_intro(
+                    ui,
+                    "Clone review",
+                    "Clone Profile safeguards",
+                    "Review the copied endpoints and authorization choices before saving this separate profile.",
+                );
                 draw_contextual_help_link(
                     ui,
                     "Clone safeguards",
@@ -2719,198 +4625,248 @@ impl SyncPlusApp {
                             .form
                             .clone_source_authorizations
                             .allow_unattended_destructive(),
-                    self.form.profile_authorizations.allow_unattended_permanent_removal(),
+                    self.form
+                        .profile_authorizations
+                        .allow_unattended_permanent_removal(),
                 );
             }
         }
-        ui.horizontal(|ui| {
-            ui.label("Profile name");
-            ui.text_edit_singleline(&mut self.form.name);
+        card_frame(ui).show(ui, |ui| {
+            ui.label(egui::RichText::new("PROFILE IDENTITY").small().strong().color(palette.accent));
+            ui.heading("Name this Sync Profile");
+            ui.label(egui::RichText::new("A clear name makes schedules, Run Reports, and recovery decisions easier to identify.").color(palette.muted));
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Profile name").strong());
+            ui.add_sized(
+                egui::vec2(ui.available_width(), 38.0),
+                egui::TextEdit::singleline(&mut self.form.name)
+                    .vertical_align(egui::Align::Center),
+            );
         });
-        ui.separator();
-        draw_endpoint(ui, "Source endpoint", &mut self.form.peer_a);
-        draw_endpoint(ui, "Destination endpoint", &mut self.form.peer_b);
-        ui.separator();
-        ui.label("Sync method");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.form.mode, SyncMode::OneWay, "One-Way Sync (recommended)");
-            ui.radio_value(&mut self.form.mode, SyncMode::Mirror, "Mirror Sync (review required)");
-        });
-        if self.form.mode == SyncMode::OneWay {
-            ui.horizontal(|ui| {
-                ui.label("Authoritative source");
-                ui.radio_value(&mut self.form.source, OneWaySource::PeerA, "Source endpoint");
-                ui.radio_value(&mut self.form.source, OneWaySource::PeerB, "Destination endpoint");
+        card_frame(ui).show(ui, |ui| {
+            ui.label(egui::RichText::new("SYNC POLICY").small().strong().color(palette.secondary));
+            ui.heading("Choose how files move");
+            ui.label(egui::RichText::new("One-Way Sync has an explicit authority. Mirror Sync never assumes a winner and requires Conflict Review.").color(palette.muted));
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Sync method").strong());
+            egui::ComboBox::from_id_salt("sync-method")
+                .selected_text(sync_mode_label(self.form.mode))
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.form.mode,
+                        SyncMode::OneWay,
+                        "One-Way Sync (recommended)",
+                    );
+                    ui.selectable_value(
+                        &mut self.form.mode,
+                        SyncMode::Mirror,
+                        "Mirror Sync (review required)",
+                    );
+                });
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(10.0);
+            ui.label(match self.form.mode {
+                SyncMode::OneWay => "One-Way Sync copies from the authoritative source endpoint to the other endpoint.",
+                SyncMode::Mirror => "Mirror Sync keeps both endpoints populated and requires explicit conflict review.",
             });
-        }
-        ui.collapsing("Exclusion Rules", |ui| {
-            ui.label("One pattern per line. Excluded items are neither synchronized nor deleted.");
-            ui.add(egui::TextEdit::multiline(&mut self.form.exclusions).desired_rows(3));
+            if self.form.mode == SyncMode::OneWay {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Authoritative source").strong());
+                    ui.radio_value(&mut self.form.source, OneWaySource::PeerA, "Source endpoint");
+                    ui.radio_value(&mut self.form.source, OneWaySource::PeerB, "Destination endpoint");
+                });
+            }
+        });
+        card_frame(ui).show(ui, |ui| {
+            section_intro(
+                ui,
+                "Connections",
+                "Source and destination",
+                "Both endpoints remain visible so the direction and scope are always clear.",
+            );
+            ui.add_space(4.0);
+            draw_endpoint(ui, "Source endpoint", &mut self.form.peer_a);
+            ui.add_space(12.0);
+            draw_endpoint(ui, "Destination endpoint", &mut self.form.peer_b);
+        });
+        card_frame(ui).show(ui, |ui| {
+            ui.collapsing("Exclusion Rules", |ui| {
+                ui.label(egui::RichText::new("One pattern per line. Excluded items are neither synchronized nor deleted.").color(ui_palette(ui).muted));
+                ui.add(egui::TextEdit::multiline(&mut self.form.exclusions).desired_rows(3));
+            });
         });
         if self.settings.mode() == ApplicationMode::Advanced {
-            ui.collapsing("Advanced safety options", |ui| {
-                let safe_delete_changed = ui
-                    .checkbox(&mut self.form.safe_delete, "One-Way Safe-Delete Sync")
-                    .changed();
-                if !self.form.safe_delete {
-                    self.form.deletion_method = None;
-                } else if safe_delete_changed && self.form.deletion_method.is_none() {
-                    self.form.deletion_method = Some(DeletionMethod::Trash);
-                }
-                if self.form.safe_delete {
-                    ui.label("Recovery method (Permanent Removal is separately authorized and irreversible):");
-                    ui.radio_value(
-                        &mut self.form.deletion_method,
-                        Some(DeletionMethod::Trash),
-                        "Move verified removals to Trash",
-                    );
-                    ui.radio_value(
-                        &mut self.form.deletion_method,
-                        Some(DeletionMethod::PermanentRemoval),
-                        "Permanent Removal (separate Advanced authorization)",
-                    );
-                }
-                ui.checkbox(&mut self.form.destination_cleanup, "Destination Cleanup");
-                ui.separator();
-                ui.label("Unattended authorization (explicit and profile-specific)");
-                let destructive_actions_enabled = self.form.safe_delete || self.form.destination_cleanup;
-                if self.form.clone_source.is_none() && destructive_actions_enabled {
-                    let mut allow_destructive = self
-                        .form
-                        .profile_authorizations
-                        .allow_unattended_destructive();
-                    ui.checkbox(
-                        &mut allow_destructive,
-                        "Authorize unattended Safe Delete or Destination Cleanup",
-                    );
-                    self.form.profile_authorizations = AuthorizationSnapshot::new(
-                        allow_destructive,
-                        self.form.profile_authorizations.allow_unattended_permanent_removal(),
-                    );
-                } else if !destructive_actions_enabled {
-                    self.form.profile_authorizations = AuthorizationSnapshot::new(
-                        false,
-                        self.form.profile_authorizations.allow_unattended_permanent_removal(),
-                    );
-                    ui.label("Enable Safe Delete or Destination Cleanup before authorizing unattended destructive actions.");
-                } else {
-                    ui.label(if self
-                        .form
-                        .profile_authorizations
-                        .allow_unattended_destructive()
-                    {
-                        "This clone explicitly authorizes unattended destructive actions."
-                    } else {
-                        "This clone does not authorize unattended destructive actions."
-                    });
-                }
-                if self.form.deletion_method == Some(DeletionMethod::PermanentRemoval) {
-                    let mut allow_permanent = self
-                        .form
-                        .profile_authorizations
-                        .allow_unattended_permanent_removal();
-                    ui.checkbox(
-                        &mut allow_permanent,
-                        "Authorize unattended Permanent Removal (irreversible; Advanced only)",
-                    );
-                    self.form.profile_authorizations = AuthorizationSnapshot::new(
-                        self.form.profile_authorizations.allow_unattended_destructive(),
-                        allow_permanent,
-                    );
-                    ui.label("Permanent Removal requires this separate authorization before saving.");
-                } else {
-                    if self
-                        .form
-                        .profile_authorizations
-                        .allow_unattended_permanent_removal()
-                    {
-                        self.form.profile_authorizations = AuthorizationSnapshot::new(
-                            self.form.profile_authorizations.allow_unattended_destructive(),
-                            false,
+            card_frame(ui).show(ui, |ui| {
+                ui.collapsing("Advanced safety options", |ui| {
+                    let safe_delete_changed = ui
+                        .checkbox(&mut self.form.safe_delete, "One-Way Safe-Delete Sync")
+                        .changed();
+                    if !self.form.safe_delete {
+                        self.form.deletion_method = None;
+                    } else if safe_delete_changed && self.form.deletion_method.is_none() {
+                        self.form.deletion_method = Some(DeletionMethod::Trash);
+                    }
+                    if self.form.safe_delete {
+                        ui.label("Recovery method (Permanent Removal is separately authorized and irreversible):");
+                        ui.radio_value(
+                            &mut self.form.deletion_method,
+                            Some(DeletionMethod::Trash),
+                            "Move verified removals to Trash",
+                        );
+                        ui.radio_value(
+                            &mut self.form.deletion_method,
+                            Some(DeletionMethod::PermanentRemoval),
+                            "Permanent Removal (separate Advanced authorization)",
                         );
                     }
-                    ui.label("Unattended Permanent Removal remains disabled unless Permanent Removal is selected.");
-                }
-                ui.separator();
-                ui.label("Metadata preservation (validated named options)");
-                ui.checkbox(&mut self.form.timestamps, "Preserve and verify timestamps");
-                ui.checkbox(&mut self.form.ownership, "Preserve ownership");
-                ui.checkbox(&mut self.form.access_control_lists, "Preserve access-control lists");
-                ui.checkbox(&mut self.form.extended_attributes, "Preserve extended attributes");
-                ui.separator();
-                ui.label("Transfer resilience");
-                ui.horizontal(|ui| {
-                    ui.label("Partial transfer");
-                    ui.radio_value(
-                        &mut self.form.partial_transfer_policy,
-                        PartialTransferPolicy::Cleanup,
-                        "Clean up failed partial files",
+                    ui.checkbox(&mut self.form.destination_cleanup, "Destination Cleanup");
+                    ui.separator();
+                    ui.label("Unattended authorization (explicit and profile-specific)");
+                    let destructive_actions_enabled = self.form.safe_delete || self.form.destination_cleanup;
+                    if self.form.clone_source.is_none() && destructive_actions_enabled {
+                        let mut allow_destructive = self
+                            .form
+                            .profile_authorizations
+                            .allow_unattended_destructive();
+                        ui.checkbox(
+                            &mut allow_destructive,
+                            "Authorize unattended Safe Delete or Destination Cleanup",
+                        );
+                        self.form.profile_authorizations = AuthorizationSnapshot::new(
+                            allow_destructive,
+                            self.form.profile_authorizations.allow_unattended_permanent_removal(),
+                        );
+                    } else if !destructive_actions_enabled {
+                        self.form.profile_authorizations = AuthorizationSnapshot::new(
+                            false,
+                            self.form.profile_authorizations.allow_unattended_permanent_removal(),
+                        );
+                        ui.label("Enable Safe Delete or Destination Cleanup before authorizing unattended destructive actions.");
+                    } else {
+                        ui.label(if self
+                            .form
+                            .profile_authorizations
+                            .allow_unattended_destructive()
+                        {
+                            "This clone explicitly authorizes unattended destructive actions."
+                        } else {
+                            "This clone does not authorize unattended destructive actions."
+                        });
+                    }
+                    if self.form.deletion_method == Some(DeletionMethod::PermanentRemoval) {
+                        let mut allow_permanent = self
+                            .form
+                            .profile_authorizations
+                            .allow_unattended_permanent_removal();
+                        ui.checkbox(
+                            &mut allow_permanent,
+                            "Authorize unattended Permanent Removal (irreversible; Advanced only)",
+                        );
+                        self.form.profile_authorizations = AuthorizationSnapshot::new(
+                            self.form.profile_authorizations.allow_unattended_destructive(),
+                            allow_permanent,
+                        );
+                        ui.label("Permanent Removal requires this separate authorization before saving.");
+                    } else {
+                        if self
+                            .form
+                            .profile_authorizations
+                            .allow_unattended_permanent_removal()
+                        {
+                            self.form.profile_authorizations = AuthorizationSnapshot::new(
+                                self.form.profile_authorizations.allow_unattended_destructive(),
+                                false,
+                            );
+                        }
+                        ui.label("Unattended Permanent Removal remains disabled unless Permanent Removal is selected.");
+                    }
+                    ui.separator();
+                    ui.label("Metadata preservation (validated named options)");
+                    ui.checkbox(&mut self.form.timestamps, "Preserve and verify timestamps");
+                    ui.checkbox(&mut self.form.ownership, "Preserve ownership");
+                    ui.checkbox(&mut self.form.access_control_lists, "Preserve access-control lists");
+                    ui.checkbox(&mut self.form.extended_attributes, "Preserve extended attributes");
+                    ui.separator();
+                    ui.label("Transfer resilience");
+                    ui.horizontal(|ui| {
+                        ui.label("Partial transfer");
+                        ui.radio_value(
+                            &mut self.form.partial_transfer_policy,
+                            PartialTransferPolicy::Cleanup,
+                            "Clean up failed partial files",
+                        );
+                        ui.radio_value(
+                            &mut self.form.partial_transfer_policy,
+                            PartialTransferPolicy::KeepPartialForResume,
+                            "Keep for reviewed resume",
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Retry attempts");
+                        ui.add(egui::TextEdit::singleline(&mut self.form.retry_attempts).desired_width(55.0));
+                        ui.label("Initial delay (ms)");
+                        ui.add(egui::TextEdit::singleline(&mut self.form.retry_delay_millis).desired_width(75.0));
+                    });
+                    ui.separator();
+                    ui.label("Background Scheduler (Advanced Mode only)");
+                    ui.checkbox(
+                        &mut self.form.schedule_enabled,
+                        "Enable recurring Unattended Run for this Sync Profile",
                     );
-                    ui.radio_value(
-                        &mut self.form.partial_transfer_policy,
-                        PartialTransferPolicy::KeepPartialForResume,
-                        "Keep for reviewed resume",
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Every (minutes)");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.form.schedule_interval_minutes)
+                                .desired_width(70.0),
+                        );
+                        ui.label("Timezone");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.form.schedule_timezone)
+                                .desired_width(150.0),
+                        );
+                    });
+                    ui.label("Scheduled launches run as this OS user through the same safety workflow; no root service or hidden credential prompt is used.");
+                    ui.label("The next run is persisted by the Background Scheduler. Editing or disabling this schedule never changes an active Run's frozen Profile Snapshot.");
+                    ui.label("Transport is selected through the typed Local or SSH endpoint fields. Command editing is not available.");
+                    ui.label("These options remain subject to Fresh Analysis, verification, and explicit Execution Confirmation.");
                 });
-                ui.horizontal(|ui| {
-                    ui.label("Retry attempts");
-                    ui.add(egui::TextEdit::singleline(&mut self.form.retry_attempts).desired_width(55.0));
-                    ui.label("Initial delay (ms)");
-                    ui.add(egui::TextEdit::singleline(&mut self.form.retry_delay_millis).desired_width(75.0));
-                });
-                ui.separator();
-                ui.label("Background Scheduler (Advanced Mode only)");
-                ui.checkbox(
-                    &mut self.form.schedule_enabled,
-                    "Enable recurring Unattended Run for this Sync Profile",
-                );
-                ui.horizontal(|ui| {
-                    ui.label("Every (minutes)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.form.schedule_interval_minutes)
-                            .desired_width(70.0),
-                    );
-                    ui.label("Timezone");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.form.schedule_timezone)
-                            .desired_width(150.0),
-                    );
-                });
-                ui.label("Scheduled launches run as this OS user through the same safety workflow; no root service or hidden credential prompt is used.");
-                ui.label("The next run is persisted by the Background Scheduler. Editing or disabling this schedule never changes an active Run's frozen Profile Snapshot.");
-                ui.label("Transport is selected through the typed Local or SSH endpoint fields. Command editing is not available.");
-                ui.label("These options remain subject to Fresh Analysis, verification, and explicit Execution Confirmation.");
             });
         } else {
-            ui.label("Simple Mode keeps destructive options hidden. Switch to Advanced Mode to review them.");
+            full_width_inset_frame(ui, |ui| {
+                ui.label(egui::RichText::new("Simple Mode").strong());
+                ui.label("Destructive options stay hidden. Switch to Advanced Mode only when you need to review them.");
+            });
         }
-        ui.collapsing("Help & safety", |ui| {
-            ui.label("What: Simple Mode provides a calm, non-destructive One-Way Sync profile editor.");
-            ui.label("Why: new profiles start with source-authoritative copying and no deletion, cleanup, schedules, or unattended destructive authorization.");
-            ui.label("How: choose named local folders or one SSH peer, validate the fields, then save. The core creates the same typed Process Specification used later for execution.");
-            ui.label("When: Fresh Analysis, precheck, and one final Execution Confirmation are required before a file-changing run.");
-            ui.label("Limits: Mirror Sync has no implicit winner; excluded, unavailable, changed, or ambiguous items remain visible for review. Passwords stay in the desktop keyring and only an opaque reference is kept in the profile.");
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Analyze current state").clicked() {
-                if let Err(error) = self.analyze_profile() {
-                    self.status = format_form_validation_diagnostic(&self.form, &error);
-                }
-            }
-            if ui.button("Validate").clicked() {
-                if let Err(error) = self.validate_profile() {
-                    self.status = format_form_validation_diagnostic(&self.form, &error);
-                }
-            }
-            if ui.button("Save profile").clicked() {
-                if let Err(error) = self.save_profile() {
-                    self.status = format_form_validation_diagnostic(&self.form, &error);
-                }
-            }
+        card_frame(ui).show(ui, |ui| {
+            ui.collapsing("Help & safety", |ui| {
+                ui.label("What: Simple Mode provides a calm, non-destructive One-Way Sync profile editor.");
+                ui.label("Why: new profiles start with source-authoritative copying and no deletion, cleanup, schedules, or unattended destructive authorization.");
+                ui.label("How: choose named local folders or one SSH peer, validate the fields, then save. The core creates the same typed Process Specification used later for execution.");
+                ui.label("When: Fresh Analysis, precheck, and one final Execution Confirmation are required before a file-changing run.");
+                ui.label("Limits: Mirror Sync has no implicit winner; excluded, unavailable, changed, or ambiguous items remain visible for review. Passwords stay in the desktop keyring and only an opaque reference is kept in the profile.");
+            });
         });
         if self.form != form_before_draw {
             self.clear_review();
-            self.status = "Profile changed. Fresh Analysis and confirmation are required again.".to_owned();
+            self.status =
+                "Profile changed. Fresh Analysis and confirmation are required again.".to_owned();
+        }
+        if let Some(id) = profile_to_select {
+            self.select_profile(id);
+        }
+        if request_analyze && let Err(error) = self.start_analysis(ui.ctx()) {
+            self.status = format_form_validation_diagnostic(&self.form, &error);
+        }
+        if request_validate && let Err(error) = self.validate_profile() {
+            self.status = format_form_validation_diagnostic(&self.form, &error);
+        }
+        if request_save && let Err(error) = self.save_profile() {
+            self.status = format_form_validation_diagnostic(&self.form, &error);
+        }
+        if request_synchronise {
+            self.request_synchronise_async(ui.ctx());
         }
     }
 
@@ -2919,8 +4875,12 @@ impl SyncPlusApp {
         let mut request_start = false;
         let mut request_resolution_start = false;
         let mut request_resolution_confirmation = false;
-        ui.separator();
-        ui.heading("Plan review and Execution Confirmation");
+        section_intro(
+            ui,
+            "Safety gate",
+            "Plan review and Execution Confirmation",
+            "Read the exact scope, resolve every blocker, then confirm this plan before any file-changing action.",
+        );
         draw_contextual_help_link(
             ui,
             "Plan and confirmation",
@@ -2929,9 +4889,14 @@ impl SyncPlusApp {
         );
 
         if let Some(review) = self.review.as_mut() {
-            ui.label("This is a read-only review of the current profile. No filesystem mutation starts from this view.");
-            ui.group(|ui| {
-                ui.label("Folder mapping");
+            ui.label(egui::RichText::new("This is a read-only review of the current profile. No filesystem mutation starts from this view.").color(ui_palette(ui).muted));
+            card_frame(ui).show(ui, |ui| {
+                section_intro(
+                    ui,
+                    "Scope",
+                    "Folder mapping",
+                    "These exact roots define the reviewed action. A trailing separator does not widen the scope.",
+                );
                 let (source_peer, destination_peer) = mapped_peers(&review.profile);
                 let source = source_peer.root().display().to_string();
                 let destination = destination_peer.root().display().to_string();
@@ -2944,13 +4909,12 @@ impl SyncPlusApp {
                     ui.label(format!("Peer B folder: {}", review.profile.peer_b().root().display()));
                     ui.label("Mirror Sync reviews both folder directions independently; neither folder is an implicit winner.");
                 }
-                ui.label("A trailing separator marks the selected path as a folder; it does not select a parent folder or widen the reviewed root. Actions below are relative to these exact selected roots.");
                 ui.label("The reviewed typed Process Specification below is authoritative for execution.");
             });
 
             if let Some(error) = &review.error {
-                ui.group(|ui| {
-                    ui.label("Review status: not ready");
+                inset_frame(ui).show(ui, |ui| {
+                    status_badge(ui, "Blocked · review not ready", false);
                     let topic = help_topic_for_error(error);
                     draw_contextual_help_link(
                         ui,
@@ -2968,7 +4932,16 @@ impl SyncPlusApp {
             }
 
             if let Some(precheck) = &review.precheck {
-                ui.group(|ui| {
+                card_frame(ui).show(ui, |ui| {
+                    status_badge(
+                        ui,
+                        if precheck.can_execute() {
+                            "Precheck passed"
+                        } else {
+                            "Precheck blocked"
+                        },
+                        precheck.can_execute(),
+                    );
                     draw_contextual_help_link(
                         ui,
                         "Precheck blocker guidance",
@@ -3030,8 +5003,16 @@ impl SyncPlusApp {
                     && !unresolved
                     && !conflicts_pending
                     && (!stronger_required || stronger_confirmation);
-                ui.group(|ui| {
-                    ui.label("Final Execution Confirmation");
+                card_frame(ui).show(ui, |ui| {
+                    section_intro(
+                        ui,
+                        "Final gate",
+                        "Execution Confirmation",
+                        "Confirm only after the plan, precheck, and any high-risk scope requirements are understood.",
+                    );
+                    if review.confirmed {
+                        status_badge(ui, "Confirmation recorded", true);
+                    }
                     draw_confirmation_summary(ui, review, &analysis);
                     if stronger_required {
                         ui.label("This high-risk source scope requires stronger confirmation. Type the exact source path shown in the mapping above:");
@@ -3041,16 +5022,15 @@ impl SyncPlusApp {
                         ui.label("Execution Confirmation recorded. No filesystem mutation has started.");
                         if self.active_manual_run.is_some() {
                             ui.label("A Manual Sync Run is active. Closing the window hides SyncPlus and leaves it running.");
-                        } else if ui.button("Start Manual Sync Run").clicked() {
+                        } else if primary_button(ui, "Synchronise").clicked() {
                             request_start = true;
                         }
-                    } else if ui
-                        .add_enabled(
-                            can_confirm,
-                            egui::Button::new("Confirm this exact reviewed scope"),
-                        )
-                        .clicked()
-                    {
+                    } else if primary_button_enabled(
+                        ui,
+                        "Confirm this exact reviewed scope",
+                        can_confirm,
+                    )
+                    .clicked() {
                         request_confirmation = true;
                     }
                     if unresolved && !review.confirmed {
@@ -3064,31 +5044,25 @@ impl SyncPlusApp {
                     }
                 });
             } else {
-                ui.label("No explainable plan is available until the precheck and Fresh Analysis pass.");
+                ui.label(
+                    "No explainable plan is available until the precheck and Fresh Analysis pass.",
+                );
             }
         } else {
             ui.label("No plan has been analyzed. Select Analyze current state to review the intended work.");
         }
 
-        if request_resolution_start {
-            if let Err(error) = self.start_resolution_run() {
-                self.status = format!("Resolution Run was not started: {error}");
-            }
+        if request_resolution_start && let Err(error) = self.start_resolution_run() {
+            self.status = format!("Resolution Run was not started: {error}");
         }
-        if request_resolution_confirmation {
-            if let Err(error) = self.confirm_resolution_run() {
-                self.status = format!("Resolution Run confirmation was not recorded: {error}");
-            }
+        if request_resolution_confirmation && let Err(error) = self.confirm_resolution_run() {
+            self.status = format!("Resolution Run confirmation was not recorded: {error}");
         }
-        if request_confirmation {
-            if let Err(error) = self.confirm_review() {
-                self.status = format!("Execution Confirmation was not recorded: {error}");
-            }
+        if request_confirmation && let Err(error) = self.confirm_review() {
+            self.status = format!("Execution Confirmation was not recorded: {error}");
         }
-        if request_start {
-            if let Err(error) = self.start_manual_run() {
-                self.status = format!("Manual Sync Run was not started: {error}");
-            }
+        if request_start && let Err(error) = self.start_manual_run() {
+            self.status = format!("Manual Sync Run was not started: {error}");
         }
     }
 
@@ -3098,12 +5072,19 @@ impl SyncPlusApp {
         let mut manual_cancel = None;
         let mut review_to_clear = None;
         let mut requested_help = None;
-        ui.separator();
-        ui.heading("Sync Run lifecycle, Run Reports, and Recovery Review");
-        ui.label("Run Reports are durable safety evidence. They contain status, progress, paths, outcomes, and recovery facts, never passwords or file contents.");
-        ui.label("All lifecycle state, progress, warnings, and recovery actions have text labels and keyboard-focusable controls.");
+        section_intro(
+            ui,
+            "Evidence",
+            "Sync Runs and Recovery Review",
+            "Durable Run Reports explain progress, outcomes, and recovery facts without storing passwords or file contents.",
+        );
         if self.run_reports.is_empty() {
-            ui.label("No durable Sync Run reports are available.");
+            inset_frame(ui).show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("No durable Sync Run reports are available.").strong(),
+                );
+                ui.label("Reports will appear here after a reviewed Sync Run starts.");
+            });
             return;
         }
 
@@ -3132,7 +5113,8 @@ impl SyncPlusApp {
                 .selected_run_report
                 .and_then(|run_id| reports.iter().find(|report| report.run_id() == run_id));
             let Some(report) = selected else {
-                columns[1].label("Select a Run Report to inspect its lifecycle and evidence.");
+                columns[1].label(egui::RichText::new("Select a Run Report").strong());
+                columns[1].label("Inspect its lifecycle, evidence, and any Recovery Review requirements here.");
                 return;
             };
             draw_run_report_detail(&mut columns[1], report, &mut requested_help);
@@ -3144,7 +5126,7 @@ impl SyncPlusApp {
                     | PendingReportAction::DiscardUnresolvedRun(run_id) => *run_id == report.run_id(),
                 });
             if let Some(action) = pending {
-                columns[1].group(|ui| {
+                card_frame(&columns[1]).show(&mut columns[1], |ui| {
                     ui.label("Confirm metadata action");
                     match action {
                         PendingReportAction::RemoveCompletedReport(_) => {
@@ -3222,10 +5204,10 @@ impl SyncPlusApp {
             if let Err(error) = result {
                 self.status = format!("Run Report action was not completed: {error}");
             }
-        } else if let Some(run_id) = review_to_clear {
-            if let Err(error) = self.mark_review_cleared(run_id) {
-                self.status = format!("Review could not be cleared: {error}");
-            }
+        } else if let Some(run_id) = review_to_clear
+            && let Err(error) = self.mark_review_cleared(run_id)
+        {
+            self.status = format!("Review could not be cleared: {error}");
         }
     }
 
@@ -3236,11 +5218,14 @@ impl SyncPlusApp {
         let notices = self.missed_schedule_notices.clone();
         let mut run_now = None;
         let mut not_now = None;
-        ui.separator();
-        ui.heading("Missed Schedule Notices");
-        ui.label("A notice records why a Scheduled Run did not complete. Choosing Run Now starts a fresh interactive review; it never reuses an old plan.");
+        section_intro(
+            ui,
+            "Attention",
+            "Missed Schedule Notices",
+            "A missed occurrence is never replayed blindly. Run Now starts a fresh interactive review.",
+        );
         for notice in notices {
-            ui.group(|ui| {
+            inset_frame(ui).show(ui, |ui| {
                 ui.label(format!(
                     "Sync Profile {} — {} missed occurrence{}",
                     notice.profile_id().value(),
@@ -3272,10 +5257,10 @@ impl SyncPlusApp {
             if let Err(error) = self.request_missed_schedule_run_now(notice_id) {
                 self.status = format!("Run Now was not started: {error}");
             }
-        } else if let Some(notice_id) = not_now {
-            if let Err(error) = self.record_missed_schedule_not_now(notice_id) {
-                self.status = format!("Not Now was not recorded: {error}");
-            }
+        } else if let Some(notice_id) = not_now
+            && let Err(error) = self.record_missed_schedule_not_now(notice_id)
+        {
+            self.status = format!("Not Now was not recorded: {error}");
         }
     }
 
@@ -3283,12 +5268,15 @@ impl SyncPlusApp {
         if self.scheduler_events.is_empty() {
             return;
         }
-        ui.separator();
-        ui.heading("Scheduler Events and Notifications");
-        ui.label("These text equivalents preserve the reason and safe next action for unattended work. Notification actions never bypass confirmation, verification, host-identity review, or Recovery Review.");
+        section_intro(
+            ui,
+            "Background activity",
+            "Scheduler Events and Notifications",
+            "These notices preserve the reason and safe next action for unattended work.",
+        );
         for event in &self.scheduler_events {
             let notification = event.notification();
-            ui.group(|ui| {
+            inset_frame(ui).show(ui, |ui| {
                 ui.label(format!(
                     "{} — Sync Profile {} — Sync Run {}",
                     notification.title(),
@@ -3316,11 +5304,14 @@ impl SyncPlusApp {
         if self.notifications.is_empty() {
             return;
         }
-        ui.separator();
-        ui.heading("Notifications");
-        ui.label("Notifications contain only safe status and next-action text. Open the Run Report to inspect paths and evidence; no notification bypasses confirmation or Recovery Review.");
+        section_intro(
+            ui,
+            "Updates",
+            "Notifications",
+            "Safe status and next-action text. Open the Run Report for paths and evidence.",
+        );
         for notification in &self.notifications {
-            ui.group(|ui| {
+            inset_frame(ui).show(ui, |ui| {
                 let run = notification
                     .run_id
                     .map(|run_id| format!(" — Sync Run {}", run_id.value()))
@@ -3352,15 +5343,19 @@ fn draw_conflict_review(
     let mut decisions_changed = false;
     let mut action = ConflictReviewAction::None;
 
-    ui.group(|ui| {
-        ui.heading("Conflict Review (read-only)");
+    card_frame(ui).show(ui, |ui| {
+        section_intro(
+            ui,
+            "Mirror Sync",
+            "Conflict Review (read-only)",
+            "Mirror Sync has no implicit winner. Choose one explicit whole-file decision for every entry.",
+        );
         draw_contextual_help_link(
             ui,
             "Conflict Review guidance",
             help_topic_for_surface(HelpSurface::ConflictReview),
             help_topic,
         );
-        ui.label("Mirror Sync has no implicit winner. Inspect both peer versions and choose one explicit whole-file decision for every entry.");
         ui.label("This review never edits file content. Preserve Both, Rename/Preserve for Review, and Defer keep the run open for later review.");
         if entries.is_empty() {
             ui.label("No Mirror conflicts require a whole-file decision in this Fresh Analysis.");
@@ -3370,7 +5365,7 @@ fn draw_conflict_review(
             let path = entry.relative_path().to_path_buf();
             let key = entry.key();
             ui.push_id(format!("{:?}:{:?}", entry.kind(), key), |ui| {
-                ui.separator();
+                inset_frame(ui).show(ui, |ui| {
                 ui.label(format!("Conflict path: {}", path.display()));
                 ui.label(format!("Conflict kind: {}", conflict_kind_label(entry.kind())));
                 if let Some(related_path) = entry.related_path() {
@@ -3418,6 +5413,7 @@ fn draw_conflict_review(
                             format!("selected {}", resolution_label(resolution))
                         })
                 ));
+                });
             });
         }
 
@@ -3463,17 +5459,17 @@ fn draw_conflict_review(
             }
             if conflicts.confirmed {
                 ui.label("Resolution Run confirmation recorded. No filesystem mutation has started.");
-            } else if ui.button("Confirm this exact Resolution Run").clicked() {
+            } else if primary_button(ui, "Confirm this exact Resolution Run").clicked() {
                 action = ConflictReviewAction::ConfirmResolutionRun;
             }
         } else if entries.is_empty() {
             ui.label("Resolution Run is not needed because Fresh Analysis found no conflicts.");
-        } else if ui
-            .add_enabled(
-                all_decisions && precheck_ready,
-                egui::Button::new("Start Resolution Run review (fresh-check decisions)"),
-            )
-            .clicked()
+        } else if primary_button_enabled(
+            ui,
+            "Start Resolution Run review (fresh-check decisions)",
+            all_decisions && precheck_ready,
+        )
+        .clicked()
         {
             action = ConflictReviewAction::StartResolutionRun;
         } else {
@@ -3515,11 +5511,7 @@ fn draw_conflict_evidence(ui: &mut egui::Ui, evidence: &syncplus_core::ConflictE
     });
 }
 
-fn draw_compatibility_review(
-    ui: &mut egui::Ui,
-    profile: &SyncProfile,
-    precheck: &PrecheckResult,
-) {
+fn draw_compatibility_review(ui: &mut egui::Ui, profile: &SyncProfile, precheck: &PrecheckResult) {
     if precheck.naming_conflicts().is_empty() {
         return;
     }
@@ -3586,10 +5578,18 @@ fn resolution_label(resolution: ConflictResolution) -> &'static str {
 
 fn resolution_consequence(action: &syncplus_core::ConflictResolutionAction) -> &'static str {
     match action.resolution() {
-        ConflictResolution::KeepPeerA => "copy Peer A's verified whole file to Peer B; Peer A is preserved",
-        ConflictResolution::KeepPeerB => "copy Peer B's verified whole file to Peer A; Peer B is preserved",
-        ConflictResolution::PreserveBoth => "keep both existing peer versions without an implicit winner",
-        ConflictResolution::RenamePreserveForReview => "preserve both versions for a later explicit review",
+        ConflictResolution::KeepPeerA => {
+            "copy Peer A's verified whole file to Peer B; Peer A is preserved"
+        }
+        ConflictResolution::KeepPeerB => {
+            "copy Peer B's verified whole file to Peer A; Peer B is preserved"
+        }
+        ConflictResolution::PreserveBoth => {
+            "keep both existing peer versions without an implicit winner"
+        }
+        ConflictResolution::RenamePreserveForReview => {
+            "preserve both versions for a later explicit review"
+        }
         ConflictResolution::Defer => "make no file change and keep this conflict unresolved",
     }
 }
@@ -3619,14 +5619,16 @@ fn draw_analysis_review(
         .chain(analysis.destination_inventory().items())
         .filter(|item| item.outcome() == AnalysisOutcome::Unsupported)
         .count();
-    let excluded_count = analysis
-        .source_inventory()
-        .excluded_items()
-        .count()
+    let excluded_count = analysis.source_inventory().excluded_items().count()
         + analysis.destination_inventory().excluded_items().count();
 
-    ui.group(|ui| {
-        ui.label("Fresh Analysis: Explainable Actions");
+    card_frame(ui).show(ui, |ui| {
+        section_intro(
+            ui,
+            "Fresh Analysis",
+            "Explainable Actions",
+            "A read-only plan generated from the current profile and endpoint inventories.",
+        );
         draw_contextual_help_link(
             ui,
             "Plan guidance",
@@ -3652,25 +5654,37 @@ fn draw_analysis_review(
             format_bytes(summary.source_removal_bytes())
         ));
         ui.label(format!("Transfer data: {}", format_bytes(summary.total_bytes())));
+        status_badge(
+            ui,
+            if unsupported_count == 0 {
+                "Scope ready for confirmation"
+            } else {
+                "Scope has unresolved items"
+            },
+            unsupported_count == 0,
+        );
     });
 
-    ui.collapsing(format!("Explainable Actions ({})", analysis.plan().action_count()), |ui| {
-        if analysis.plan().actions().is_empty() {
-            ui.label("No file actions are planned for this current state.");
-        }
-        for action in analysis.plan().actions() {
-            ui.label(format!(
-                "{:?}: {}{} — {}",
-                action.kind(),
-                action.relative_path().display(),
-                action
-                    .size()
-                    .map(|size| format!(" ({})", format_bytes(size)))
-                    .unwrap_or_default(),
-                action.consequence()
-            ));
-        }
-    });
+    ui.collapsing(
+        format!("Explainable Actions ({})", analysis.plan().action_count()),
+        |ui| {
+            if analysis.plan().actions().is_empty() {
+                ui.label("No file actions are planned for this current state.");
+            }
+            for action in analysis.plan().actions() {
+                ui.label(format!(
+                    "{:?}: {}{} — {}",
+                    action.kind(),
+                    action.relative_path().display(),
+                    action
+                        .size()
+                        .map(|size| format!(" ({})", format_bytes(size)))
+                        .unwrap_or_default(),
+                    action.consequence()
+                ));
+            }
+        },
+    );
 
     ui.collapsing(
         format!("Exclusion Rules ({})", review.profile.exclusions().len()),
@@ -3771,10 +5785,7 @@ fn analysis_has_unresolved_items(analysis: &FreshAnalysis) -> bool {
         .any(|item| item.outcome() == AnalysisOutcome::Unsupported)
 }
 
-fn stronger_confirmation_satisfied(
-    review: &PlanReviewState,
-    precheck: &PrecheckResult,
-) -> bool {
+fn stronger_confirmation_satisfied(review: &PlanReviewState, precheck: &PrecheckResult) -> bool {
     let typed_path = review.stronger_confirmation_path.trim();
     precheck
         .warnings()
@@ -3783,7 +5794,11 @@ fn stronger_confirmation_satisfied(
         .all(|warning| warning.source().display().to_string() == typed_path)
 }
 
-fn draw_confirmation_summary(ui: &mut egui::Ui, review: &PlanReviewState, analysis: &FreshAnalysis) {
+fn draw_confirmation_summary(
+    ui: &mut egui::Ui,
+    review: &PlanReviewState,
+    analysis: &FreshAnalysis,
+) {
     let summary = analysis.plan().summary();
     let (source, destination) = mapped_peers(&review.profile);
     if review.profile.mode() == SyncMode::OneWay {
@@ -3852,7 +5867,9 @@ fn format_bytes(bytes: u64) -> String {
 
 fn map_storage_error(error: syncplus_core::StorageError) -> UiValidationError {
     match error {
-        syncplus_core::StorageError::DuplicateEndpointPair => UiValidationError::DuplicateEndpointPair,
+        syncplus_core::StorageError::DuplicateEndpointPair => {
+            UiValidationError::DuplicateEndpointPair
+        }
         syncplus_core::StorageError::ConcurrentProfileUpdate => {
             UiValidationError::ProfileChangedDuringEdit
         }
@@ -3872,11 +5889,12 @@ fn execute_manual_run(
         .and_then(|path| path.parent())
         .ok_or_else(|| "canonical database has no XDG data parent".to_owned())?
         .to_path_buf();
-    let recovery_method = if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval) {
-        RecoveryMethod::permanent_removal()
-    } else {
-        RecoveryMethod::native_trash(data_home)
-    };
+    let recovery_method =
+        if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval) {
+            RecoveryMethod::permanent_removal()
+        } else {
+            RecoveryMethod::native_trash(data_home)
+        };
     let workflow = syncplus_core::RunWorkflow::new(recovery_method);
     let mut store = RunEvidenceStore::open_canonical().map_err(|error| error.to_string())?;
     workflow
@@ -3896,8 +5914,9 @@ impl eframe::App for SyncPlusApp {
         let context = ui.ctx().clone();
         self.ensure_tray(&context);
         self.process_tray_commands(&context);
+        self.poll_analysis();
         self.poll_manual_run(&context);
-        if context.input(|input| input.viewport().close_requested()) {
+        if !self.exit_requested && context.input(|input| input.viewport().close_requested()) {
             self.handle_close_request(&context);
         }
         if self.exit_requested {
@@ -3913,13 +5932,32 @@ impl eframe::App for SyncPlusApp {
         if let Err(error) = self.refresh_run_reports() {
             self.status = format!("Run Reports are unavailable: {error}");
         }
-        egui::Panel::top("app-menu").show(ui, |ui| self.draw_app_menu(ui, &context));
-        egui::Panel::right("help")
+        let palette = ui_palette(ui);
+        egui::Panel::left("workspace-sidebar")
             .resizable(true)
-            .default_size(360.0)
-            .show(ui, |ui| draw_help(ui, &mut self.help_topic));
-        egui::Panel::top("settings").show(ui, |ui| self.draw_settings(ui));
-        egui::Panel::left("profiles").show(ui, |ui| self.draw_profile_list(ui));
+            .default_size(250.0)
+            .min_size(220.0)
+            .max_size(300.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(palette.canvas)
+                    .inner_margin(egui::Margin::symmetric(14, 8)),
+            )
+            .show(ui, |ui| {
+                let sidebar_actions_height = 78.0;
+                let sidebar_content_height =
+                    (ui.available_height() - sidebar_actions_height).max(1.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("workspace-sidebar-content")
+                    .auto_shrink([false, false])
+                    .max_height(sidebar_content_height)
+                    .show(ui, |ui| {
+                        ui.set_min_height(sidebar_content_height);
+                        self.draw_sidebar(ui);
+                    });
+                ui.add_space(6.0);
+                self.draw_sidebar_actions(ui, &context);
+            });
         egui::CentralPanel::default().show(ui, |ui| self.draw_central_content(ui));
         self.draw_quit_dialog(&context);
     }
@@ -3927,26 +5965,77 @@ impl eframe::App for SyncPlusApp {
 
 impl SyncPlusApp {
     fn draw_central_content(&mut self, ui: &mut egui::Ui) {
+        match self.view {
+            AppView::Welcome => self.draw_welcome(ui),
+            AppView::Profiles => self.draw_profiles_page(ui),
+            AppView::Settings => self.draw_settings_page(ui),
+            AppView::Wizard => self.draw_wizard(ui),
+            AppView::Help => self.draw_help_page(ui),
+            AppView::Reports => {
+                egui::ScrollArea::vertical()
+                    .id_salt("reports-content")
+                    .show(ui, |ui| self.draw_run_reports(ui));
+            }
+            AppView::Sync => {
+                egui::ScrollArea::vertical()
+                    .id_salt("central-content")
+                    .show(ui, |ui| {
+                        self.draw_notifications(ui);
+                        self.draw_missed_schedule_notices(ui);
+                        self.draw_scheduler_events(ui);
+                        self.draw_profile_form(ui);
+                        self.draw_review(ui);
+                        self.draw_run_reports(ui);
+                    });
+            }
+        }
+    }
+
+    fn draw_help_page(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
-            .id_salt("notifications")
-            .show(ui, |ui| self.draw_notifications(ui));
-        egui::ScrollArea::vertical()
-            .id_salt("missed-schedule-notices")
-            .show(ui, |ui| self.draw_missed_schedule_notices(ui));
-        egui::ScrollArea::vertical()
-            .id_salt("scheduler-events")
-            .show(ui, |ui| self.draw_scheduler_events(ui));
-        egui::ScrollArea::vertical()
-            .id_salt("profile-form")
-            .show(ui, |ui| self.draw_profile_form(ui));
-        egui::ScrollArea::vertical()
-            .id_salt("review")
-            .show(ui, |ui| self.draw_review(ui));
-        egui::ScrollArea::vertical()
-            .id_salt("run-reports")
-            .show(ui, |ui| self.draw_run_reports(ui));
-        ui.separator();
-        ui.label(egui::RichText::new(&self.status).strong());
+            .id_salt("help-support")
+            .show(ui, |ui| {
+                let available_width = ui.available_width();
+                let content_width = available_width.min(1120.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(((available_width - content_width) / 2.0).max(0.0));
+                    ui.vertical(|ui| {
+                        ui.set_width(content_width);
+                        ui.add_space(28.0);
+                        card_frame(ui).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    section_intro(
+                                        ui,
+                                        "Support centre",
+                                        "Help & Support",
+                                        "A clear route through setup, synchronization, and recovery.",
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Min),
+                                    |ui| {
+                                        info_badge(ui, &format!("{} guides", help_topics().len()));
+                                    },
+                                );
+                            });
+                            ui.add_space(14.0);
+                            inset_frame(ui).show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    status_dot(ui, ui_palette(ui).accent);
+                                    ui.label(egui::RichText::new("Safety promise").strong());
+                                    ui.label(egui::RichText::new(
+                                        "Every guide explains the next safe action. Help informs decisions; it never bypasses a safety gate.",
+                                    ).color(ui_palette(ui).muted));
+                                });
+                            });
+                        });
+                        ui.add_space(8.0);
+                        draw_help(ui, &mut self.help_topic);
+                        ui.add_space(16.0);
+                    });
+                });
+            });
     }
 }
 
@@ -3955,7 +6044,20 @@ fn draw_run_report_detail(
     report: &RunReport,
     requested_help: &mut Option<HelpTopic>,
 ) {
-    ui.heading(format!("Sync Run {}", report.run_id().value()));
+    section_intro(
+        ui,
+        "Selected report",
+        &format!("Sync Run {}", report.run_id().value()),
+        "A durable record of the frozen Profile Snapshot, actions, outcomes, and review state.",
+    );
+    status_badge(
+        ui,
+        run_report_status_label(report.status()),
+        matches!(
+            report.status(),
+            RunReportStatus::Completed | RunReportStatus::ReviewCleared
+        ),
+    );
     draw_contextual_help_request(
         ui,
         "Run Report guidance",
@@ -3980,8 +6082,13 @@ fn draw_run_report_detail(
     ));
 
     if report.status() == RunReportStatus::InProgress {
-        ui.group(|ui| {
-            ui.heading("Active Sync Run");
+        inset_frame(ui).show(ui, |ui| {
+            section_intro(
+                ui,
+                "Live progress",
+                "Active Sync Run",
+                "The latest durable action boundary remains visible while the run is active.",
+            );
             draw_contextual_help_request(
                 ui,
                 "Progress and cancellation",
@@ -4012,7 +6119,7 @@ fn draw_run_report_detail(
             | RunReportStatus::Failed
             | RunReportStatus::Blocked
     ) {
-        ui.group(|ui| {
+        card_frame(ui).show(ui, |ui| {
             let report_help_topic = help_topic_for_report_status(report.status());
             let review_heading = match report.status() {
                 RunReportStatus::Failed => "Execution Failure Review",
@@ -4024,14 +6131,13 @@ fn draw_run_report_detail(
                 HelpTopic::PrecheckBlockers => "Precheck blocker guidance",
                 _ => "Recovery guidance",
             };
-            ui.heading(review_heading);
+            section_intro(ui, "Review required", review_heading, run_recovery_message(report.status()));
             draw_contextual_help_request(
                 ui,
                 review_help_label,
                 report_help_topic,
                 requested_help,
             );
-            ui.label(run_recovery_message(report.status()));
             if let Some(reason) = report.blocked_reason() {
                 let topic = help_topic_for_report_status(report.status());
                 ui.label(format!(
@@ -4088,22 +6194,25 @@ fn draw_run_report_detail(
                         evidence.source_present(),
                         evidence.destination_present(),
                         evidence.recovery_present(),
-                        evidence.source_size().map_or_else(|| "unknown".to_owned(), |size| format_bytes(size)),
-                        evidence.destination_size().map_or_else(|| "unknown".to_owned(), |size| format_bytes(size)),
+                        evidence.source_size().map_or_else(|| "unknown".to_owned(), format_bytes),
+                        evidence.destination_size().map_or_else(|| "unknown".to_owned(), format_bytes),
                     ));
                 }
             }
         });
     }
 
-    ui.collapsing(format!("Explainable Actions ({})", report.items().len()), |ui| {
-        if report.items().is_empty() {
-            ui.label("No action boundaries have been recorded yet.");
-        }
-        for item in report.items() {
-            ui.group(|ui| draw_explainable_action(ui, item));
-        }
-    });
+    ui.collapsing(
+        format!("Explainable Actions ({})", report.items().len()),
+        |ui| {
+            if report.items().is_empty() {
+                ui.label("No action boundaries have been recorded yet.");
+            }
+            for item in report.items() {
+                ui.group(|ui| draw_explainable_action(ui, item));
+            }
+        },
+    );
     if !report.mirror_resolutions().is_empty() {
         ui.collapsing("Mirror resolution evidence", |ui| {
             for resolution in report.mirror_resolutions() {
@@ -4120,7 +6229,7 @@ fn draw_run_report_detail(
 }
 
 fn draw_explainable_action(ui: &mut egui::Ui, item: &syncplus_core::RunReportItem) {
-            ui.label(format!(
+    ui.label(format!(
         "{} — {} — {}",
         item.relative_path().display(),
         plan_action_label(item.operation()),
@@ -4219,51 +6328,646 @@ fn action_outcome_label(outcome: &ActionOutcome) -> String {
 
 fn run_recovery_message(status: RunReportStatus) -> &'static str {
     match status {
-        RunReportStatus::Cancelled => "Cancellation was recorded. Unfinished work remains open; affected source items remain preserved when safety cannot prove removal. Inspect the durable action evidence before taking an explicit review action.",
-        RunReportStatus::Interrupted => "The run was interrupted by a crash, disconnect, or process stop. The last durable boundary is shown below and unresolved work requires Recovery Review.",
-        RunReportStatus::RecoveryReview => "Filesystem state crossed an uncertain boundary. The recorded source, destination, and recovery observations must be reviewed before this run can be cleared.",
-        RunReportStatus::CompletedWithReviewRequired => "Actions settled, but completion is withheld because unexplained, failed, unavailable, or otherwise unverified items remain.",
-        RunReportStatus::Failed => "At least one action failed. The report remains open so the failure, verification state, and preserved data can be reviewed.",
-        RunReportStatus::Blocked => "The run did not start because a safety precheck or scope blocker prevented mutation.",
+        RunReportStatus::Cancelled => {
+            "Cancellation was recorded. Unfinished work remains open; affected source items remain preserved when safety cannot prove removal. Inspect the durable action evidence before taking an explicit review action."
+        }
+        RunReportStatus::Interrupted => {
+            "The run was interrupted by a crash, disconnect, or process stop. The last durable boundary is shown below and unresolved work requires Recovery Review."
+        }
+        RunReportStatus::RecoveryReview => {
+            "Filesystem state crossed an uncertain boundary. The recorded source, destination, and recovery observations must be reviewed before this run can be cleared."
+        }
+        RunReportStatus::CompletedWithReviewRequired => {
+            "Actions settled, but completion is withheld because unexplained, failed, unavailable, or otherwise unverified items remain."
+        }
+        RunReportStatus::Failed => {
+            "At least one action failed. The report remains open so the failure, verification state, and preserved data can be reviewed."
+        }
+        RunReportStatus::Blocked => {
+            "The run did not start because a safety precheck or scope blocker prevented mutation."
+        }
         _ => "This run requires review before it can be treated as cleared.",
     }
 }
 
+fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    primary_button_enabled(ui, label, true)
+}
+
+fn primary_button_enabled(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    let palette = ui_palette(ui);
+    let fill = if enabled {
+        palette.accent
+    } else {
+        palette.elevated
+    };
+    let text_color = if enabled {
+        palette.on_accent
+    } else {
+        palette.muted
+    };
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(label).strong().color(text_color))
+            .fill(fill)
+            .stroke(egui::Stroke::new(
+                1.0,
+                if enabled {
+                    palette.accent
+                } else {
+                    palette.border_subtle
+                },
+            ))
+            .corner_radius(egui::CornerRadius::same(8))
+            .min_size(egui::vec2(0.0, 40.0)),
+    );
+    paint_focus_ring(ui, &response, palette.on_accent);
+    response
+}
+
+fn secondary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let palette = ui_palette(ui);
+    let response = ui.add(
+        egui::Button::new(egui::RichText::new(label).color(palette.text))
+            .fill(palette.elevated)
+            .stroke(egui::Stroke::new(1.0, palette.border))
+            .corner_radius(egui::CornerRadius::same(8))
+            .min_size(egui::vec2(0.0, 38.0)),
+    );
+    paint_focus_ring(ui, &response, palette.text);
+    response
+}
+
+fn sidebar_nav_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: bool,
+    icon: SidebarIcon,
+    icon_color: egui::Color32,
+) -> egui::Response {
+    let palette = ui_palette(ui);
+    let width = ui.available_width();
+    let response = ui.add(
+        egui::Button::new(
+            egui::RichText::new(format!("        {label}")).color(if selected {
+                palette.text
+            } else {
+                palette.muted
+            }),
+        )
+        .fill(if selected {
+            palette.accent_soft
+        } else {
+            egui::Color32::TRANSPARENT
+        })
+        .stroke(egui::Stroke::new(
+            1.0,
+            if selected {
+                palette.accent
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+        ))
+        .corner_radius(egui::CornerRadius::same(8))
+        .min_size(egui::vec2(width, 40.0)),
+    );
+    paint_sidebar_icon(ui, response.rect, icon, icon_color);
+    paint_focus_ring(ui, &response, palette.text);
+    response
+}
+
+fn paint_sidebar_icon(
+    ui: &egui::Ui,
+    button_rect: egui::Rect,
+    icon: SidebarIcon,
+    color: egui::Color32,
+) {
+    let painter = ui.painter();
+    let rect = egui::Rect::from_center_size(
+        egui::pos2(button_rect.left() + 22.0, button_rect.center().y),
+        egui::vec2(18.0, 18.0),
+    );
+    let stroke = egui::Stroke::new(1.7, color);
+
+    match icon {
+        SidebarIcon::Overview => {
+            let roof = [
+                egui::pos2(rect.left() + 2.0, rect.top() + 8.0),
+                egui::pos2(rect.center().x, rect.top() + 2.0),
+                egui::pos2(rect.right() - 2.0, rect.top() + 8.0),
+            ];
+            painter.line(roof.to_vec(), stroke);
+            painter.rect_stroke(
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 4.0, rect.top() + 7.0),
+                    egui::pos2(rect.right() - 4.0, rect.bottom() - 2.0),
+                ),
+                egui::CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(rect.center().x, rect.bottom() - 2.0),
+                    egui::pos2(rect.center().x, rect.bottom() - 7.0),
+                ],
+                stroke,
+            );
+        }
+        SidebarIcon::Profiles => {
+            painter.circle_stroke(egui::pos2(rect.center().x, rect.top() + 5.0), 2.8, stroke);
+            painter.line(
+                vec![
+                    egui::pos2(rect.center().x - 5.0, rect.bottom() - 2.0),
+                    egui::pos2(rect.center().x - 3.5, rect.bottom() - 5.0),
+                    egui::pos2(rect.center().x, rect.bottom() - 6.0),
+                    egui::pos2(rect.center().x + 3.5, rect.bottom() - 5.0),
+                    egui::pos2(rect.center().x + 5.0, rect.bottom() - 2.0),
+                ],
+                stroke,
+            );
+            painter.circle_stroke(egui::pos2(rect.left() + 4.0, rect.top() + 8.0), 2.0, stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 1.5, rect.bottom() - 2.0),
+                    egui::pos2(rect.left() + 6.5, rect.bottom() - 2.0),
+                ],
+                stroke,
+            );
+        }
+        SidebarIcon::SyncWorkspace => {
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 1.0, rect.top() + 6.0),
+                    egui::pos2(rect.right() - 2.0, rect.top() + 6.0),
+                ],
+                stroke,
+            );
+            painter.line(
+                vec![
+                    egui::pos2(rect.right() - 5.0, rect.top() + 3.0),
+                    egui::pos2(rect.right() - 1.0, rect.top() + 6.0),
+                    egui::pos2(rect.right() - 5.0, rect.top() + 9.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(rect.right() - 1.0, rect.bottom() - 6.0),
+                    egui::pos2(rect.left() + 2.0, rect.bottom() - 6.0),
+                ],
+                stroke,
+            );
+            painter.line(
+                vec![
+                    egui::pos2(rect.left() + 5.0, rect.bottom() - 9.0),
+                    egui::pos2(rect.left() + 1.0, rect.bottom() - 6.0),
+                    egui::pos2(rect.left() + 5.0, rect.bottom() - 3.0),
+                ],
+                stroke,
+            );
+        }
+        SidebarIcon::Reports => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 4.0, rect.top() + 2.0),
+                    egui::pos2(rect.right() - 4.0, rect.bottom() - 2.0),
+                ),
+                egui::CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            for offset in [6.0, 9.5, 13.0] {
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + 7.0, rect.top() + offset),
+                        egui::pos2(rect.right() - 7.0, rect.top() + offset),
+                    ],
+                    stroke,
+                );
+            }
+        }
+        SidebarIcon::Recovery => {
+            let shield = [
+                egui::pos2(rect.center().x, rect.top() + 1.0),
+                egui::pos2(rect.right() - 3.0, rect.top() + 5.0),
+                egui::pos2(rect.right() - 4.0, rect.bottom() - 5.0),
+                egui::pos2(rect.center().x, rect.bottom() - 1.0),
+                egui::pos2(rect.left() + 4.0, rect.bottom() - 5.0),
+                egui::pos2(rect.left() + 3.0, rect.top() + 5.0),
+            ];
+            painter.line(shield.to_vec(), stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + 6.5, rect.center().y),
+                    egui::pos2(rect.center().x - 1.0, rect.bottom() - 5.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(rect.center().x - 1.0, rect.bottom() - 5.0),
+                    egui::pos2(rect.right() - 5.5, rect.top() + 7.0),
+                ],
+                stroke,
+            );
+        }
+        SidebarIcon::Help => {
+            painter.circle_stroke(rect.center(), 7.0, stroke);
+            painter.text(
+                egui::pos2(rect.center().x, rect.top() + 1.0),
+                egui::Align2::CENTER_TOP,
+                "?",
+                egui::FontId::proportional(12.0),
+                color,
+            );
+        }
+    }
+}
+
+fn sidebar_exit_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let palette = ui_palette(ui);
+    let width = ui.available_width();
+    let response = ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .strong()
+                .color(palette.on_danger_soft),
+        )
+        .fill(palette.danger_soft)
+        .stroke(egui::Stroke::new(1.0, palette.danger))
+        .corner_radius(egui::CornerRadius::same(8))
+        .min_size(egui::vec2(width, 40.0)),
+    );
+    paint_focus_ring(ui, &response, palette.danger);
+    response
+}
+
+fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.5, color);
+}
+
+fn sync_path_arrow(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 28.0), egui::Sense::hover());
+    let stroke = egui::Stroke::new(2.5, color);
+    let center_y = rect.center().y;
+    let start_x = rect.left() + 5.0;
+    let tip_x = rect.right() - 5.0;
+    ui.painter().line_segment(
+        [egui::pos2(start_x, center_y), egui::pos2(tip_x, center_y)],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(tip_x - 8.0, center_y - 7.0),
+            egui::pos2(tip_x, center_y),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(tip_x - 8.0, center_y + 7.0),
+            egui::pos2(tip_x, center_y),
+        ],
+        stroke,
+    );
+}
+
+fn sync_illustration(ui: &mut egui::Ui, palette: UiPalette) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(300.0, 200.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, egui::CornerRadius::same(16), palette.field);
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(16),
+        egui::Stroke::new(1.0, palette.border_subtle),
+        egui::StrokeKind::Inside,
+    );
+
+    let panel_size = egui::vec2(88.0, 68.0);
+    let source =
+        egui::Rect::from_center_size(egui::pos2(rect.left() + 72.0, rect.center().y), panel_size);
+    let destination =
+        egui::Rect::from_center_size(egui::pos2(rect.right() - 72.0, rect.center().y), panel_size);
+    for (panel, color) in [(source, palette.accent), (destination, palette.secondary)] {
+        painter.rect_filled(panel, egui::CornerRadius::same(12), palette.elevated);
+        painter.rect_stroke(
+            panel,
+            egui::CornerRadius::same(12),
+            egui::Stroke::new(1.5, color),
+            egui::StrokeKind::Inside,
+        );
+        for row in 0..3 {
+            let y = panel.top() + 22.0 + row as f32 * 10.0;
+            painter.line_segment(
+                [
+                    egui::pos2(panel.left() + 14.0, y),
+                    egui::pos2(panel.right() - 14.0 - row as f32 * 7.0, y),
+                ],
+                egui::Stroke::new(2.0, color.gamma_multiply(0.7)),
+            );
+        }
+    }
+    let arrow_y = rect.center().y - 1.0;
+    let start_x = source.right() + 12.0;
+    let tip_x = destination.left() - 12.0;
+    let stroke = egui::Stroke::new(2.5, palette.accent);
+    painter.line_segment(
+        [egui::pos2(start_x, arrow_y), egui::pos2(tip_x, arrow_y)],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(tip_x - 8.0, arrow_y - 7.0),
+            egui::pos2(tip_x, arrow_y),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(tip_x - 8.0, arrow_y + 7.0),
+            egui::pos2(tip_x, arrow_y),
+        ],
+        stroke,
+    );
+    painter.text(
+        egui::pos2(source.center().x, source.bottom() + 18.0),
+        egui::Align2::CENTER_TOP,
+        "SOURCE",
+        egui::FontId::proportional(11.0),
+        palette.muted,
+    );
+    painter.text(
+        egui::pos2(destination.center().x, destination.bottom() + 18.0),
+        egui::Align2::CENTER_TOP,
+        "DESTINATION",
+        egui::FontId::proportional(11.0),
+        palette.muted,
+    );
+    painter.text(
+        egui::pos2(rect.center().x, rect.top() + 22.0),
+        egui::Align2::CENTER_TOP,
+        "REVIEW BEFORE RUN",
+        egui::FontId::proportional(11.0),
+        palette.secondary,
+    );
+}
+
+fn paint_focus_ring(ui: &egui::Ui, response: &egui::Response, inner_color: egui::Color32) {
+    if response.has_focus() {
+        let palette = ui_palette(ui);
+        ui.painter().rect_stroke(
+            response.rect.expand(3.0),
+            egui::CornerRadius::same(11),
+            egui::Stroke::new(2.0, palette.hot),
+            egui::StrokeKind::Outside,
+        );
+        ui.painter().rect_stroke(
+            response.rect.expand(1.0),
+            egui::CornerRadius::same(9),
+            egui::Stroke::new(2.0, inner_color),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
+fn neon_gradient(ui: &mut egui::Ui, width: f32, height: f32) {
+    let palette = ui_palette(ui);
+    let width = width.min(ui.available_width()).max(0.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    if !rect.is_positive() {
+        return;
+    }
+
+    let mut mesh = egui::epaint::Mesh::default();
+    mesh.colored_vertex(rect.left_top(), palette.accent);
+    mesh.colored_vertex(rect.right_top(), palette.secondary);
+    mesh.colored_vertex(rect.right_bottom(), palette.secondary);
+    mesh.colored_vertex(rect.left_bottom(), palette.accent);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    ui.painter().add(egui::Shape::mesh(mesh));
+}
+
+fn card_frame(ui: &egui::Ui) -> egui::Frame {
+    let palette = ui_palette(ui);
+    egui::Frame::new()
+        .fill(palette.surface)
+        .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+        .corner_radius(egui::CornerRadius::same(12))
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .outer_margin(egui::Margin::symmetric(0, 6))
+        .shadow(if ui.visuals().dark_mode {
+            egui::Shadow {
+                offset: [0, 3],
+                blur: 12,
+                spread: 1,
+                color: egui::Color32::from_black_alpha(80),
+            }
+        } else {
+            egui::Shadow {
+                offset: [0, 2],
+                blur: 8,
+                spread: 0,
+                color: egui::Color32::from_black_alpha(24),
+            }
+        })
+}
+
+fn inset_frame(ui: &egui::Ui) -> egui::Frame {
+    let palette = ui_palette(ui);
+    egui::Frame::new()
+        .fill(palette.elevated)
+        .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+        .corner_radius(egui::CornerRadius::same(9))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .outer_margin(egui::Margin::symmetric(0, 4))
+}
+
+fn full_width_inset_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let content_width = (ui.available_width() - 24.0).max(0.0);
+    inset_frame(ui).show(ui, |ui| {
+        ui.set_min_width(content_width);
+        add_contents(ui);
+    });
+}
+
+fn section_intro(ui: &mut egui::Ui, eyebrow: &str, title: &str, description: &str) {
+    let palette = ui_palette(ui);
+    ui.label(
+        egui::RichText::new(eyebrow.to_uppercase())
+            .small()
+            .strong()
+            .color(palette.accent),
+    );
+    ui.heading(title);
+    ui.label(egui::RichText::new(description).color(palette.muted));
+}
+
+fn status_badge(ui: &mut egui::Ui, label: &str, positive: bool) {
+    let palette = ui_palette(ui);
+    let fill = if positive {
+        palette.accent_soft
+    } else {
+        palette.amber_soft
+    };
+    let text = if positive {
+        palette.accent
+    } else {
+        palette.amber
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(9, 5))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).small().strong().color(text));
+        });
+}
+
+fn active_mode_badge(ui: &mut egui::Ui, mode: ApplicationMode) {
+    let label = format!("Active mode: {}", mode_label(mode));
+    status_badge(ui, &label, true);
+}
+
+fn info_badge(ui: &mut egui::Ui, label: &str) {
+    let palette = ui_palette(ui);
+    egui::Frame::new()
+        .fill(palette.elevated)
+        .stroke(egui::Stroke::new(1.0, palette.secondary))
+        .corner_radius(egui::CornerRadius::same(7))
+        .inner_margin(egui::Margin::symmetric(9, 5))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(label)
+                    .small()
+                    .strong()
+                    .color(palette.secondary),
+            );
+        });
+}
+
+fn endpoint_summary(endpoint: &EndpointForm) -> String {
+    match endpoint.kind {
+        EndpointKind::Local => {
+            if endpoint.local_path.trim().is_empty() {
+                "Not selected".to_owned()
+            } else {
+                endpoint.local_path.trim().to_owned()
+            }
+        }
+        EndpointKind::Ssh => {
+            if endpoint.server.trim().is_empty()
+                || endpoint.username.trim().is_empty()
+                || endpoint.remote_path.trim().is_empty()
+            {
+                "SSH peer not fully configured".to_owned()
+            } else {
+                format!(
+                    "{}@{}:{}{}",
+                    endpoint.username.trim(),
+                    endpoint.server.trim(),
+                    endpoint.port.trim(),
+                    endpoint.remote_path.trim()
+                )
+            }
+        }
+    }
+}
+
+fn endpoint_form_label(ui: &mut egui::Ui, label: &str) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(112.0, ui.spacing().interact_size.y),
+        egui::Sense::hover(),
+    );
+    ui.painter().text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::TextStyle::Body.resolve(ui.style()),
+        ui.visuals().text_color(),
+    );
+}
+
 fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
-    ui.collapsing(title, |ui| {
+    inset_frame(ui).show(ui, |ui| {
+        ui.label(egui::RichText::new(title).heading().strong());
+        ui.label(egui::RichText::new("A named endpoint keeps the sync scope explicit and reviewable.").color(ui_palette(ui).muted));
         ui.horizontal(|ui| {
-            ui.label("Name");
-            ui.text_edit_singleline(&mut endpoint.name);
+            endpoint_form_label(ui, "Display name");
+            let width = ui.available_width();
+            ui.add_sized(
+                egui::vec2(width, 32.0),
+                egui::TextEdit::singleline(&mut endpoint.name).vertical_align(egui::Align::Center),
+            );
         });
         ui.horizontal(|ui| {
-            ui.label("Location type");
+            endpoint_form_label(ui, "Endpoint type");
             ui.radio_value(&mut endpoint.kind, EndpointKind::Local, "Local folder");
             ui.radio_value(&mut endpoint.kind, EndpointKind::Ssh, "SSH peer");
         });
         match endpoint.kind {
             EndpointKind::Local => {
                 ui.horizontal(|ui| {
-                    ui.label("Folder path");
-                    ui.text_edit_singleline(&mut endpoint.local_path);
+                    endpoint_form_label(ui, "Folder");
+                    let browse_width = 106.0;
+                    let field_width = (ui.available_width()
+                        - browse_width
+                        - ui.spacing().item_spacing.x)
+                        .max(180.0);
+                    ui.add_sized(
+                        egui::vec2(field_width, 32.0),
+                        egui::TextEdit::singleline(&mut endpoint.local_path)
+                            .vertical_align(egui::Align::Center),
+                    );
+                    if secondary_button(ui, "Browse…").clicked()
+                        && let Some(path) = FileDialog::new()
+                            .set_title(format!("Select {title} folder"))
+                            .pick_folder()
+                        {
+                            endpoint.local_path = path.to_string_lossy().into_owned();
+                        }
                 });
                 ui.label("The folder is passed as a validated path argument; no shell command is accepted.");
             }
             EndpointKind::Ssh => {
                 ui.horizontal(|ui| {
-                    ui.label("Server");
-                    ui.text_edit_singleline(&mut endpoint.server);
-                    ui.label("Username");
-                    ui.text_edit_singleline(&mut endpoint.username);
-                    ui.label("Port");
-                    ui.add(egui::TextEdit::singleline(&mut endpoint.port).desired_width(55.0));
+                    endpoint_form_label(ui, "Server");
+                    ui.add_sized(
+                        egui::vec2(ui.available_width(), 32.0),
+                        egui::TextEdit::singleline(&mut endpoint.server)
+                            .vertical_align(egui::Align::Center),
+                    );
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Remote folder");
-                    ui.text_edit_singleline(&mut endpoint.remote_path);
+                    endpoint_form_label(ui, "Username");
+                    ui.add_sized(
+                        egui::vec2(ui.available_width(), 32.0),
+                        egui::TextEdit::singleline(&mut endpoint.username)
+                            .vertical_align(egui::Align::Center),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    endpoint_form_label(ui, "Port");
+                    ui.add_sized(
+                        egui::vec2(100.0, 32.0),
+                        egui::TextEdit::singleline(&mut endpoint.port)
+                            .vertical_align(egui::Align::Center),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    endpoint_form_label(ui, "Remote folder");
+                    let width = ui.available_width();
+                    ui.add_sized(
+                        egui::vec2(width, 32.0),
+                        egui::TextEdit::singleline(&mut endpoint.remote_path)
+                            .vertical_align(egui::Align::Center),
+                    );
                 });
                 ui.label("SSH host identity is checked by the core preflight before any mutation.");
                 ui.horizontal(|ui| {
-                    ui.label("Authentication");
+                    endpoint_form_label(ui, "Authentication");
                     ui.radio_value(&mut endpoint.authentication, AuthenticationForm::Key, "Identity file");
                     ui.radio_value(&mut endpoint.authentication, AuthenticationForm::Agent, "SSH agent");
                     ui.radio_value(
@@ -4280,14 +6984,22 @@ fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
                 match endpoint.authentication {
                     AuthenticationForm::Key => {
                         ui.horizontal(|ui| {
-                            ui.label("Identity file");
-                            ui.text_edit_singleline(&mut endpoint.identity);
+                            endpoint_form_label(ui, "Identity file");
+                            ui.add_sized(
+                                egui::vec2(ui.available_width(), 32.0),
+                                egui::TextEdit::singleline(&mut endpoint.identity)
+                                    .vertical_align(egui::Align::Center),
+                            );
                         });
                     }
                     AuthenticationForm::SavedPassword => {
                         ui.horizontal(|ui| {
-                            ui.label("Keyring reference");
-                            ui.text_edit_singleline(&mut endpoint.secret_reference);
+                            endpoint_form_label(ui, "Keyring reference");
+                            ui.add_sized(
+                                egui::vec2(ui.available_width(), 32.0),
+                                egui::TextEdit::singleline(&mut endpoint.secret_reference)
+                                    .vertical_align(egui::Align::Center),
+                            );
                         });
                         ui.label("Only the nonsecret reference is saved. Passwords and passphrases stay in the desktop keyring.");
                     }
@@ -4331,46 +7043,427 @@ fn draw_contextual_help_request(
 }
 
 fn help_link_clicked(ui: &mut egui::Ui, label: &str, topic: HelpTopic) -> bool {
-    ui.button(format!("Help: {label}"))
+    secondary_button(ui, &format!("Help: {label}"))
         .on_hover_text(format!("Open {} guidance", topic.label()))
         .clicked()
 }
 
 fn draw_help(ui: &mut egui::Ui, selected_topic: &mut HelpTopic) {
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        ui.heading("Help & safe diagnostics");
-        ui.label("Use the text links below to understand what SyncPlus is doing, why a decision is required, and the next safe action. Help never bypasses a safety gate.");
-        ui.horizontal_wrapped(|ui| {
-            for topic in help_topics() {
-                let selected = *selected_topic == *topic;
-                if ui.selectable_label(selected, topic.label()).clicked() {
-                    *selected_topic = *topic;
-                }
-            }
+    let content_width = ui.available_width();
+    let navigation_width = 270.0_f32.min((content_width * 0.32).max(230.0));
+    let article_width = (content_width - navigation_width - 16.0).max(0.0);
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.set_width(navigation_width);
+            draw_help_navigation(ui, selected_topic);
         });
-        let entry = help_entry(*selected_topic);
-        ui.group(|ui| {
-            ui.heading(entry.title);
-            ui.label(format!("What: {}", entry.what));
-            ui.label(format!("Why: {}", entry.why));
-            ui.label(format!("How: {}", entry.how));
-            ui.label(format!("When: {}", entry.when));
-            ui.label(format!("Consequences: {}", entry.consequences));
-            ui.label(format!("Limitations: {}", entry.limitations));
-            ui.label(format!("Next safe action: {}", entry.next_action));
+        ui.add_space(16.0);
+        ui.vertical(|ui| {
+            ui.set_width(article_width);
+            draw_help_article(ui, *selected_topic);
         });
     });
 }
 
+fn draw_help_navigation(ui: &mut egui::Ui, selected_topic: &mut HelpTopic) {
+    let palette = ui_palette(ui);
+    card_frame(ui).show(ui, |ui| {
+        section_intro(
+            ui,
+            "Browse guides",
+            "Support library",
+            "Choose a guide by task. Start at the top if SyncPlus is new to you.",
+        );
+        ui.add_space(10.0);
+        for (group, topics) in HELP_GROUPS {
+            ui.label(
+                egui::RichText::new(group.to_uppercase())
+                    .small()
+                    .strong()
+                    .color(palette.muted),
+            );
+            ui.add_space(4.0);
+            for topic in *topics {
+                if help_topic_button(ui, *topic, *selected_topic == *topic).clicked() {
+                    *selected_topic = *topic;
+                }
+            }
+            ui.add_space(6.0);
+        }
+    });
+}
+
+fn help_topic_button(ui: &mut egui::Ui, topic: HelpTopic, selected: bool) -> egui::Response {
+    let palette = ui_palette(ui);
+    let width = ui.available_width();
+    let response = ui.add(
+        egui::Button::new(egui::RichText::new(format!("   {}", topic.label())).color(
+            if selected {
+                palette.text
+            } else {
+                palette.muted
+            },
+        ))
+        .fill(if selected {
+            palette.accent_soft
+        } else {
+            egui::Color32::TRANSPARENT
+        })
+        .stroke(egui::Stroke::new(
+            1.0,
+            if selected {
+                palette.accent
+            } else {
+                egui::Color32::TRANSPARENT
+            },
+        ))
+        .corner_radius(egui::CornerRadius::same(7))
+        .min_size(egui::vec2(width, 34.0)),
+    );
+    ui.painter().circle_filled(
+        egui::pos2(response.rect.left() + 12.0, response.rect.center().y),
+        3.0,
+        help_topic_color(topic, palette),
+    );
+    paint_focus_ring(ui, &response, palette.accent);
+    response
+}
+
+fn help_topic_color(topic: HelpTopic, palette: UiPalette) -> egui::Color32 {
+    match topic {
+        HelpTopic::GettingStarted | HelpTopic::Modes | HelpTopic::OneWaySync => palette.accent,
+        HelpTopic::SafeDelete
+        | HelpTopic::Recovery
+        | HelpTopic::DestructiveActions
+        | HelpTopic::ExecutionFailures => palette.danger,
+        HelpTopic::MirrorSync
+        | HelpTopic::SshAuthentication
+        | HelpTopic::ProgressAndCancellation
+        | HelpTopic::Diagnostics => palette.secondary,
+        HelpTopic::ConflictReview | HelpTopic::CloneProfile => palette.hot,
+        HelpTopic::Exclusions | HelpTopic::RunReports | HelpTopic::PrecheckBlockers => {
+            palette.amber
+        }
+        HelpTopic::PlanAndConfirmation => palette.accent,
+    }
+}
+
+fn draw_help_article(ui: &mut egui::Ui, topic: HelpTopic) {
+    let palette = ui_palette(ui);
+    let entry = help_entry(topic);
+    let topic_color = help_topic_color(topic, palette);
+    card_frame(ui).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new("GUIDE")
+                        .small()
+                        .strong()
+                        .color(topic_color),
+                );
+                ui.heading(entry.title);
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                info_badge(ui, "SAFE GUIDANCE");
+            });
+        });
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+        help_article_section(ui, "At a glance", entry.what, topic_color);
+        help_article_section(ui, "Why it matters", entry.why, palette.secondary);
+        help_article_section(ui, "How to use it", entry.how, palette.accent);
+        help_article_section(ui, "When to use it", entry.when, palette.muted);
+        help_callout(
+            ui,
+            "Consequences",
+            entry.consequences,
+            palette.danger_soft,
+            palette.danger,
+            palette.on_danger_soft,
+        );
+        help_callout(
+            ui,
+            "Limitations",
+            entry.limitations,
+            palette.amber_soft,
+            palette.amber,
+            palette.text,
+        );
+        help_callout(
+            ui,
+            "Next safe action",
+            entry.next_action,
+            palette.accent_soft,
+            palette.accent,
+            palette.text,
+        );
+    });
+}
+
+fn help_article_section(
+    ui: &mut egui::Ui,
+    heading: &str,
+    body: &str,
+    heading_color: egui::Color32,
+) {
+    let palette = ui_palette(ui);
+    ui.label(
+        egui::RichText::new(heading.to_uppercase())
+            .small()
+            .strong()
+            .color(heading_color),
+    );
+    ui.add_space(3.0);
+    ui.label(egui::RichText::new(body).color(palette.text));
+    ui.add_space(11.0);
+}
+
+fn help_callout(
+    ui: &mut egui::Ui,
+    heading: &str,
+    body: &str,
+    fill: egui::Color32,
+    border: egui::Color32,
+    text: egui::Color32,
+) {
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, border))
+        .corner_radius(egui::CornerRadius::same(9))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .outer_margin(egui::Margin::symmetric(0, 5))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(heading.to_uppercase())
+                    .small()
+                    .strong()
+                    .color(border),
+            );
+            ui.add_space(3.0);
+            ui.label(egui::RichText::new(body).color(text));
+        });
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use super::*;
+
+    fn relative_luminance(color: egui::Color32) -> f32 {
+        fn linear_channel(channel: u8) -> f32 {
+            let channel = f32::from(channel) / 255.0;
+            if channel <= 0.04045 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        }
+
+        0.2126 * linear_channel(color.r())
+            + 0.7152 * linear_channel(color.g())
+            + 0.0722 * linear_channel(color.b())
+    }
+
+    fn contrast_ratio(foreground: egui::Color32, background: egui::Color32) -> f32 {
+        let foreground = relative_luminance(foreground);
+        let background = relative_luminance(background);
+        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+    }
 
     fn app() -> SyncPlusApp {
         SyncPlusApp::new_with_store(RunEvidenceStore::open_in_memory().expect("database"))
             .expect("app")
+    }
+
+    #[test]
+    fn option_a_palettes_meet_wcag_contrast_contract() {
+        for (name, palette) in [
+            ("dark", ui_palette_for_dark_mode(true)),
+            ("light", ui_palette_for_dark_mode(false)),
+        ] {
+            for (label, foreground, background) in [
+                ("primary text", palette.text, palette.canvas),
+                ("muted text", palette.muted, palette.canvas),
+                ("green accent", palette.accent, palette.canvas),
+                ("blue accent", palette.secondary, palette.canvas),
+                ("pink accent", palette.hot, palette.canvas),
+                (
+                    "exit button text",
+                    palette.on_danger_soft,
+                    palette.danger_soft,
+                ),
+                ("warning text", palette.amber, palette.amber_soft),
+                ("button text", palette.on_accent, palette.accent),
+            ] {
+                assert!(
+                    contrast_ratio(foreground, background) >= 4.5,
+                    "{name} {label} must meet WCAG AA normal-text contrast"
+                );
+            }
+
+            for (label, foreground, background) in [
+                ("card border", palette.border, palette.surface),
+                ("subtle card border", palette.border_subtle, palette.surface),
+            ] {
+                assert!(
+                    contrast_ratio(foreground, background) >= 3.0,
+                    "{name} {label} must meet WCAG non-text contrast"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_store_opens_branded_welcome_and_new_profile_starts_wizard() {
+        let mut syncplus = app();
+        assert_eq!(syncplus.view, AppView::Welcome);
+        assert_eq!(syncplus.wizard_step, None);
+
+        syncplus.start_new_profile();
+
+        assert_eq!(syncplus.view, AppView::Wizard);
+        assert_eq!(syncplus.wizard_step, Some(ProfileWizardStep::SyncMethod));
+    }
+
+    #[test]
+    fn wizard_requires_current_step_fields_before_advancing() {
+        let mut syncplus = app();
+        syncplus.start_new_profile();
+
+        assert_eq!(
+            syncplus.advance_wizard_step(ProfileWizardStep::SyncMethod),
+            Err(UiValidationError::EmptyProfileName)
+        );
+        assert_eq!(syncplus.wizard_step, Some(ProfileWizardStep::SyncMethod));
+
+        syncplus.form.name = "Documents backup".to_owned();
+        assert!(
+            syncplus
+                .advance_wizard_step(ProfileWizardStep::SyncMethod)
+                .is_ok()
+        );
+        assert_eq!(
+            syncplus.wizard_step,
+            Some(ProfileWizardStep::SourceEndpoint)
+        );
+        assert_eq!(
+            syncplus.wizard_step_validation(ProfileWizardStep::SourceEndpoint),
+            Err(UiValidationError::EmptyLocalPath { peer: "Source" })
+        );
+    }
+
+    #[test]
+    fn wizard_back_moves_to_the_previous_step_and_clears_review() {
+        let mut syncplus = app();
+        syncplus.start_new_profile();
+        syncplus.wizard_step = Some(ProfileWizardStep::DestinationEndpoint);
+        syncplus.review = Some(PlanReviewState {
+            profile: SyncProfile::new(
+                "Documents backup",
+                Peer::new("source", PathBuf::from("/source")),
+                Peer::new("destination", PathBuf::from("/destination")),
+            ),
+            precheck: None,
+            analysis: None,
+            conflicts: None,
+            error: None,
+            stronger_confirmation_path: String::new(),
+            confirmed: false,
+        });
+
+        syncplus.retreat_wizard_step(ProfileWizardStep::DestinationEndpoint);
+
+        assert_eq!(
+            syncplus.wizard_step,
+            Some(ProfileWizardStep::SourceEndpoint)
+        );
+        assert!(syncplus.review.is_none());
+    }
+
+    #[test]
+    fn selecting_a_saved_profile_loads_it_into_the_sync_workspace() {
+        let mut syncplus = app();
+        let profile = SyncProfile::new(
+            "Documents backup",
+            Peer::new("source", PathBuf::from("/source")),
+            Peer::new("destination", PathBuf::from("/destination")),
+        );
+        let persisted = syncplus.store.create_profile(&profile).expect("profile");
+        syncplus.profiles = syncplus.store.list_profiles().expect("profiles");
+
+        syncplus.select_profile(persisted.id());
+
+        assert_eq!(syncplus.view, AppView::Sync);
+        assert_eq!(syncplus.form.id, Some(persisted.id()));
+        assert_eq!(syncplus.form.name, "Documents backup");
+        assert!(syncplus.status().contains("Editing Documents backup"));
+    }
+
+    #[test]
+    fn help_navigation_is_separate_from_the_sync_workspace() {
+        let mut syncplus = app();
+        syncplus.show_help(HelpTopic::Recovery);
+        assert_eq!(syncplus.view, AppView::Help);
+        assert_eq!(syncplus.help_topic, HelpTopic::Recovery);
+
+        syncplus.show_sync_workspace();
+        assert_eq!(syncplus.view, AppView::Sync);
+        assert_eq!(syncplus.wizard_step, None);
+    }
+
+    #[test]
+    fn settings_navigation_is_available_as_a_primary_workspace_destination() {
+        let mut syncplus = app();
+        syncplus.show_settings();
+
+        assert_eq!(syncplus.view, AppView::Settings);
+        assert_eq!(syncplus.wizard_step, None);
+    }
+
+    #[test]
+    fn synchronise_starts_with_fresh_analysis_and_never_bypasses_confirmation() {
+        let (form, _source, base) = filesystem_form();
+        let mut syncplus = app();
+        syncplus.form = form;
+
+        syncplus.request_synchronise();
+
+        assert!(syncplus.review.is_some());
+        assert!(syncplus.active_manual_run.is_none());
+        assert!(syncplus.status().contains("Fresh Analysis completed"));
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn fresh_analysis_is_dispatched_without_blocking_the_ui_thread() {
+        let (form, _source, base) = filesystem_form();
+        let mut syncplus = app();
+        syncplus.form = form;
+        let context = egui::Context::default();
+
+        syncplus
+            .start_analysis(&context)
+            .expect("analysis should be dispatched");
+
+        assert!(syncplus.active_analysis.is_some());
+        assert!(syncplus.status().contains("running"));
+
+        for _ in 0..100 {
+            syncplus.poll_analysis();
+            if syncplus.active_analysis.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(syncplus.active_analysis.is_none());
+        fs::remove_dir_all(base).expect("test directory cleanup");
     }
 
     #[cfg(debug_assertions)]
@@ -4414,10 +7507,7 @@ mod tests {
 
     #[test]
     fn window_close_hides_to_tray_without_stopping_work() {
-        assert_eq!(
-            window_close_decision(true),
-            WindowCloseDecision::HideToTray
-        );
+        assert_eq!(window_close_decision(true), WindowCloseDecision::HideToTray);
         assert_eq!(
             window_close_decision(false),
             WindowCloseDecision::KeepVisible
@@ -4483,13 +7573,22 @@ mod tests {
         .expect("completed snapshot");
         store.begin_run(&completed_snapshot).expect("snapshot");
         store
-            .append_event(completed_run, syncplus_core::JournalEvent::Planned { action: action() })
+            .append_event(
+                completed_run,
+                syncplus_core::JournalEvent::Planned { action: action() },
+            )
             .expect("plan");
         store
-            .append_event(completed_run, syncplus_core::JournalEvent::Started { action_id: 1 })
+            .append_event(
+                completed_run,
+                syncplus_core::JournalEvent::Started { action_id: 1 },
+            )
             .expect("start");
         store
-            .append_event(completed_run, syncplus_core::JournalEvent::Completed { action_id: 1 })
+            .append_event(
+                completed_run,
+                syncplus_core::JournalEvent::Completed { action_id: 1 },
+            )
             .expect("complete");
 
         let unresolved_run = syncplus_core::RunId::new(91);
@@ -4501,10 +7600,16 @@ mod tests {
         .expect("unresolved snapshot");
         store.begin_run(&unresolved_snapshot).expect("snapshot");
         store
-            .append_event(unresolved_run, syncplus_core::JournalEvent::Planned { action: action() })
+            .append_event(
+                unresolved_run,
+                syncplus_core::JournalEvent::Planned { action: action() },
+            )
             .expect("plan");
         store
-            .append_event(unresolved_run, syncplus_core::JournalEvent::Started { action_id: 1 })
+            .append_event(
+                unresolved_run,
+                syncplus_core::JournalEvent::Started { action_id: 1 },
+            )
             .expect("start");
         store
             .append_event(
@@ -4526,12 +7631,16 @@ mod tests {
         assert_eq!(app.run_reports().len(), 2);
         assert_eq!(app.run_reports()[0].run_id(), unresolved_run);
         app.select_run_report(completed_run).expect("select report");
-        assert_eq!(app.selected_run_report().expect("selected report").run_id(), completed_run);
-        assert!(app
-            .remove_completed_report(unresolved_run)
-            .expect_err("unresolved work has a separate discard action")
-            .to_string()
-            .contains("Remove Completed Report"));
+        assert_eq!(
+            app.selected_run_report().expect("selected report").run_id(),
+            completed_run
+        );
+        assert!(
+            app.remove_completed_report(unresolved_run)
+                .expect_err("unresolved work has a separate discard action")
+                .to_string()
+                .contains("Remove Completed Report")
+        );
         app.mark_review_cleared(completed_run)
             .expect("record explicit review acknowledgement");
         assert_eq!(
@@ -4602,7 +7711,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let base = std::env::temp_dir().join(format!("syncplus-ui-{unique}-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("syncplus-ui-{unique}-{}", std::process::id()));
         let source = base.join("source");
         let destination = base.join("destination");
         fs::create_dir_all(&source).expect("source directory");
@@ -4611,8 +7721,10 @@ mod tests {
         fs::write(source.join("ignored.tmp"), b"excluded file").expect("excluded file");
         fs::write(destination.join("keep.txt"), b"old contents").expect("existing file");
 
-        let mut form = ProfileForm::default();
-        form.name = "Filesystem review".to_owned();
+        let mut form = ProfileForm {
+            name: "Filesystem review".to_owned(),
+            ..Default::default()
+        };
         form.peer_a.local_path = source.display().to_string();
         form.peer_b.local_path = destination.display().to_string();
         form.exclusions = "*.tmp".to_owned();
@@ -4656,7 +7768,10 @@ mod tests {
             .find(|profile| profile.id() == id)
             .expect("profile");
         assert!(persisted.schedule_enabled());
-        assert_eq!(persisted.schedule().expect("schedule").interval_minutes(), 15);
+        assert_eq!(
+            persisted.schedule().expect("schedule").interval_minutes(),
+            15
+        );
     }
 
     #[test]
@@ -4665,7 +7780,10 @@ mod tests {
         app.set_mode(ApplicationMode::Advanced);
         app.form = valid_form();
         app.form.schedule_interval_minutes = "0".to_owned();
-        assert_eq!(app.save_profile(), Err(UiValidationError::InvalidScheduleInterval));
+        assert_eq!(
+            app.save_profile(),
+            Err(UiValidationError::InvalidScheduleInterval)
+        );
         assert!(app.profiles().is_empty());
     }
 
@@ -4708,7 +7826,12 @@ mod tests {
         app.form = valid_form();
         app.form.peer_b.local_path.clear();
         let error = app.validate_profile().expect_err("empty path must block");
-        assert_eq!(error, UiValidationError::EmptyLocalPath { peer: "Destination" });
+        assert_eq!(
+            error,
+            UiValidationError::EmptyLocalPath {
+                peer: "Destination"
+            }
+        );
         assert!(app.profiles().is_empty());
     }
 
@@ -4720,7 +7843,10 @@ mod tests {
         assert_eq!(app.profiles().len(), 1);
         assert_eq!(app.profiles()[0].id(), id);
         assert_eq!(app.profiles()[0].profile().name(), "Documents backup");
-        assert_eq!(app.profiles()[0].profile().peer_a().root(), PathBuf::from("/home/user/Documents"));
+        assert_eq!(
+            app.profiles()[0].profile().peer_a().root(),
+            PathBuf::from("/home/user/Documents")
+        );
         assert!(app.status().contains("future runs"));
     }
 
@@ -4741,7 +7867,10 @@ mod tests {
         app.clone_profile(source_id).expect("clone profile");
         assert_eq!(app.form.id, None);
         assert_eq!(app.form.peer_b.secret_reference, "");
-        assert_eq!(app.form.peer_b.authentication, AuthenticationForm::NeedsConfiguration);
+        assert_eq!(
+            app.form.peer_b.authentication,
+            AuthenticationForm::NeedsConfiguration
+        );
         app.form.peer_b.name = "renamed destination label".to_owned();
         assert_eq!(
             app.save_profile(),
@@ -4760,7 +7889,10 @@ mod tests {
             .iter()
             .find(|profile| profile.id() == clone_id)
             .expect("saved clone");
-        assert_eq!(clone.profile().peer_b().root(), PathBuf::from("/srv/backup-copy"));
+        assert_eq!(
+            clone.profile().peer_b().root(),
+            PathBuf::from("/srv/backup-copy")
+        );
         assert!(!clone.authorizations().allow_unattended_destructive());
         assert!(!clone.authorizations().allow_unattended_permanent_removal());
     }
@@ -4773,10 +7905,7 @@ mod tests {
         source_form.deletion_method = Some(DeletionMethod::PermanentRemoval);
         let source = source_form.build().expect("source profile");
         let source_id = store
-            .create_profile_with_authorizations(
-                &source,
-                AuthorizationSnapshot::new(true, true),
-            )
+            .create_profile_with_authorizations(&source, AuthorizationSnapshot::new(true, true))
             .expect("authorized source profile")
             .id();
         let mut app = SyncPlusApp::new_with_store(store).expect("app");
@@ -4796,7 +7925,10 @@ mod tests {
             .iter()
             .find(|profile| profile.id() == clone_id)
             .expect("saved clone");
-        assert_eq!(clone.profile().options().deletion_method, Some(DeletionMethod::Trash));
+        assert_eq!(
+            clone.profile().options().deletion_method,
+            Some(DeletionMethod::Trash)
+        );
         assert!(!clone.authorizations().allow_unattended_destructive());
         assert!(!clone.authorizations().allow_unattended_permanent_removal());
     }
@@ -4809,10 +7941,7 @@ mod tests {
         source_form.deletion_method = Some(DeletionMethod::PermanentRemoval);
         let source = source_form.build().expect("source profile");
         let source_id = store
-            .create_profile_with_authorizations(
-                &source,
-                AuthorizationSnapshot::new(true, true),
-            )
+            .create_profile_with_authorizations(&source, AuthorizationSnapshot::new(true, true))
             .expect("authorized source profile")
             .id();
         let mut app = SyncPlusApp::new_with_store(store).expect("app");
@@ -4860,8 +7989,8 @@ mod tests {
     #[test]
     fn saved_password_profiles_require_an_available_keyring_entry() {
         let store = RunEvidenceStore::open_in_memory().expect("database");
-        let mut app = SyncPlusApp::new_with_store_and_secret_store(store, AvailableSecretStore)
-            .expect("app");
+        let mut app =
+            SyncPlusApp::new_with_store_and_secret_store(store, AvailableSecretStore).expect("app");
         app.form = valid_form();
         app.form.peer_b.kind = EndpointKind::Ssh;
         app.form.peer_b.server = "backup.example.com".to_owned();
@@ -4892,13 +8021,20 @@ mod tests {
         let review = app.review.as_ref().expect("review state");
         let analysis = review.analysis.as_ref().expect("fresh analysis");
         assert!(review.precheck.as_ref().expect("precheck").can_execute());
-        assert!(analysis
-            .source_inventory()
-            .excluded_items()
-            .any(|item| item.relative_path() == std::path::Path::new("ignored.tmp")));
+        assert!(
+            analysis
+                .source_inventory()
+                .excluded_items()
+                .any(|item| item.relative_path() == std::path::Path::new("ignored.tmp"))
+        );
         assert!(analysis.plan().summary().overwrite_count() >= 1);
         assert!(analysis.specification().preview().contains("rsync"));
-        assert!(!analysis.specification().preview().contains("test-only-secret"));
+        assert!(
+            !analysis
+                .specification()
+                .preview()
+                .contains("test-only-secret")
+        );
         assert!(app.status().contains("Fresh Analysis ready"));
 
         fs::remove_dir_all(base).expect("test directory cleanup");
@@ -4912,7 +8048,10 @@ mod tests {
         let mut app = app();
         app.form = form;
 
-        assert_eq!(app.analyze_profile(), Err(UiValidationError::PrecheckBlocked));
+        assert_eq!(
+            app.analyze_profile(),
+            Err(UiValidationError::PrecheckBlocked)
+        );
         let review = app.review.as_ref().expect("blocked review state");
         let precheck = review.precheck.as_ref().expect("precheck result");
         assert!(!precheck.can_execute());
@@ -4952,32 +8091,48 @@ mod tests {
         let entries = app.conflict_entries().expect("mirror conflict review");
         assert_eq!(entries.len(), 1);
         assert!(entries[0].is_read_only());
-        assert!(app.start_resolution_run().is_err(), "missing decisions must block");
+        assert!(
+            app.start_resolution_run().is_err(),
+            "missing decisions must block"
+        );
 
         app.set_conflict_resolution("keep.txt", ConflictResolution::KeepPeerA)
             .expect("whole-file decision");
-        fs::write(source.join("keep.txt"), b"changed before resolution start").expect("change source");
-        assert!(app.start_resolution_run().is_err(), "stale resolution must block before start");
+        fs::write(source.join("keep.txt"), b"changed before resolution start")
+            .expect("change source");
+        assert!(
+            app.start_resolution_run().is_err(),
+            "stale resolution must block before start"
+        );
 
-        app.analyze_profile().expect("fresh mirror analysis should pass");
+        app.analyze_profile()
+            .expect("fresh mirror analysis should pass");
         app.set_conflict_resolution("keep.txt", ConflictResolution::KeepPeerA)
             .expect("whole-file decision after fresh analysis");
         app.start_resolution_run()
             .expect("selected decision starts a fresh Resolution Run");
         assert!(!app.resolution_is_confirmed());
         let source_before = fs::read(source.join("keep.txt")).expect("source contents");
-        let destination_before = fs::read(base.join("destination/keep.txt")).expect("destination contents");
+        let destination_before =
+            fs::read(base.join("destination/keep.txt")).expect("destination contents");
         app.confirm_resolution_run()
             .expect("fresh Resolution Run confirmation should pass");
         assert!(app.resolution_is_confirmed());
-        assert_eq!(fs::read(source.join("keep.txt")).expect("source contents"), source_before);
+        assert_eq!(
+            fs::read(source.join("keep.txt")).expect("source contents"),
+            source_before
+        );
         assert_eq!(
             fs::read(base.join("destination/keep.txt")).expect("destination contents"),
             destination_before
         );
 
-        fs::write(source.join("keep.txt"), b"changed after conflict review").expect("change source");
-        assert!(app.confirm_resolution_run().is_err(), "stale resolution must block");
+        fs::write(source.join("keep.txt"), b"changed after conflict review")
+            .expect("change source");
+        assert!(
+            app.confirm_resolution_run().is_err(),
+            "stale resolution must block"
+        );
         assert!(!app.resolution_is_confirmed());
 
         fs::remove_dir_all(base).expect("test directory cleanup");
@@ -4998,15 +8153,28 @@ mod tests {
         let options = profile.options();
         assert!(options.metadata.timestamps());
         assert!(options.metadata.specialist_metadata().ownership());
-        assert!(options.metadata.specialist_metadata().access_control_lists());
+        assert!(
+            options
+                .metadata
+                .specialist_metadata()
+                .access_control_lists()
+        );
         assert!(options.metadata.specialist_metadata().extended_attributes());
-        assert_eq!(options.partial_transfer_policy, PartialTransferPolicy::KeepPartialForResume);
+        assert_eq!(
+            options.partial_transfer_policy,
+            PartialTransferPolicy::KeepPartialForResume
+        );
         assert_eq!(options.retry_policy.max_attempts(), 5);
-        assert_eq!(options.retry_policy.initial_delay(), Duration::from_millis(250));
-        assert!(!syncplus_core::ProcessSpecification::from_profile(&profile)
-            .expect("validated specification")
-            .preview()
-            .contains("--arbitrary"));
+        assert_eq!(
+            options.retry_policy.initial_delay(),
+            Duration::from_millis(250)
+        );
+        assert!(
+            !syncplus_core::ProcessSpecification::from_profile(&profile)
+                .expect("validated specification")
+                .preview()
+                .contains("--arbitrary")
+        );
 
         form.retry_attempts = "11".to_owned();
         assert_eq!(form.build(), Err(UiValidationError::InvalidRetryAttempts));

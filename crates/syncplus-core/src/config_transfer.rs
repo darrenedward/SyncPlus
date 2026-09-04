@@ -15,11 +15,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    storage::{ConfigurationImport, ImportedProfile},
     ApplicationMode, ApplicationSettings, DeletionMethod, MetadataRequirements, OneWaySource,
-    PartialTransferPolicy, Peer, PeerEndpoint, RetryPolicy,
-    SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions, SyncProfile,
-    ThemePreference,
+    PartialTransferPolicy, Peer, PeerEndpoint, RetryPolicy, SpecialistMetadataRequirements,
+    SshAuthentication, SyncMode, SyncOptions, SyncProfile, ThemePreference,
+    storage::{ConfigurationImport, ImportedProfile},
 };
 use crate::{ProcessSpecification, RunEvidenceStore, ScheduleDefinition, StorageError};
 
@@ -87,7 +86,10 @@ impl fmt::Display for ConfigurationTransferError {
                 "configuration schema version {version} is unsupported; export a fresh file from this SyncPlus version"
             ),
             Self::InvalidConfiguration { field, reason } => {
-                write!(formatter, "configuration field {field} is invalid: {reason}")
+                write!(
+                    formatter,
+                    "configuration field {field} is invalid: {reason}"
+                )
             }
             Self::Storage(error) => write!(
                 formatter,
@@ -118,6 +120,12 @@ struct ExportConfiguration {
 struct ExportSettings {
     mode: ExportApplicationMode,
     theme: ExportTheme,
+    #[serde(default = "default_hide_to_tray_on_close")]
+    hide_to_tray_on_close: bool,
+}
+
+fn default_hide_to_tray_on_close() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -286,8 +294,8 @@ fn prepare_import(
     json: &str,
     existing_profile_count: usize,
 ) -> Result<PreparedImport, ConfigurationTransferError> {
-    let document: ExportConfiguration = serde_json::from_str(json)
-        .map_err(ConfigurationTransferError::Json)?;
+    let document: ExportConfiguration =
+        serde_json::from_str(json).map_err(ConfigurationTransferError::Json)?;
     if document.schema_version != CURRENT_SCHEMA_VERSION {
         return Err(ConfigurationTransferError::UnsupportedSchemaVersion(
             document.schema_version,
@@ -350,9 +358,12 @@ fn prepare_import(
                 ));
             }
         }
-        if endpoint_pairs.iter().any(|(existing_a, existing_b): &(Peer, Peer)| {
-            existing_a.same_endpoint(&peer_a) && existing_b.same_endpoint(&peer_b)
-        }) {
+        if endpoint_pairs
+            .iter()
+            .any(|(existing_a, existing_b): &(Peer, Peer)| {
+                existing_a.same_endpoint(&peer_a) && existing_b.same_endpoint(&peer_b)
+            })
+        {
             return Err(invalid(
                 field,
                 "the endpoint pair duplicates another imported Sync Profile",
@@ -373,12 +384,9 @@ fn prepare_import(
             .map(|schedule| {
                 schedule_count += 1;
                 let was_enabled = schedule.enabled;
-                let schedule = ScheduleDefinition::new(
-                    schedule.interval_minutes,
-                    schedule.timezone,
-                    false,
-                )
-                .map_err(|error| invalid(format!("{field}.schedule"), error.to_string()))?;
+                let schedule =
+                    ScheduleDefinition::new(schedule.interval_minutes, schedule.timezone, false)
+                        .map_err(|error| invalid(format!("{field}.schedule"), error.to_string()))?;
                 if was_enabled {
                     enabled_schedules_disabled += 1;
                 }
@@ -392,7 +400,10 @@ fn prepare_import(
             .with_options(options)
             .with_exclusions(exported.exclusions);
         ProcessSpecification::from_profile(&profile).map_err(|error| {
-            invalid(format!("{field}.options"), format!("profile is not executable: {error}"))
+            invalid(
+                format!("{field}.options"),
+                format!("profile is not executable: {error}"),
+            )
         })?;
         imported_profiles.push(ImportedProfile { profile, schedule });
     }
@@ -425,6 +436,7 @@ impl ExportSettings {
                 ThemePreference::Light => ExportTheme::Light,
                 ThemePreference::Dark => ExportTheme::Dark,
             },
+            hide_to_tray_on_close: settings.hide_to_tray_on_window_close(),
         }
     }
 
@@ -440,6 +452,7 @@ impl ExportSettings {
                 ExportTheme::Dark => ThemePreference::Dark,
             },
         )
+        .with_hide_to_tray_on_window_close(self.hide_to_tray_on_close)
     }
 }
 
@@ -546,9 +559,8 @@ impl ExportOptions {
     }
 
     fn into_safe_options(self) -> (SyncOptions, bool) {
-        let stripped_destructive = self.safe_delete
-            || self.destination_cleanup
-            || self.deletion_method.is_some();
+        let stripped_destructive =
+            self.safe_delete || self.destination_cleanup || self.deletion_method.is_some();
         let metadata = MetadataRequirements::new(
             self.metadata.file_type,
             self.metadata.executable_permissions,
@@ -651,14 +663,12 @@ impl From<ExportPartialTransferPolicy> for PartialTransferPolicy {
 }
 
 fn path_to_string(path: &Path, field: &str) -> Result<String, ConfigurationTransferError> {
-    path.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            invalid(
-                field,
-                "contains a non-Unicode path that cannot be represented in JSON",
-            )
-        })
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        invalid(
+            field,
+            "contains a non-Unicode path that cannot be represented in JSON",
+        )
+    })
 }
 
 fn invalid(field: impl Into<String>, reason: impl Into<String>) -> ConfigurationTransferError {

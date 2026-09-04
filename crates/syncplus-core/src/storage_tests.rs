@@ -10,8 +10,8 @@ use rusqlite::params;
 use crate::{
     ApplicationMode, ApplicationSettings, AuthorizationSnapshot, HostTrustError, Peer,
     RunEvidenceStore, RunId, RunSnapshot, SavedSecretReference, ScheduleDefinition,
-    SshAuthentication, SshHost, SshHostFingerprint, SyncMode,
-    SyncProfile, StorageError, ThemePreference,
+    SshAuthentication, SshHost, SshHostFingerprint, StorageError, SyncMode, SyncProfile,
+    ThemePreference,
 };
 
 fn profile() -> SyncProfile {
@@ -43,12 +43,15 @@ fn application_settings_survive_restart() {
     let database = database();
     {
         let mut store = RunEvidenceStore::open(database.path()).expect("open database");
-        assert_eq!(store.load_settings().expect("default settings"), ApplicationSettings::default());
+        assert_eq!(
+            store.load_settings().expect("default settings"),
+            ApplicationSettings::default()
+        );
         store
-            .save_settings(&ApplicationSettings::new(
-                ApplicationMode::Advanced,
-                ThemePreference::Dark,
-            ))
+            .save_settings(
+                &ApplicationSettings::new(ApplicationMode::Advanced, ThemePreference::Dark)
+                    .with_hide_to_tray_on_window_close(false),
+            )
             .expect("save settings");
     }
 
@@ -56,6 +59,7 @@ fn application_settings_survive_restart() {
     assert_eq!(
         reopened.load_settings().expect("load settings"),
         ApplicationSettings::new(ApplicationMode::Advanced, ThemePreference::Dark)
+            .with_hide_to_tray_on_window_close(false)
     );
 }
 
@@ -78,7 +82,11 @@ fn profiles_round_trip_with_validated_endpoints_and_safe_defaults() {
         assert!(!persisted.profile().options().destination_cleanup);
         assert!(!persisted.schedule_enabled());
         assert!(!persisted.authorizations().allow_unattended_destructive());
-        assert!(!persisted.authorizations().allow_unattended_permanent_removal());
+        assert!(
+            !persisted
+                .authorizations()
+                .allow_unattended_permanent_removal()
+        );
 
         store
             .update_profile(profile_id, &edited)
@@ -94,10 +102,12 @@ fn profiles_round_trip_with_validated_endpoints_and_safe_defaults() {
     assert_eq!(reopened.list_profiles().expect("list profiles").len(), 1);
 
     assert!(reopened.remove_profile(profile_id).expect("remove profile"));
-    assert!(reopened
-        .load_profile(profile_id)
-        .expect("load removed profile")
-        .is_none());
+    assert!(
+        reopened
+            .load_profile(profile_id)
+            .expect("load removed profile")
+            .is_none()
+    );
 }
 
 #[test]
@@ -151,10 +161,7 @@ fn explicitly_created_authorizations_round_trip_separately_from_profile_fields()
         ..crate::SyncOptions::default()
     });
     let id = store
-        .create_profile_with_authorizations(
-            &profile,
-            AuthorizationSnapshot::new(true, true),
-        )
+        .create_profile_with_authorizations(&profile, AuthorizationSnapshot::new(true, true))
         .expect("create profile")
         .id();
 
@@ -225,9 +232,15 @@ fn safety_and_endpoint_edits_revoke_unattended_authorization() {
             persisted.revision(),
         )
         .expect("endpoint edit");
-    assert!(!after_endpoint_change.authorizations().allow_unattended_destructive());
+    assert!(
+        !after_endpoint_change
+            .authorizations()
+            .allow_unattended_destructive()
+    );
 
-    let options_changed = endpoint_changed.clone().with_options(crate::SyncOptions::default());
+    let options_changed = endpoint_changed
+        .clone()
+        .with_options(crate::SyncOptions::default());
     let after_safety_change = store
         .update_profile_with_authorizations_if_revision(
             persisted.id(),
@@ -236,21 +249,33 @@ fn safety_and_endpoint_edits_revoke_unattended_authorization() {
             after_endpoint_change.revision(),
         )
         .expect("safety edit");
-    assert!(!after_safety_change.authorizations().allow_unattended_destructive());
+    assert!(
+        !after_safety_change
+            .authorizations()
+            .allow_unattended_destructive()
+    );
 }
 
 #[test]
 fn recurring_schedule_round_trips_and_requires_advanced_mode_to_enable() {
     let database = database();
     let mut store = RunEvidenceStore::open(database.path()).expect("open database");
-    let id = store.create_profile(&profile()).expect("create profile").id();
+    let id = store
+        .create_profile(&profile())
+        .expect("create profile")
+        .id();
     let disabled = ScheduleDefinition::new(60, "Pacific/Auckland", false).expect("schedule");
 
     let persisted = store
         .update_schedule(id, Some(disabled.clone()), ApplicationMode::Simple)
         .expect("save disabled schedule");
     assert_eq!(persisted.schedule(), Some(&disabled));
-    assert_eq!(persisted.schedule().and_then(|schedule| schedule.next_run_at_unix_seconds()), None);
+    assert_eq!(
+        persisted
+            .schedule()
+            .and_then(|schedule| schedule.next_run_at_unix_seconds()),
+        None
+    );
     assert!(!persisted.schedule_enabled());
 
     let enabled = disabled.with_enabled(true);
@@ -261,9 +286,21 @@ fn recurring_schedule_round_trips_and_requires_advanced_mode_to_enable() {
     let persisted = store
         .update_schedule(id, Some(enabled.clone()), ApplicationMode::Advanced)
         .expect("enable schedule in Advanced Mode");
-    assert_eq!(persisted.schedule().map(|schedule| schedule.interval_minutes()), Some(60));
-    assert_eq!(persisted.schedule().map(|schedule| schedule.timezone()), Some("Pacific/Auckland"));
-    assert!(persisted.schedule().is_some_and(|schedule| schedule.next_run_at_unix_seconds().is_some()));
+    assert_eq!(
+        persisted
+            .schedule()
+            .map(|schedule| schedule.interval_minutes()),
+        Some(60)
+    );
+    assert_eq!(
+        persisted.schedule().map(|schedule| schedule.timezone()),
+        Some("Pacific/Auckland")
+    );
+    assert!(
+        persisted
+            .schedule()
+            .is_some_and(|schedule| schedule.next_run_at_unix_seconds().is_some())
+    );
     assert!(persisted.schedule_enabled());
 
     drop(store);
@@ -272,9 +309,21 @@ fn recurring_schedule_round_trips_and_requires_advanced_mode_to_enable() {
         .load_profile(id)
         .expect("load profile")
         .expect("profile exists");
-    assert_eq!(loaded.schedule().map(|schedule| schedule.interval_minutes()), Some(60));
-    assert_eq!(loaded.schedule().map(|schedule| schedule.timezone()), Some("Pacific/Auckland"));
-    assert!(loaded.schedule().is_some_and(|schedule| schedule.next_run_at_unix_seconds().is_some()));
+    assert_eq!(
+        loaded
+            .schedule()
+            .map(|schedule| schedule.interval_minutes()),
+        Some(60)
+    );
+    assert_eq!(
+        loaded.schedule().map(|schedule| schedule.timezone()),
+        Some("Pacific/Auckland")
+    );
+    assert!(
+        loaded
+            .schedule()
+            .is_some_and(|schedule| schedule.next_run_at_unix_seconds().is_some())
+    );
 }
 
 #[test]
@@ -282,8 +331,8 @@ fn due_schedule_claim_is_atomic_advances_next_run_and_freezes_snapshot() {
     let database = database();
     let mut store = RunEvidenceStore::open(database.path()).expect("open database");
     let persisted = store.create_profile(&profile()).expect("create profile");
-    let schedule = ScheduleDefinition::new_with_next_run_at(1, "UTC", true, Some(600))
-        .expect("schedule");
+    let schedule =
+        ScheduleDefinition::new_with_next_run_at(1, "UTC", true, Some(600)).expect("schedule");
     store
         .update_schedule_at(
             persisted.id(),
@@ -304,11 +353,16 @@ fn due_schedule_claim_is_atomic_advances_next_run_and_freezes_snapshot() {
         .load_profile(persisted.id())
         .expect("load profile")
         .expect("profile exists");
-    assert_eq!(loaded.schedule().and_then(|s| s.next_run_at_unix_seconds()), Some(660));
-    assert!(store
-        .claim_due_schedule(persisted.id(), 601)
-        .expect("second claim")
-        .is_none());
+    assert_eq!(
+        loaded.schedule().and_then(|s| s.next_run_at_unix_seconds()),
+        Some(660)
+    );
+    assert!(
+        store
+            .claim_due_schedule(persisted.id(), 601)
+            .expect("second claim")
+            .is_none()
+    );
 
     let edited = persisted.profile().clone().with_mode(SyncMode::Mirror);
     store
@@ -335,9 +389,16 @@ fn profile_edits_and_removal_do_not_mutate_a_started_run_snapshot() {
     store
         .update_profile(persisted.id(), &edited)
         .expect("edit profile");
-    assert!(store.remove_profile(persisted.id()).expect("remove profile"));
+    assert!(
+        store
+            .remove_profile(persisted.id())
+            .expect("remove profile")
+    );
 
-    assert_eq!(store.load_snapshot(RunId::new(79)).expect("load snapshot"), run);
+    assert_eq!(
+        store.load_snapshot(RunId::new(79)).expect("load snapshot"),
+        run
+    );
 }
 
 #[test]
@@ -360,18 +421,26 @@ fn profile_removal_changes_metadata_only_and_preserves_endpoint_files() {
     assert!(store.remove_profile(profile_id).expect("remove profile"));
     assert!(source_file.is_file());
     assert!(destination_file.is_file());
-    assert!(store
-        .load_profile(profile_id)
-        .expect("load removed profile")
-        .is_none());
+    assert!(
+        store
+            .load_profile(profile_id)
+            .expect("load removed profile")
+            .is_none()
+    );
 }
 
 #[test]
 fn stale_profile_revision_cannot_overwrite_a_concurrent_update() {
     let database = database();
     let mut initializer = RunEvidenceStore::open(database.path()).expect("open database");
-    let id = initializer.create_profile(&profile()).expect("create profile").id();
-    let baseline = initializer.load_profile(id).expect("load profile").expect("profile exists");
+    let id = initializer
+        .create_profile(&profile())
+        .expect("create profile")
+        .id();
+    let baseline = initializer
+        .load_profile(id)
+        .expect("load profile")
+        .expect("profile exists");
     drop(initializer);
 
     let mut first = RunEvidenceStore::open(database.path()).expect("open first store");
@@ -396,7 +465,10 @@ fn stale_profile_revision_cannot_overwrite_a_concurrent_update() {
         Err(StorageError::ConcurrentProfileUpdate)
     ));
 
-    let loaded = first.load_profile(id).expect("load profile").expect("profile exists");
+    let loaded = first
+        .load_profile(id)
+        .expect("load profile")
+        .expect("profile exists");
     assert_eq!(loaded.profile().mode(), SyncMode::Mirror);
     assert!(!loaded.profile().exclusions().contains(&"later/".to_owned()));
 }
@@ -499,7 +571,9 @@ fn profile_storage_keeps_secret_values_out_of_schema_and_rows() {
         .collect::<Result<Vec<_>, _>>()
         .expect("collect profile columns");
     assert!(columns.iter().all(|column| {
-        !column.contains("password") && !column.contains("passphrase") && !column.contains("secret_value")
+        !column.contains("password")
+            && !column.contains("passphrase")
+            && !column.contains("secret_value")
     }));
 }
 
@@ -507,7 +581,10 @@ fn profile_storage_keeps_secret_values_out_of_schema_and_rows() {
 fn malformed_persisted_profile_fails_without_exposing_the_stored_value() {
     let database = database();
     let mut store = RunEvidenceStore::open(database.path()).expect("open database");
-    let profile_id = store.create_profile(&profile()).expect("create profile").id();
+    let profile_id = store
+        .create_profile(&profile())
+        .expect("create profile")
+        .id();
 
     store
         .connection()
@@ -521,9 +598,10 @@ fn malformed_persisted_profile_fails_without_exposing_the_stored_value() {
 
     let error = store
         .load_profile(profile_id)
-        .err()
-        .expect("malformed profile must fail to load");
-    assert!(matches!(error, crate::StorageError::CorruptEvidence(ref reason) if reason == "corrupt Sync Profile record"));
+        .expect_err("malformed profile must fail to load");
+    assert!(
+        matches!(error, crate::StorageError::CorruptEvidence(ref reason) if reason == "corrupt Sync Profile record")
+    );
     assert!(!error.to_string().contains("malformed-secret-value"));
 }
 
@@ -551,7 +629,13 @@ fn evidence_and_profiles_share_the_same_application_database() {
     }
 
     let reopened = RunEvidenceStore::open(database.path()).expect("reopen database");
-    assert_eq!(reopened.load_snapshot(RunId::new(44)).expect("load evidence").run_id(), RunId::new(44));
+    assert_eq!(
+        reopened
+            .load_snapshot(RunId::new(44))
+            .expect("load evidence")
+            .run_id(),
+        RunId::new(44)
+    );
     assert_eq!(reopened.list_profiles().expect("load profiles").len(), 1);
 }
 
@@ -559,9 +643,13 @@ fn evidence_and_profiles_share_the_same_application_database() {
 fn database_enables_foreign_keys_and_uses_the_canonical_test_root() {
     let root = TestDirectory::new();
     let expected = root.path().join("syncplus/syncplus.db");
-    let store = RunEvidenceStore::open_at_data_home(root.path()).expect("open canonical test database");
+    let store =
+        RunEvidenceStore::open_at_data_home(root.path()).expect("open canonical test database");
 
-    assert_eq!(RunEvidenceStore::canonical_path_for_data_home(root.path()), expected);
+    assert_eq!(
+        RunEvidenceStore::canonical_path_for_data_home(root.path()),
+        expected
+    );
     assert_eq!(
         store
             .connection()
@@ -576,8 +664,22 @@ fn database_enables_foreign_keys_and_uses_the_canonical_test_root() {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        assert_eq!(fs::metadata(expected.parent().expect("database parent")).expect("metadata").permissions().mode() & 0o777, 0o700);
-        assert_eq!(fs::metadata(expected).expect("metadata").permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(expected.parent().expect("database parent"))
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(expected)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }
 
