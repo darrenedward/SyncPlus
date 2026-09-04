@@ -493,3 +493,17 @@ Backups are created only before a file-changing run, database migration, or repa
 A UI state shown when the live Application Database fails integrity validation or cannot be opened safely. It explains the problem and offers only validated backups for explicit user-selected restoration; it never silently replaces the live database or treats a corrupt snapshot as recoverable.
 
 Before restoring, SyncPlus quarantines the corrupt live database under a timestamped diagnostic name. The quarantined copy is excluded from active storage and has a separate user-controlled Remove action.
+
+## Appearance
+
+**Dark Appearance**:
+The first-class dark theme: warm ink surfaces, copper primary accent, and steel companion accent. It is not pure black and not a neon-on-black HUD.
+_Avoid_: OLED black, cyberpunk, treating dark as the only real product
+
+**Light Appearance**:
+The first-class light theme: warm paper, cream, and stone surfaces. The canvas is not white and is not a brightness-inverted Dark Appearance.
+_Avoid_: White sheet, bright fallback, leftover dark-mode chrome
+
+**Brand Theme**:
+The desktop GUI token set that supplies canvas, surface, elevated, field, text, muted, border, copper, steel, danger, warning, and their on/soft pairs for both appearances. Core stores only the named preference System, Light, or Dark; it does not store colours.
+_Avoid_: Per-screen one-off colours, user-supplied chrome, colours in SQLite

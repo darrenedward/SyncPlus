@@ -493,6 +493,10 @@ Examples of required messages:
 - “This profile allows unattended data deletion. Continue copying this authorization to the new profile?”
 - “The destination file was verified, but the source changed during transfer. The source was preserved and needs review.”
 
+## Follow-on visual identity
+
+Brand Theme tokens for Dark Appearance and Light Appearance live in `crates/syncplus/src/theme.rs`. Core still stores only the named preference System, Light, or Dark. Brand Mark, navigation chrome, workspace type, and the public Brand Kit remain follow-on work and must not weaken the v1 safety contract.
+
 ## Deferred design work
 
 After v1, consider SSH↔SSH, rsync daemon URLs, SSH config import, high-assurance local read-back verification of remote bytes, richer metadata/ACL support, content merge tooling, and broader platform installers. None of these may weaken the v1 safety contract when added.

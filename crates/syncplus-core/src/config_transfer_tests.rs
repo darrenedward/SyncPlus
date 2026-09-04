@@ -63,6 +63,11 @@ fn export_is_explicit_nonsecret_configuration_and_import_strips_authority() {
     assert!(!json.contains("top-secret-password"));
     assert!(!json.contains("run_snapshots"));
     assert!(json.contains("schema_version"));
+    assert!(json.contains("\"theme\": \"dark\""));
+    assert!(!json.contains("#"));
+    assert!(!json.contains("00FF85"));
+    assert!(!json.contains("FF0099"));
+    assert!(!json.contains("79D2C3"));
 
     let mut imported = RunEvidenceStore::open_in_memory().expect("open import database");
     let preview = imported
