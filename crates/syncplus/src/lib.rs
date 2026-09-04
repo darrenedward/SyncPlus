@@ -9,5 +9,7 @@
 )]
 
 mod app;
+mod theme;
 
 pub use app::{EndpointKind, SyncPlusApp, UiValidationError, run_background_scheduler_once};
+pub use theme::BrandTheme;
