@@ -493,6 +493,10 @@ Examples of required messages:
 - “This profile allows unattended data deletion. Continue copying this authorization to the new profile?”
 - “The destination file was verified, but the source changed during transfer. The source was preserved and needs review.”
 
+## Follow-on visual identity
+
+After the v1 safety parents, SyncPlus still needs one Brand Mark, first-class Dark Appearance and Light Appearance, and a public Brand Kit for GitHub and Facebook. Light Appearance is not a white fallback. See `docs/specs/parent-issues/08-brand-identity-dual-theme.md` and GitHub issue #117. That work must not weaken the v1 safety contract.
+
 ## Deferred design work
 
 After v1, consider SSH↔SSH, rsync daemon URLs, SSH config import, high-assurance local read-back verification of remote bytes, richer metadata/ACL support, content merge tooling, and broader platform installers. None of these may weaken the v1 safety contract when added.
