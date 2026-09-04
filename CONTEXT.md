@@ -241,10 +241,10 @@ Folder selection in Simple Mode abstracts rsync trailing-slash semantics and sta
 Plain-language information that explains what an option or result means, why it matters, when to use it, and what consequences or limitations apply.
 _Avoid_: Reference dump, jargon-only help
 
-The desktop Help catalog presents each topic with What, Why, How, When,
+The desktop Help & Support page presents each topic with What, Why, How, When,
 Consequences, Limitations, and Next safe action text. Profile, plan, Conflict
 Review, progress, Run Report, Recovery Review, and Clone Profile surfaces link
-to the relevant topic in the visible Help pane. Precheck diagnostics identify
+to the relevant topic in the dedicated Help & Support page. Precheck diagnostics identify
 the Sync Profile, peer, remote account when applicable, exact scope, safety
 requirement, reason, and remediation. These links and diagnostics explain a
 blocked or review-required state; they never authorize bypassing prechecks,

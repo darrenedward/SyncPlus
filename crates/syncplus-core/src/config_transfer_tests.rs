@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::{
-    ApplicationMode, ApplicationSettings, AuthorizationSnapshot, DeletionMethod,
-    Peer, RunEvidenceStore, SavedSecretReference, ScheduleDefinition, SshAuthentication, SyncMode,
+    ApplicationMode, ApplicationSettings, AuthorizationSnapshot, DeletionMethod, Peer,
+    RunEvidenceStore, SavedSecretReference, ScheduleDefinition, SshAuthentication, SyncMode,
     SyncOptions, SyncProfile, ThemePreference,
 };
 
@@ -41,10 +41,10 @@ fn profile() -> SyncProfile {
 fn export_is_explicit_nonsecret_configuration_and_import_strips_authority() {
     let mut source = RunEvidenceStore::open_in_memory().expect("open source database");
     source
-        .save_settings(&ApplicationSettings::new(
-            ApplicationMode::Advanced,
-            ThemePreference::Dark,
-        ))
+        .save_settings(
+            &ApplicationSettings::new(ApplicationMode::Advanced, ThemePreference::Dark)
+                .with_hide_to_tray_on_window_close(false),
+        )
         .expect("save settings");
     let profile_id = source
         .create_profile_with_authorizations(&profile(), AuthorizationSnapshot::new(true, true))
@@ -87,7 +87,11 @@ fn export_is_explicit_nonsecret_configuration_and_import_strips_authority() {
     assert!(!persisted.profile().options().destination_cleanup);
     assert_eq!(persisted.profile().options().deletion_method, None);
     assert!(!persisted.authorizations().allow_unattended_destructive());
-    assert!(!persisted.authorizations().allow_unattended_permanent_removal());
+    assert!(
+        !persisted
+            .authorizations()
+            .allow_unattended_permanent_removal()
+    );
     assert!(!persisted.schedule().expect("schedule").enabled());
     assert_eq!(
         persisted
@@ -121,7 +125,12 @@ fn malformed_and_incompatible_imports_are_read_only_and_secret_safe() {
         .import_configuration(&malformed)
         .expect_err("unknown secret field must be rejected");
     assert!(!error.to_string().contains("secret-value"));
-    assert_eq!(store.export_configuration().expect("export after rejection"), before);
+    assert_eq!(
+        store
+            .export_configuration()
+            .expect("export after rejection"),
+        before
+    );
 
     let malformed_peer = before.replacen(
         "\"root\": \"/source\"",
@@ -132,16 +141,19 @@ fn malformed_and_incompatible_imports_are_read_only_and_secret_safe() {
         .import_configuration(&malformed_peer)
         .expect_err("unknown peer secret field must be rejected");
     assert!(!error.to_string().contains("secret-value"));
-    assert_eq!(store.export_configuration().expect("export after peer rejection"), before);
-
-    let incompatible = before.replacen(
-        "\"schema_version\": 1",
-        "\"schema_version\": 99",
-        1,
+    assert_eq!(
+        store
+            .export_configuration()
+            .expect("export after peer rejection"),
+        before
     );
+
+    let incompatible = before.replacen("\"schema_version\": 1", "\"schema_version\": 99", 1);
     assert!(matches!(
         store.preview_configuration_import(&incompatible),
-        Err(crate::ConfigurationTransferError::UnsupportedSchemaVersion(99))
+        Err(crate::ConfigurationTransferError::UnsupportedSchemaVersion(
+            99
+        ))
     ));
     assert_eq!(
         store
@@ -166,22 +178,25 @@ fn imported_configuration_survives_restart() {
 
     let mut source = RunEvidenceStore::open_in_memory().expect("open source database");
     source
-        .save_settings(&ApplicationSettings::new(
-            ApplicationMode::Advanced,
-            ThemePreference::Dark,
-        ))
+        .save_settings(
+            &ApplicationSettings::new(ApplicationMode::Advanced, ThemePreference::Dark)
+                .with_hide_to_tray_on_window_close(false),
+        )
         .expect("save settings");
     source.create_profile(&profile()).expect("save profile");
     let json = source.export_configuration().expect("export configuration");
 
     {
         let mut target = RunEvidenceStore::open(&path).expect("open target database");
-        target.import_configuration(&json).expect("import configuration");
+        target
+            .import_configuration(&json)
+            .expect("import configuration");
     }
     let reopened = RunEvidenceStore::open(&path).expect("reopen target database");
     assert_eq!(
         reopened.load_settings().expect("load settings"),
         ApplicationSettings::new(ApplicationMode::Advanced, ThemePreference::Dark)
+            .with_hide_to_tray_on_window_close(false)
     );
     assert_eq!(reopened.list_profiles().expect("load profiles").len(), 1);
 

@@ -1,3 +1,14 @@
+// These domain APIs intentionally keep rich typed errors and evidence-bearing
+// values together. Their layout and constructor shapes are part of the safety
+// contract, so the size/argument-count lints are not actionable refactors here.
+#![allow(
+    clippy::if_same_then_else,
+    clippy::large_enum_variant,
+    clippy::result_large_err,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
+
 mod model;
 mod process;
 mod analysis;

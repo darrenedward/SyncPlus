@@ -1,25 +1,23 @@
 use std::{
     collections::BTreeMap,
-    fmt,
-    fs,
-    io,
+    fmt, fs, io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::backup::DatabaseBackupManager;
+use crate::restore::RecoveryProvenance;
 use crate::{
-    AuthorizationSnapshot, DeletionMethod, ItemType, MetadataRequirements, OneWaySource, Peer,
-    PeerSide, PartialTransferPolicy, PlanActionKind, ProcessSpecError, ProcessSpecification,
-    ProfileSnapshotId, ReconciliationFindingKind, ReconciliationReason, RetryPolicy, RunId,
-    AnalysisOutcome, CompletionReconciliation, ConflictResolution, ContentProof, InventorySnapshotItem,
-    ResolutionOperation, SourceDrainStatus, SourceInventorySnapshot, SyncBaseline,
-    SyncBaselineItem, SyncBaselineItemState, SyncMode, SyncOptions, SyncProfile,
+    AnalysisOutcome, AuthorizationSnapshot, CompletionReconciliation, ConflictResolution,
+    ContentProof, DeletionMethod, InventorySnapshotItem, ItemType, MetadataRequirements,
+    OneWaySource, PartialTransferPolicy, Peer, PeerSide, PlanActionKind, ProcessSpecError,
+    ProcessSpecification, ProfileSnapshotId, ReconciliationFindingKind, ReconciliationReason,
+    ResolutionOperation, RetryPolicy, RunId, SourceDrainStatus, SourceInventorySnapshot,
+    SyncBaseline, SyncBaselineItem, SyncBaselineItemState, SyncMode, SyncOptions, SyncProfile,
     SyncProfileId, ValidatedSyncOptions, VolumeIdentity,
 };
-use crate::restore::RecoveryProvenance;
 
 pub type ActionId = u64;
 
@@ -40,13 +38,7 @@ impl RunSnapshot {
         profile: &SyncProfile,
         authorizations: AuthorizationSnapshot,
     ) -> Result<Self, StorageError> {
-        Self::from_profile_with_volume_identities(
-            run_id,
-            profile,
-            authorizations,
-            None,
-            None,
-        )
+        Self::from_profile_with_volume_identities(run_id, profile, authorizations, None, None)
     }
 
     pub fn from_profile_with_volume_identities(
@@ -59,8 +51,7 @@ impl RunSnapshot {
         let specification =
             ProcessSpecification::from_profile(profile).map_err(StorageError::InvalidProfile)?;
         if authorizations.allow_unattended_permanent_removal()
-            && (specification.options().deletion_method()
-                != Some(DeletionMethod::PermanentRemoval)
+            && (specification.options().deletion_method() != Some(DeletionMethod::PermanentRemoval)
                 || !specification.options().safe_delete())
         {
             return Err(StorageError::InvalidSnapshot(
@@ -389,8 +380,12 @@ impl RemovalResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JournalEvent {
-    Planned { action: PlanRecord },
-    Started { action_id: ActionId },
+    Planned {
+        action: PlanRecord,
+    },
+    Started {
+        action_id: ActionId,
+    },
     Progress {
         action_id: ActionId,
         completed_bytes: u64,
@@ -414,14 +409,22 @@ pub enum JournalEvent {
         action_id: ActionId,
         result: RemovalResult,
     },
-    Completed { action_id: ActionId },
+    Completed {
+        action_id: ActionId,
+    },
     Failed {
         action_id: ActionId,
         reason: ActionReason,
     },
-    Cancelled { action_id: ActionId },
-    Interrupted { action_id: ActionId },
-    Deferred { action_id: ActionId },
+    Cancelled {
+        action_id: ActionId,
+    },
+    Interrupted {
+        action_id: ActionId,
+    },
+    Deferred {
+        action_id: ActionId,
+    },
     Unresolved {
         action_id: ActionId,
         reason: ActionReason,
@@ -534,11 +537,8 @@ impl RunReportItem {
         };
         let source_path = source_root.join(journal.plan.relative_path());
         let destination_path = destination_root.join(journal.plan.relative_path());
-        let consequence = report_consequence(
-            journal.plan.operation(),
-            side,
-            snapshot.profile().mode(),
-        );
+        let consequence =
+            report_consequence(journal.plan.operation(), side, snapshot.profile().mode());
         Self {
             journal,
             source_path,
@@ -827,14 +827,30 @@ impl SchedulerEventKind {
             Self::ScheduledRunClaimed => "The scheduler claimed this occurrence for execution.",
             Self::Completed => "The Scheduled Run completed successfully.",
             Self::Failed => "The Scheduled Run failed before all approved work completed.",
-            Self::Cancelled => "The Scheduled Run was cancelled before all approved work completed.",
-            Self::Interrupted => "The Scheduled Run was interrupted before all approved work completed.",
-            Self::PendingReview => "The Scheduled Run completed with work that remains open for review.",
-            Self::ReviewCleared => "The Scheduled Run review was explicitly cleared after reconciliation.",
-            Self::Missed => "The Scheduled Run did not complete and remains visible for catch-up review.",
-            Self::SkippedOverlap => "The Scheduled Run was skipped because an overlapping peer scope is active.",
-            Self::BlockedPreflight => "The Scheduled Run was blocked before filesystem mutation by a safety preflight.",
-            Self::Retry => "A transient transfer condition caused the Scheduled Run to retry within its bound.",
+            Self::Cancelled => {
+                "The Scheduled Run was cancelled before all approved work completed."
+            }
+            Self::Interrupted => {
+                "The Scheduled Run was interrupted before all approved work completed."
+            }
+            Self::PendingReview => {
+                "The Scheduled Run completed with work that remains open for review."
+            }
+            Self::ReviewCleared => {
+                "The Scheduled Run review was explicitly cleared after reconciliation."
+            }
+            Self::Missed => {
+                "The Scheduled Run did not complete and remains visible for catch-up review."
+            }
+            Self::SkippedOverlap => {
+                "The Scheduled Run was skipped because an overlapping peer scope is active."
+            }
+            Self::BlockedPreflight => {
+                "The Scheduled Run was blocked before filesystem mutation by a safety preflight."
+            }
+            Self::Retry => {
+                "A transient transfer condition caused the Scheduled Run to retry within its bound."
+            }
             Self::RetryExhausted => "The Scheduled Run exhausted its bounded retry policy.",
         }
     }
@@ -842,17 +858,35 @@ impl SchedulerEventKind {
     const fn next_action(self) -> &'static str {
         match self {
             Self::ScheduledRunClaimed => "Open the Run Report after execution settles.",
-            Self::Completed => "Open the Run Report to review verification and reconciliation evidence.",
-            Self::Failed => "Open the Run Report, resolve the reported failure, and retry after review.",
-            Self::Cancelled => "Open the Run Report and review the unfinished actions before retrying.",
-            Self::Interrupted => "Open the Run Report and complete Recovery Review before resuming.",
-            Self::PendingReview => "Open the Run Report and complete the required review before clearing it.",
+            Self::Completed => {
+                "Open the Run Report to review verification and reconciliation evidence."
+            }
+            Self::Failed => {
+                "Open the Run Report, resolve the reported failure, and retry after review."
+            }
+            Self::Cancelled => {
+                "Open the Run Report and review the unfinished actions before retrying."
+            }
+            Self::Interrupted => {
+                "Open the Run Report and complete Recovery Review before resuming."
+            }
+            Self::PendingReview => {
+                "Open the Run Report and complete the required review before clearing it."
+            }
             Self::ReviewCleared => "Open the Run Report to review the final safety evidence.",
-            Self::Missed => "Choose Run Now for fresh interactive analysis and confirmation, or choose Not Now.",
-            Self::SkippedOverlap => "Open the running sync or wait for the overlapping scope to finish.",
-            Self::BlockedPreflight => "Open the Run Report, resolve the preflight blocker, and retry.",
+            Self::Missed => {
+                "Choose Run Now for fresh interactive analysis and confirmation, or choose Not Now."
+            }
+            Self::SkippedOverlap => {
+                "Open the running sync or wait for the overlapping scope to finish."
+            }
+            Self::BlockedPreflight => {
+                "Open the Run Report, resolve the preflight blocker, and retry."
+            }
             Self::Retry => "Open the Run Report to review the bounded retry evidence.",
-            Self::RetryExhausted => "Open the Run Report, resolve the cause, and retry after review.",
+            Self::RetryExhausted => {
+                "Open the Run Report, resolve the cause, and retry after review."
+            }
         }
     }
 }
@@ -988,7 +1022,9 @@ pub enum NotificationDeliveryError {
 impl fmt::Display for NotificationDeliveryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Unavailable => formatter.write_str("scheduler notification delivery is unavailable"),
+            Self::Unavailable => {
+                formatter.write_str("scheduler notification delivery is unavailable")
+            }
         }
     }
 }
@@ -999,8 +1035,10 @@ impl std::error::Error for NotificationDeliveryError {}
 /// implement this sink. Delivery is deliberately separate from event and
 /// report persistence so a failed presentation cannot alter safety evidence.
 pub trait SchedulerNotificationSink {
-    fn deliver(&mut self, notification: &SchedulerNotification)
-        -> Result<(), NotificationDeliveryError>;
+    fn deliver(
+        &mut self,
+        notification: &SchedulerNotification,
+    ) -> Result<(), NotificationDeliveryError>;
 }
 
 impl MissedScheduleNotice {
@@ -1144,9 +1182,15 @@ pub enum StorageError {
     InvalidSchedule(String),
     ScheduleRequiresAdvanced,
     ConcurrentProfileUpdate,
-    ProfileNotFound { id: u64 },
-    ReportNotFound { run_id: u64 },
-    MissedScheduleNotFound { notice_id: u64 },
+    ProfileNotFound {
+        id: u64,
+    },
+    ReportNotFound {
+        run_id: u64,
+    },
+    MissedScheduleNotFound {
+        notice_id: u64,
+    },
     MissedScheduleAlreadyDecided {
         notice_id: u64,
         decision: MissedScheduleDecision,
@@ -1276,29 +1320,33 @@ impl RunEvidenceStore {
                 fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
             }
         }
-        if let Ok(metadata) = fs::symlink_metadata(path) {
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-                return Err(StorageError::UnsafeDatabasePath);
-            }
+        if let Ok(metadata) = fs::symlink_metadata(path)
+            && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
+        {
+            return Err(StorageError::UnsafeDatabasePath);
         }
         let existed_before_open = fs::symlink_metadata(path).is_ok();
         let connection = open_canonical_connection(path)?;
         if existed_before_open {
-            let version: i64 = match connection.query_row("PRAGMA user_version", [], |row| row.get(0)) {
-                Ok(version) => version,
-                Err(error) => {
-                    drop(connection);
-                    return Err(quarantine_after_open_failure(
-                        path,
-                        format!("could not read the live database schema version: {error}"),
-                    ));
-                }
-            };
-            if version < 19 {
+            let version: i64 =
+                match connection.query_row("PRAGMA user_version", [], |row| row.get(0)) {
+                    Ok(version) => version,
+                    Err(error) => {
+                        drop(connection);
+                        return Err(quarantine_after_open_failure(
+                            path,
+                            format!("could not read the live database schema version: {error}"),
+                        ));
+                    }
+                };
+            if version < 20 {
                 let manager = DatabaseBackupManager::for_database(path)
                     .map_err(|error| StorageError::DatabaseBackup(error.to_string()))?;
                 if let Err(error) = manager.create_validated_backup(&connection) {
-                    if matches!(error, crate::BackupError::Integrity(_) | crate::BackupError::Sqlite(_)) {
+                    if matches!(
+                        error,
+                        crate::BackupError::Integrity(_) | crate::BackupError::Sqlite(_)
+                    ) {
                         drop(connection);
                         return Err(quarantine_after_open_failure(
                             path,
@@ -1312,14 +1360,14 @@ impl RunEvidenceStore {
         let store = match Self::from_connection(connection, Some(path.to_path_buf())) {
             Ok(store) => store,
             Err(error @ StorageError::CorruptEvidence(_)) => {
-                return Err(quarantine_after_open_failure(path, error.to_string()))
+                return Err(quarantine_after_open_failure(path, error.to_string()));
             }
             Err(error) => return Err(error),
         };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         }
         Ok(store)
     }
@@ -1369,7 +1417,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 19 {
+        if version > 20 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -1378,7 +1426,7 @@ impl RunEvidenceStore {
         if version == 0 {
             let transaction = connection.transaction()?;
             transaction.execute_batch(
-            "
+                "
             CREATE TABLE run_snapshots (
                 run_id INTEGER PRIMARY KEY,
                 snapshot_id INTEGER NOT NULL,
@@ -1470,7 +1518,10 @@ impl RunEvidenceStore {
             let transaction = connection.transaction()?;
             let columns = [
                 ("metadata_file_type", "INTEGER NOT NULL DEFAULT 1"),
-                ("metadata_executable_permissions", "INTEGER NOT NULL DEFAULT 1"),
+                (
+                    "metadata_executable_permissions",
+                    "INTEGER NOT NULL DEFAULT 1",
+                ),
                 ("metadata_symlink_targets", "INTEGER NOT NULL DEFAULT 1"),
                 ("metadata_timestamps", "INTEGER NOT NULL DEFAULT 0"),
             ];
@@ -1786,7 +1837,7 @@ impl RunEvidenceStore {
                 CREATE TABLE application_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
-                    CHECK (key IN ('ui_mode', 'theme')),
+                    CHECK (key IN ('ui_mode', 'theme', 'hide_to_tray_on_close')),
                     CHECK (length(value) > 0)
                 );
                 CREATE TABLE sync_profiles (
@@ -2000,6 +2051,30 @@ impl RunEvidenceStore {
             transaction.pragma_update(None, "user_version", 19)?;
             verify_integrity(&transaction)?;
             transaction.commit()?;
+            version = 19;
+        }
+        if version == 19 {
+            let transaction = connection.transaction()?;
+            transaction.execute_batch(
+                "
+                ALTER TABLE application_settings RENAME TO application_settings_v19;
+                CREATE TABLE application_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    CHECK (key IN ('ui_mode', 'theme', 'hide_to_tray_on_close')),
+                    CHECK (length(value) > 0)
+                );
+                INSERT INTO application_settings (key, value)
+                    SELECT key, value FROM application_settings_v19;
+                INSERT INTO application_settings (key, value)
+                    VALUES ('hide_to_tray_on_close', 'true')
+                    ON CONFLICT(key) DO NOTHING;
+                DROP TABLE application_settings_v19;
+                ",
+            )?;
+            transaction.pragma_update(None, "user_version", 20)?;
+            verify_integrity(&transaction)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -2115,7 +2190,9 @@ impl RunEvidenceStore {
         let next_run_id = i64::try_from(snapshot.run_id().value())
             .ok()
             .and_then(|run_id| run_id.checked_add(1))
-            .ok_or_else(|| StorageError::InvalidSnapshot("run identifier is out of range".to_owned()))?;
+            .ok_or_else(|| {
+                StorageError::InvalidSnapshot("run identifier is out of range".to_owned())
+            })?;
         transaction.execute(
             "UPDATE run_id_sequence
              SET next_run_id = MAX(next_run_id, ?1)
@@ -2340,24 +2417,12 @@ impl RunEvidenceStore {
                 )| {
                     Ok(MirrorResolutionReportItem::new(
                         blob_to_path(&original_path)?,
-                        generated_path
-                            .as_deref()
-                            .map(blob_to_path)
-                            .transpose()?,
+                        generated_path.as_deref().map(blob_to_path).transpose()?,
                         decode_conflict_resolution(&resolution)?,
                         decode_resolution_operation(&operation)?,
-                        source_peer
-                            .as_deref()
-                            .map(decode_side)
-                            .transpose()?,
-                        target_peer
-                            .as_deref()
-                            .map(decode_side)
-                            .transpose()?,
-                        decode_mirror_resolution_outcome(
-                            &outcome,
-                            action_reason.as_deref(),
-                        )?,
+                        source_peer.as_deref().map(decode_side).transpose()?,
+                        target_peer.as_deref().map(decode_side).transpose()?,
+                        decode_mirror_resolution_outcome(&outcome, action_reason.as_deref())?,
                         decode_mirror_review_state(&review_state)?,
                     ))
                 },
@@ -2402,12 +2467,12 @@ impl RunEvidenceStore {
                 snapshot.profile().peer_b().root().to_path_buf(),
             ),
         };
-        let mut statement = self.connection.prepare(
-            &format!("SELECT relative_path, item_type, outcome, size,
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT relative_path, item_type, outcome, size,
                     modified_at_unix_nanos, readonly, permissions,
                     symlink_target, content_fingerprint
-             FROM {table} WHERE run_id = ?1 ORDER BY ordinal"),
-        )?;
+             FROM {table} WHERE run_id = ?1 ORDER BY ordinal"
+        ))?;
         let rows = statement
             .query_map(params![run_id.value()], |row| {
                 Ok((
@@ -2453,16 +2518,12 @@ impl RunEvidenceStore {
                             .map(|permissions| {
                                 u32::try_from(permissions).map_err(|_| {
                                     StorageError::CorruptEvidence(
-                                        "source inventory contains invalid permissions"
-                                            .to_owned(),
+                                        "source inventory contains invalid permissions".to_owned(),
                                     )
                                 })
                             })
                             .transpose()?,
-                        symlink_target
-                            .as_deref()
-                            .map(blob_to_path)
-                            .transpose()?,
+                        symlink_target.as_deref().map(blob_to_path).transpose()?,
                         decode_hash(content_fingerprint.as_deref())?,
                     ))
                 },
@@ -2497,7 +2558,12 @@ impl RunEvidenceStore {
                 bool_to_int(baseline.metadata_requirements().executable_permissions()),
                 bool_to_int(baseline.metadata_requirements().symlink_targets()),
                 bool_to_int(baseline.metadata_requirements().timestamps()),
-                bool_to_int(baseline.metadata_requirements().specialist_metadata().ownership()),
+                bool_to_int(
+                    baseline
+                        .metadata_requirements()
+                        .specialist_metadata()
+                        .ownership()
+                ),
                 bool_to_int(
                     baseline
                         .metadata_requirements()
@@ -2622,11 +2688,17 @@ impl RunEvidenceStore {
         let specialist = crate::SpecialistMetadataRequirements::new(
             decode_bool(ownership, "baseline ownership requirement")?,
             decode_bool(access_control_lists, "baseline ACL requirement")?,
-            decode_bool(extended_attributes, "baseline extended-attribute requirement")?,
+            decode_bool(
+                extended_attributes,
+                "baseline extended-attribute requirement",
+            )?,
         );
         let metadata_requirements = MetadataRequirements::new(
             decode_bool(file_type, "baseline file-type requirement")?,
-            decode_bool(executable_permissions, "baseline executable-permission requirement")?,
+            decode_bool(
+                executable_permissions,
+                "baseline executable-permission requirement",
+            )?,
             decode_bool(symlink_targets, "baseline symlink-target requirement")?,
             decode_bool(timestamps, "baseline timestamp requirement")?,
         )
@@ -2799,7 +2871,8 @@ impl RunEvidenceStore {
             .into_iter()
             .map(|(relative_path, kind, reason, action_reason)| {
                 let kind = decode_finding_kind(&kind)?;
-                let parsed_reason = decode_reconciliation_reason(&reason, action_reason.as_deref())?;
+                let parsed_reason =
+                    decode_reconciliation_reason(&reason, action_reason.as_deref())?;
                 if parsed_reason.kind() != kind {
                     return Err(StorageError::CorruptEvidence(
                         "reconciliation finding kind and reason differ".to_owned(),
@@ -2855,13 +2928,18 @@ impl RunEvidenceStore {
             None,
         )?;
         transaction.commit()?;
-        self.load_scheduler_event(event_id)?
-            .ok_or_else(|| StorageError::CorruptEvidence("new scheduler event disappeared".to_owned()))
+        self.load_scheduler_event(event_id)?.ok_or_else(|| {
+            StorageError::CorruptEvidence("new scheduler event disappeared".to_owned())
+        })
     }
 
-    pub fn load_scheduler_event(&self, event_id: u64) -> Result<Option<SchedulerEvent>, StorageError> {
-        let event_id = i64::try_from(event_id)
-            .map_err(|_| StorageError::InvalidEvent("scheduler event identifier is out of range".to_owned()))?;
+    pub fn load_scheduler_event(
+        &self,
+        event_id: u64,
+    ) -> Result<Option<SchedulerEvent>, StorageError> {
+        let event_id = i64::try_from(event_id).map_err(|_| {
+            StorageError::InvalidEvent("scheduler event identifier is out of range".to_owned())
+        })?;
         self.connection
             .query_row(
                 "SELECT event_id, profile_id, run_id, event_kind, reason,
@@ -2913,8 +2991,9 @@ impl RunEvidenceStore {
         if retry_count == 0 {
             return Ok(());
         }
-        let run_id_i64 = i64::try_from(run_id.value())
-            .map_err(|_| StorageError::InvalidEvent("scheduler run identifier is out of range".to_owned()))?;
+        let run_id_i64 = i64::try_from(run_id.value()).map_err(|_| {
+            StorageError::InvalidEvent("scheduler run identifier is out of range".to_owned())
+        })?;
         let Some(profile_id) = self
             .connection
             .query_row(
@@ -2928,8 +3007,9 @@ impl RunEvidenceStore {
         else {
             return Ok(());
         };
-        let profile_id = u64::try_from(profile_id)
-            .map_err(|_| StorageError::CorruptEvidence("scheduler profile id is invalid".to_owned()))?;
+        let profile_id = u64::try_from(profile_id).map_err(|_| {
+            StorageError::CorruptEvidence("scheduler profile id is invalid".to_owned())
+        })?;
         let kind = if exhausted {
             SchedulerEventKind::RetryExhausted
         } else {
@@ -2973,8 +3053,9 @@ impl RunEvidenceStore {
         retry_count: Option<u32>,
     ) -> Result<u64, StorageError> {
         let profile_id = profile_id.value_as_i64()?;
-        let run_id = i64::try_from(run_id.value())
-            .map_err(|_| StorageError::InvalidEvent("scheduler run identifier is out of range".to_owned()))?;
+        let run_id = i64::try_from(run_id.value()).map_err(|_| {
+            StorageError::InvalidEvent("scheduler run identifier is out of range".to_owned())
+        })?;
         if created_at_unix_seconds < 0 {
             return Err(StorageError::InvalidEvent(
                 "scheduler event time must be nonnegative".to_owned(),
@@ -2983,7 +3064,9 @@ impl RunEvidenceStore {
         let missed_notice_id = missed_notice_id
             .map(i64::try_from)
             .transpose()
-            .map_err(|_| StorageError::InvalidEvent("scheduler notice identifier is out of range".to_owned()))?;
+            .map_err(|_| {
+                StorageError::InvalidEvent("scheduler notice identifier is out of range".to_owned())
+            })?;
         let changed = transaction.execute(
             "INSERT INTO scheduler_events (
                 profile_id, run_id, event_kind, reason, next_action,
@@ -3001,13 +3084,27 @@ impl RunEvidenceStore {
             ],
         )?;
         if changed != 1 {
-            return Err(StorageError::InvalidEvent("scheduler event was not persisted".to_owned()));
+            return Err(StorageError::InvalidEvent(
+                "scheduler event was not persisted".to_owned(),
+            ));
         }
         u64::try_from(transaction.last_insert_rowid())
             .map_err(|_| StorageError::CorruptEvidence("scheduler event id is invalid".to_owned()))
     }
 
-    fn scheduler_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64, i64, String, String, String, i64, Option<i64>, Option<i64>)> {
+    fn scheduler_event_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<(
+        i64,
+        i64,
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+        Option<i64>,
+    )> {
         Ok((
             row.get(0)?,
             row.get(1)?,
@@ -3022,27 +3119,61 @@ impl RunEvidenceStore {
     }
 
     fn decode_scheduler_event(
-        row: (i64, i64, i64, String, String, String, i64, Option<i64>, Option<i64>),
+        row: (
+            i64,
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            Option<i64>,
+        ),
     ) -> Result<SchedulerEvent, StorageError> {
-        let (event_id, profile_id, run_id, kind, reason, next_action, created_at, notice_id, retry_count) = row;
-        let event_id = u64::try_from(event_id)
-            .map_err(|_| StorageError::CorruptEvidence("scheduler event id is invalid".to_owned()))?;
-        let profile_id = u64::try_from(profile_id)
-            .map_err(|_| StorageError::CorruptEvidence("scheduler profile id is invalid".to_owned()))?;
+        let (
+            event_id,
+            profile_id,
+            run_id,
+            kind,
+            reason,
+            next_action,
+            created_at,
+            notice_id,
+            retry_count,
+        ) = row;
+        let event_id = u64::try_from(event_id).map_err(|_| {
+            StorageError::CorruptEvidence("scheduler event id is invalid".to_owned())
+        })?;
+        let profile_id = u64::try_from(profile_id).map_err(|_| {
+            StorageError::CorruptEvidence("scheduler profile id is invalid".to_owned())
+        })?;
         let run_id = u64::try_from(run_id)
             .map_err(|_| StorageError::CorruptEvidence("scheduler run id is invalid".to_owned()))?;
         let notice_id = notice_id
-            .map(|value| u64::try_from(value).map_err(|_| StorageError::CorruptEvidence("scheduler notice id is invalid".to_owned())))
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StorageError::CorruptEvidence("scheduler notice id is invalid".to_owned())
+                })
+            })
             .transpose()?;
         let retry_count = retry_count
-            .map(|value| u32::try_from(value).map_err(|_| StorageError::CorruptEvidence("scheduler retry count is invalid".to_owned())))
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    StorageError::CorruptEvidence("scheduler retry count is invalid".to_owned())
+                })
+            })
             .transpose()?;
         if created_at < 0 || reason.trim().is_empty() || next_action.trim().is_empty() {
-            return Err(StorageError::CorruptEvidence("scheduler event contains invalid text or time".to_owned()));
+            return Err(StorageError::CorruptEvidence(
+                "scheduler event contains invalid text or time".to_owned(),
+            ));
         }
         let kind = SchedulerEventKind::from_str(&kind)?;
         if reason != kind.reason() || next_action != kind.next_action() {
-            return Err(StorageError::CorruptEvidence("scheduler event text does not match its kind".to_owned()));
+            return Err(StorageError::CorruptEvidence(
+                "scheduler event text does not match its kind".to_owned(),
+            ));
         }
         Ok(SchedulerEvent {
             event_id,
@@ -3132,30 +3263,39 @@ impl RunEvidenceStore {
             Self::insert_scheduler_event_in_transaction(
                 &transaction,
                 SyncProfileId::new(u64::try_from(profile_id).map_err(|_| {
-                    StorageError::InvalidEvent("missed schedule profile identifier is out of range".to_owned())
+                    StorageError::InvalidEvent(
+                        "missed schedule profile identifier is out of range".to_owned(),
+                    )
                 })?),
                 RunId::new(u64::try_from(run_id).map_err(|_| {
-                    StorageError::InvalidEvent("missed schedule run identifier is out of range".to_owned())
+                    StorageError::InvalidEvent(
+                        "missed schedule run identifier is out of range".to_owned(),
+                    )
                 })?),
                 SchedulerEventKind::Missed,
                 created_at,
                 Some(u64::try_from(notice_id).map_err(|_| {
-                    StorageError::InvalidEvent("missed schedule notice identifier is out of range".to_owned())
+                    StorageError::InvalidEvent(
+                        "missed schedule notice identifier is out of range".to_owned(),
+                    )
                 })?),
                 None,
             )?;
         }
         transaction.commit()?;
         self.load_missed_schedule_notice_by_i64(notice_id)?
-            .ok_or_else(|| StorageError::CorruptEvidence("new missed schedule notice disappeared".to_owned()))
+            .ok_or_else(|| {
+                StorageError::CorruptEvidence("new missed schedule notice disappeared".to_owned())
+            })
     }
 
     pub fn load_missed_schedule_notice(
         &self,
         notice_id: u64,
     ) -> Result<Option<MissedScheduleNotice>, StorageError> {
-        let notice_id = i64::try_from(notice_id)
-            .map_err(|_| StorageError::InvalidEvent("notice identifier is out of range".to_owned()))?;
+        let notice_id = i64::try_from(notice_id).map_err(|_| {
+            StorageError::InvalidEvent("notice identifier is out of range".to_owned())
+        })?;
         self.load_missed_schedule_notice_by_i64(notice_id)
     }
 
@@ -3199,8 +3339,9 @@ impl RunEvidenceStore {
                 "a missed schedule decision must be Run Now or Not Now".to_owned(),
             ));
         }
-        let notice_id_i64 = i64::try_from(notice_id)
-            .map_err(|_| StorageError::InvalidEvent("notice identifier is out of range".to_owned()))?;
+        let notice_id_i64 = i64::try_from(notice_id).map_err(|_| {
+            StorageError::InvalidEvent("notice identifier is out of range".to_owned())
+        })?;
         let changed = self.connection.execute(
             "UPDATE missed_schedule_notices SET decision = ?1
              WHERE notice_id = ?2 AND decision = 'pending'",
@@ -3262,16 +3403,33 @@ impl RunEvidenceStore {
     fn decode_missed_schedule_notice(
         row: (i64, i64, i64, i64, i64, String, String, i64),
     ) -> Result<MissedScheduleNotice, StorageError> {
-        let (notice_id, profile_id, run_id, first_scheduled_at, latest_scheduled_at, reason, decision, missed_count) = row;
-        let notice_id = u64::try_from(notice_id)
-            .map_err(|_| StorageError::CorruptEvidence("missed schedule notice id is invalid".to_owned()))?;
-        let profile_id = u64::try_from(profile_id)
-            .map_err(|_| StorageError::CorruptEvidence("missed schedule profile id is invalid".to_owned()))?;
-        let run_id = u64::try_from(run_id)
-            .map_err(|_| StorageError::CorruptEvidence("missed schedule run id is invalid".to_owned()))?;
-        let missed_count = u64::try_from(missed_count)
-            .map_err(|_| StorageError::CorruptEvidence("missed schedule count is invalid".to_owned()))?;
-        if first_scheduled_at < 0 || latest_scheduled_at < first_scheduled_at || missed_count == 0 || reason.trim().is_empty() {
+        let (
+            notice_id,
+            profile_id,
+            run_id,
+            first_scheduled_at,
+            latest_scheduled_at,
+            reason,
+            decision,
+            missed_count,
+        ) = row;
+        let notice_id = u64::try_from(notice_id).map_err(|_| {
+            StorageError::CorruptEvidence("missed schedule notice id is invalid".to_owned())
+        })?;
+        let profile_id = u64::try_from(profile_id).map_err(|_| {
+            StorageError::CorruptEvidence("missed schedule profile id is invalid".to_owned())
+        })?;
+        let run_id = u64::try_from(run_id).map_err(|_| {
+            StorageError::CorruptEvidence("missed schedule run id is invalid".to_owned())
+        })?;
+        let missed_count = u64::try_from(missed_count).map_err(|_| {
+            StorageError::CorruptEvidence("missed schedule count is invalid".to_owned())
+        })?;
+        if first_scheduled_at < 0
+            || latest_scheduled_at < first_scheduled_at
+            || missed_count == 0
+            || reason.trim().is_empty()
+        {
             return Err(StorageError::CorruptEvidence(
                 "missed schedule notice contains invalid values".to_owned(),
             ));
@@ -3310,22 +3468,19 @@ impl RunEvidenceStore {
             [],
             |row| row.get(0),
         )?;
-        let next = allocated.max(
-            highest_existing
-                .checked_add(1)
-                .ok_or_else(|| StorageError::InvalidSnapshot("run identifier is exhausted".to_owned()))?,
-        );
-        let following = next
-            .checked_add(1)
-            .ok_or_else(|| StorageError::InvalidSnapshot("run identifier is exhausted".to_owned()))?;
+        let next = allocated.max(highest_existing.checked_add(1).ok_or_else(|| {
+            StorageError::InvalidSnapshot("run identifier is exhausted".to_owned())
+        })?);
+        let following = next.checked_add(1).ok_or_else(|| {
+            StorageError::InvalidSnapshot("run identifier is exhausted".to_owned())
+        })?;
         transaction.execute(
             "UPDATE run_id_sequence SET next_run_id = ?1 WHERE sequence_id = 1",
             params![following],
         )?;
-        Ok(RunId::new(
-            u64::try_from(next)
-                .map_err(|_| StorageError::InvalidSnapshot("run identifier is invalid".to_owned()))?,
-        ))
+        Ok(RunId::new(u64::try_from(next).map_err(|_| {
+            StorageError::InvalidSnapshot("run identifier is invalid".to_owned())
+        })?))
     }
 
     pub fn load_snapshot(&self, run_id: RunId) -> Result<RunSnapshot, StorageError> {
@@ -3474,7 +3629,7 @@ impl RunEvidenceStore {
             value => {
                 return Err(StorageError::CorruptEvidence(format!(
                     "unsupported stored sync mode {value}"
-                )))
+                )));
             }
         })
         .with_source(decode_source(&source)?)
@@ -3596,13 +3751,12 @@ impl RunEvidenceStore {
         validate_removal_result_against_proof(&transaction, run_id, action_id, &event)?;
         validate_action_order(&transaction, run_id, action_id, &event)?;
         validate_recovery_resolution(&transaction, run_id, action_id, &event)?;
-        let sequence = transaction
-            .query_row(
-                "SELECT COALESCE(MAX(sequence), -1) + 1 FROM action_events
+        let sequence = transaction.query_row(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM action_events
                  WHERE run_id = ?1 AND action_id = ?2",
-                params![run_id.value(), action_id],
-                |row| row.get::<_, i64>(0),
-            )?;
+            params![run_id.value(), action_id],
+            |row| row.get::<_, i64>(0),
+        )?;
         let fields = EventFields::from_event(&event);
         transaction.execute(
             "INSERT INTO action_events (
@@ -3783,20 +3937,18 @@ impl RunEvidenceStore {
         } else {
             inventory_recorded
         };
-        let peer_a_inventory = if snapshot.profile().mode() == SyncMode::Mirror
-            && inventory_recorded
-        {
-            Some(self.load_source_inventory(run_id)?)
-        } else {
-            None
-        };
-        let peer_b_inventory = if snapshot.profile().mode() == SyncMode::Mirror
-            && destination_inventory_recorded
-        {
-            Some(self.load_destination_inventory(run_id)?)
-        } else {
-            None
-        };
+        let peer_a_inventory =
+            if snapshot.profile().mode() == SyncMode::Mirror && inventory_recorded {
+                Some(self.load_source_inventory(run_id)?)
+            } else {
+                None
+            };
+        let peer_b_inventory =
+            if snapshot.profile().mode() == SyncMode::Mirror && destination_inventory_recorded {
+                Some(self.load_destination_inventory(run_id)?)
+            } else {
+                None
+            };
         let items: Vec<_> = journal
             .into_iter()
             .map(|journal| RunReportItem::from_journal(&snapshot, journal))
@@ -3809,9 +3961,12 @@ impl RunEvidenceStore {
             reconciliation.as_ref(),
             inventories_recorded,
         );
-        let execution_result = execution_result(&items, blocked_reason.is_some(), reconciliation.is_some());
+        let execution_result =
+            execution_result(&items, blocked_reason.is_some(), reconciliation.is_some());
         let lifecycle = if review_cleared {
-            if mirror_resolutions.iter().any(MirrorResolutionReportItem::requires_review)
+            if mirror_resolutions
+                .iter()
+                .any(MirrorResolutionReportItem::requires_review)
                 || reconciliation
                     .as_ref()
                     .is_some_and(CompletionReconciliation::requires_review)
@@ -3880,29 +4035,26 @@ impl RunEvidenceStore {
     /// touches source or destination paths; unresolved work must use the
     /// separate discard action so its consequence is explicit in the UI.
     pub fn remove_completed_report(&mut self, run_id: RunId) -> Result<(), StorageError> {
-        self.delete_report_metadata(
-            run_id,
-            "Remove Completed Report",
-            |status| matches!(status, RunReportStatus::Completed | RunReportStatus::ReviewCleared),
-        )
+        self.delete_report_metadata(run_id, "Remove Completed Report", |status| {
+            matches!(
+                status,
+                RunReportStatus::Completed | RunReportStatus::ReviewCleared
+            )
+        })
     }
 
     /// Discard only unresolved report metadata. It intentionally performs no
     /// filesystem operation and tells callers that Recovery Review evidence is
     /// being discarded with the report.
     pub fn discard_unresolved_run(&mut self, run_id: RunId) -> Result<(), StorageError> {
-        self.delete_report_metadata(
-            run_id,
-            "Discard Unresolved Run",
-            |status| {
-                !matches!(
-                    status,
-                    RunReportStatus::Completed
-                        | RunReportStatus::ReviewCleared
-                        | RunReportStatus::InProgress
-                )
-            },
-        )
+        self.delete_report_metadata(run_id, "Discard Unresolved Run", |status| {
+            !matches!(
+                status,
+                RunReportStatus::Completed
+                    | RunReportStatus::ReviewCleared
+                    | RunReportStatus::InProgress
+            )
+        })
     }
 
     fn load_report_or_not_found(&self, run_id: RunId) -> Result<RunReport, StorageError> {
@@ -4057,7 +4209,9 @@ fn validate_canonical_parent(path: &Path) -> Result<(), StorageError> {
 fn current_unix_seconds() -> Result<i64, StorageError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|error| StorageError::InvalidEvent(format!("system clock is before Unix epoch: {error}")))?;
+        .map_err(|error| {
+            StorageError::InvalidEvent(format!("system clock is before Unix epoch: {error}"))
+        })?;
     i64::try_from(duration.as_secs())
         .map_err(|_| StorageError::InvalidEvent("scheduler event time is out of range".to_owned()))
 }
@@ -4076,22 +4230,17 @@ fn open_canonical_connection(path: &Path) -> Result<Connection, StorageError> {
     let name = CString::new(name.as_bytes()).map_err(|_| StorageError::UnsafeDatabasePath)?;
     let mut parent_how: libc::open_how = unsafe { std::mem::zeroed() };
     parent_how.flags = (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
-    parent_how.resolve = libc::RESOLVE_NO_SYMLINKS as u64;
-    let parent_fd = openat2(
-        libc::AT_FDCWD,
-        parent.as_ptr(),
-        &parent_how,
-    )?;
+    parent_how.resolve = libc::RESOLVE_NO_SYMLINKS;
+    let parent_fd = openat2(libc::AT_FDCWD, parent.as_ptr(), &parent_how)?;
     let mut database_how: libc::open_how = unsafe { std::mem::zeroed() };
     database_how.flags = (libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC) as u64;
     database_how.mode = 0o600;
-    database_how.resolve = libc::RESOLVE_NO_SYMLINKS as u64;
+    database_how.resolve = libc::RESOLVE_NO_SYMLINKS;
     let database_fd = openat2(parent_fd.as_raw_fd(), name.as_ptr(), &database_how)?;
     let database_path = format!("/proc/self/fd/{}", database_fd.as_raw_fd());
     let connection = Connection::open_with_flags(
         database_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     drop(database_fd);
     Ok(connection)
@@ -4161,9 +4310,8 @@ impl RunEvidenceStore {
 
         stored
             .map(|(algorithm, digest)| {
-                crate::SshHostFingerprint::from_storage(&algorithm, &digest).map_err(|error| {
-                    crate::HostTrustStoreError::Storage(error.to_string())
-                })
+                crate::SshHostFingerprint::from_storage(&algorithm, &digest)
+                    .map_err(|error| crate::HostTrustStoreError::Storage(error.to_string()))
             })
             .transpose()
     }
@@ -4316,7 +4464,11 @@ impl EventFields {
                 pre_item_type: Some(encode_item_type(action.pre_action.item_type)),
                 pre_size: Some(action.pre_action.size as i64),
                 pre_modified_at_unix_nanos: action.pre_action.modified_at_unix_nanos,
-                pre_device: action.pre_action.identity.as_ref().map(FileIdentity::device),
+                pre_device: action
+                    .pre_action
+                    .identity
+                    .as_ref()
+                    .map(FileIdentity::device),
                 pre_inode: action.pre_action.identity.as_ref().map(FileIdentity::inode),
                 pre_sha256: action.pre_action.sha256.map(|hash| hash.to_vec()),
                 progress_bytes: None,
@@ -4367,7 +4519,8 @@ impl EventFields {
                 let mut fields = empty();
                 fields.phase = "transfer_verified";
                 fields.proof_destination_size = evidence.destination_size.map(|size| size as i64);
-                fields.proof_destination_sha256 = evidence.destination_sha256.map(|hash| hash.to_vec());
+                fields.proof_destination_sha256 =
+                    evidence.destination_sha256.map(|hash| hash.to_vec());
                 fields.proof_metadata_verified = Some(bool_to_int(*metadata_verified));
                 set_recovery_fields(&mut fields, evidence);
                 fields
@@ -4594,11 +4747,9 @@ fn apply_stored_event(
     configured_deletion_method: Option<&str>,
 ) -> Result<(), StorageError> {
     if row.phase == "planned" {
-        let relative_path = blob_to_path(
-            row.relative_path
-                .as_deref()
-                .ok_or_else(|| StorageError::CorruptEvidence("planned action has no path".to_owned()))?,
-        )?;
+        let relative_path = blob_to_path(row.relative_path.as_deref().ok_or_else(|| {
+            StorageError::CorruptEvidence("planned action has no path".to_owned())
+        })?)?;
         let operation = decode_operation(row.operation.as_deref().ok_or_else(|| {
             StorageError::CorruptEvidence("planned action has no operation".to_owned())
         })?)?;
@@ -4608,9 +4759,9 @@ fn apply_stored_event(
         let item_type = decode_item_type(row.pre_item_type.as_deref().ok_or_else(|| {
             StorageError::CorruptEvidence("planned action has no item type".to_owned())
         })?)?;
-        let size = row
-            .pre_size
-            .ok_or_else(|| StorageError::CorruptEvidence("planned action has no size".to_owned()))?;
+        let size = row.pre_size.ok_or_else(|| {
+            StorageError::CorruptEvidence("planned action has no size".to_owned())
+        })?;
         let sha256 = row.pre_sha256.map(|bytes| {
             let mut hash = [0u8; 32];
             if bytes.len() == hash.len() {
@@ -4647,7 +4798,7 @@ fn apply_stored_event(
                             _ => {
                                 return Err(StorageError::CorruptEvidence(
                                     "stored file identity is incomplete".to_owned(),
-                                ))
+                                ));
                             }
                         },
                         sha256,
@@ -4673,11 +4824,9 @@ fn apply_stored_event(
     validate_replayed_transition(entry, &row.phase)?;
     match row.phase.as_str() {
         "started" => entry.started = true,
-        "progress" => entry
-            .progress_bytes
-            .push(row.progress_bytes.ok_or_else(|| {
-                StorageError::CorruptEvidence("progress boundary has no byte count".to_owned())
-            })?),
+        "progress" => entry.progress_bytes.push(row.progress_bytes.ok_or_else(|| {
+            StorageError::CorruptEvidence("progress boundary has no byte count".to_owned())
+        })?),
         "transfer_verified" => {
             if !matches!(
                 entry.plan.operation(),
@@ -4716,8 +4865,7 @@ fn apply_stored_event(
                 || (content_proof_required && row.proof_destination_sha256.is_none())
             {
                 return Err(StorageError::CorruptEvidence(
-                    "proof boundary is missing metadata or destination content evidence"
-                        .to_owned(),
+                    "proof boundary is missing metadata or destination content evidence".to_owned(),
                 ));
             }
             let evidence = decode_recovery_evidence(&row)?;
@@ -4756,9 +4904,7 @@ fn apply_stored_event(
         }
         "removal_completed" => {
             let method = row.deletion_method.as_deref().ok_or_else(|| {
-                StorageError::CorruptEvidence(
-                    "removal result has no deletion method".to_owned(),
-                )
+                StorageError::CorruptEvidence("removal result has no deletion method".to_owned())
             })?;
             let evidence = decode_recovery_evidence(&row)?;
             let deletion_method = decode_deletion_method(method)?;
@@ -4778,16 +4924,16 @@ fn apply_stored_event(
         "completed" => {
             if entry.plan.operation() == PlanActionKind::RemoveSourceAfterVerification {
                 return Err(StorageError::CorruptEvidence(
-                    "Safe Delete action has generic completion without a removal result"
-                        .to_owned(),
+                    "Safe Delete action has generic completion without a removal result".to_owned(),
                 ));
             }
             entry.outcome = ActionOutcome::Completed;
         }
         "failed" => {
-            entry.outcome = ActionOutcome::Failed(decode_reason(row.reason.as_deref().ok_or_else(
-                || StorageError::CorruptEvidence("failed boundary has no reason".to_owned()),
-            )?)?);
+            entry.outcome =
+                ActionOutcome::Failed(decode_reason(row.reason.as_deref().ok_or_else(|| {
+                    StorageError::CorruptEvidence("failed boundary has no reason".to_owned())
+                })?)?);
         }
         "cancelled" => entry.outcome = ActionOutcome::Cancelled,
         "interrupted" => entry.outcome = ActionOutcome::Interrupted,
@@ -4821,13 +4967,12 @@ fn apply_stored_event(
                         "Safe Delete action has an unverified recovery completion".to_owned(),
                     ));
                 }
-                if let Some(review) = entry.recovery_evidence.as_ref() {
-                    if !evidence.is_newer_than(review) {
-                        return Err(StorageError::CorruptEvidence(
-                            "recovery resolution evidence is not newer than its review"
-                                .to_owned(),
-                        ));
-                    }
+                if let Some(review) = entry.recovery_evidence.as_ref()
+                    && !evidence.is_newer_than(review)
+                {
+                    return Err(StorageError::CorruptEvidence(
+                        "recovery resolution evidence is not newer than its review".to_owned(),
+                    ));
                 }
                 entry.recovery_resolution_evidence = Some(evidence);
                 entry.outcome = ActionOutcome::Completed;
@@ -4839,7 +4984,7 @@ fn apply_stored_event(
         phase => {
             return Err(StorageError::CorruptEvidence(format!(
                 "unknown journal phase {phase}"
-            )))
+            )));
         }
     }
     entry.last_phase = row.phase;
@@ -4859,8 +5004,7 @@ fn validate_replayed_transition(
                 PlanActionKind::CopyToDestination
                     | PlanActionKind::OverwriteDestination
                     | PlanActionKind::RemoveSourceAfterVerification
-            )
-                && matches!(entry.last_phase.as_str(), "started" | "progress")
+            ) && matches!(entry.last_phase.as_str(), "started" | "progress")
                 && entry.transfer_evidence.is_none()
         }
         "proof_boundary" => {
@@ -4871,9 +5015,7 @@ fn validate_replayed_transition(
                     && entry.transfer_evidence.is_some())
                 && entry.proof_boundary.is_none()
         }
-        "removal_started" => {
-            entry.last_phase == "proof_boundary" && entry.proof_boundary.is_some()
-        }
+        "removal_started" => entry.last_phase == "proof_boundary" && entry.proof_boundary.is_some(),
         "removal_completed" => {
             entry.last_phase == "removal_started"
                 && entry.proof_boundary.is_some()
@@ -4882,8 +5024,7 @@ fn validate_replayed_transition(
         "recovery_review" => {
             matches!(
                 entry.last_phase.as_str(),
-                "started" | "progress" | "proof_boundary" | "removal_started"
-                    | "transfer_verified"
+                "started" | "progress" | "proof_boundary" | "removal_started" | "transfer_verified"
             ) && entry.recovery_evidence.is_none()
         }
         "recovery_resolved" => {
@@ -4918,12 +5059,14 @@ fn validate_removal_evidence(
 ) -> Result<(), StorageError> {
     let content_proof_required = entry.plan.pre_action().item_type() == ItemType::RegularFile;
     let valid_recovery = match deletion_method {
-        DeletionMethod::Trash => evidence.recovery_present() && evidence.recovery_target().is_some(),
+        DeletionMethod::Trash => {
+            evidence.recovery_present() && evidence.recovery_target().is_some()
+        }
         DeletionMethod::PermanentRemoval => {
             !evidence.recovery_present() && evidence.recovery_target().is_none()
         }
     };
-    let valid_provenance = evidence.provenance().map_or(true, |provenance| {
+    let valid_provenance = evidence.provenance().is_none_or(|provenance| {
         provenance.action_id() == Some(entry.plan.action_id())
             && provenance.recovery_method() == deletion_method
             && provenance.verification_state() == crate::RecoveryVerificationState::Verified
@@ -4996,7 +5139,9 @@ fn decode_recovery_evidence(row: &StoredEvent) -> Result<RecoveryEvidence, Stora
         )
     })?;
     let recovery_present = row.recovery_present.ok_or_else(|| {
-        StorageError::CorruptEvidence("recovery review has no recovery presence evidence".to_owned())
+        StorageError::CorruptEvidence(
+            "recovery review has no recovery presence evidence".to_owned(),
+        )
     })?;
     let evidence = RecoveryEvidence::new(
         observed_at_unix_nanos,
@@ -5013,10 +5158,9 @@ fn decode_recovery_evidence(row: &StoredEvent) -> Result<RecoveryEvidence, Stora
         decode_hash(row.recovery_destination_sha256.as_deref())?,
     );
     let evidence = match row.recovery_item_size {
-        Some(size) => evidence.with_recovery_proof(
-            size,
-            decode_hash(row.recovery_item_sha256.as_deref())?,
-        ),
+        Some(size) => {
+            evidence.with_recovery_proof(size, decode_hash(row.recovery_item_sha256.as_deref())?)
+        }
         None if row.recovery_item_sha256.is_some() => {
             return Err(StorageError::CorruptEvidence(
                 "recovery item content proof is incomplete".to_owned(),
@@ -5057,28 +5201,36 @@ fn decode_recovery_provenance(
     let run_id = row.recovery_provenance_run_id.ok_or_else(|| {
         StorageError::CorruptEvidence("recovery provenance has no run id".to_owned())
     })?;
-    let removed_at = row.recovery_provenance_removed_at_unix_nanos.ok_or_else(|| {
-        StorageError::CorruptEvidence("recovery provenance has no removal time".to_owned())
-    })?;
-    let item_type = decode_item_type(row.recovery_provenance_item_type.as_deref().ok_or_else(|| {
-        StorageError::CorruptEvidence("recovery provenance has no item type".to_owned())
-    })?)?;
-    let source_identity = match (row.recovery_provenance_device, row.recovery_provenance_inode) {
+    let removed_at = row
+        .recovery_provenance_removed_at_unix_nanos
+        .ok_or_else(|| {
+            StorageError::CorruptEvidence("recovery provenance has no removal time".to_owned())
+        })?;
+    let item_type = decode_item_type(row.recovery_provenance_item_type.as_deref().ok_or_else(
+        || StorageError::CorruptEvidence("recovery provenance has no item type".to_owned()),
+    )?)?;
+    let source_identity = match (
+        row.recovery_provenance_device,
+        row.recovery_provenance_inode,
+    ) {
         (Some(device), Some(inode)) => Some(FileIdentity::new(device, inode)),
         (None, None) => None,
         _ => {
             return Err(StorageError::CorruptEvidence(
                 "recovery provenance identity is incomplete".to_owned(),
-            ))
+            ));
         }
     };
-    let content = match (row.recovery_source_size, decode_hash(row.recovery_source_sha256.as_deref())?) {
+    let content = match (
+        row.recovery_source_size,
+        decode_hash(row.recovery_source_sha256.as_deref())?,
+    ) {
         (Some(size), Some(hash)) => Some(ContentProof::new(size, hash)),
         (None, None) => None,
         _ => {
             return Err(StorageError::CorruptEvidence(
                 "recovery provenance content proof is incomplete".to_owned(),
-            ))
+            ));
         }
     };
     let recovery_method = row
@@ -5140,8 +5292,7 @@ fn validate_event(
         metadata_verified,
         ..
     } = event
-    {
-        if !matches!(
+        && (!matches!(
             planned_operation,
             Some(
                 "copy_to_destination"
@@ -5157,12 +5308,11 @@ fn validate_event(
             || (content_proof_required && evidence.source_sha256().is_none())
             || evidence.destination_size().is_none()
             || (content_proof_required && evidence.destination_sha256().is_none())
-            || !matches!(current_phase, Some("started" | "progress"))
-        {
-            return Err(StorageError::InvalidEvent(
-                "verified transfer boundary is incomplete or out of order".to_owned(),
-            ));
-        }
+            || !matches!(current_phase, Some("started" | "progress")))
+    {
+        return Err(StorageError::InvalidEvent(
+            "verified transfer boundary is incomplete or out of order".to_owned(),
+        ));
     }
     if let JournalEvent::ProofBoundary {
         evidence,
@@ -5205,8 +5355,7 @@ fn validate_event(
             resolution: RecoveryResolution::Completed { .. },
             ..
         }
-    ) && planned_operation
-        == Some("remove_source_after_verification")
+    ) && planned_operation == Some("remove_source_after_verification")
     {
         return Err(StorageError::InvalidEvent(
             "Safe Delete recovery cannot be marked completed without a RemovalCompleted result"
@@ -5234,14 +5383,13 @@ fn validate_event(
         | JournalEvent::RecoveryReview { .. }
         | JournalEvent::RecoveryResolved { .. } => None,
     };
-    if let Some(event_method) = event_method {
-        if planned_operation != Some("remove_source_after_verification")
-            || configured_deletion_method != Some(encode_deletion_method(event_method))
-        {
-            return Err(StorageError::InvalidEvent(
-                "removal boundary does not match the frozen Safe Delete method".to_owned(),
-            ));
-        }
+    if let Some(event_method) = event_method
+        && (planned_operation != Some("remove_source_after_verification")
+            || configured_deletion_method != Some(encode_deletion_method(event_method)))
+    {
+        return Err(StorageError::InvalidEvent(
+            "removal boundary does not match the frozen Safe Delete method".to_owned(),
+        ));
     }
     if let JournalEvent::RemovalCompleted { result, .. } = event {
         let evidence = result.evidence();
@@ -5339,12 +5487,7 @@ fn validate_event(
             Ok(())
         }
         "cancelled" | "interrupted"
-            if matches!(
-                current_phase,
-                Some(
-                    "planned" | "started" | "progress",
-                )
-            ) =>
+            if matches!(current_phase, Some("planned" | "started" | "progress",)) =>
         {
             Ok(())
         }
@@ -5377,7 +5520,10 @@ fn validate_action_order(
     // These boundaries only say that no mutation was started for the action.
     // They must remain recordable for the rest of the plan when an earlier
     // action enters Recovery Review and blocks further mutating work.
-    if matches!(event, JournalEvent::Cancelled { .. } | JournalEvent::Interrupted { .. }) {
+    if matches!(
+        event,
+        JournalEvent::Cancelled { .. } | JournalEvent::Interrupted { .. }
+    ) {
         return Ok(());
     }
     if !event_advances_action(event) {
@@ -5477,7 +5623,9 @@ fn validate_removal_result_against_proof(
     };
     let proof_size = proof_size
         .and_then(|size| u64::try_from(size).ok())
-        .ok_or_else(|| StorageError::InvalidEvent("proof boundary has no destination size".to_owned()))?;
+        .ok_or_else(|| {
+            StorageError::InvalidEvent("proof boundary has no destination size".to_owned())
+        })?;
     let proof_sha256 = decode_hash(proof_sha256.as_deref())?;
     if item_type == "regular_file" && proof_sha256.is_none() {
         return Err(StorageError::InvalidEvent(
@@ -5519,7 +5667,9 @@ fn validate_transfer_event_against_plan(
     };
     let size = size
         .and_then(|value| u64::try_from(value).ok())
-        .ok_or_else(|| StorageError::InvalidEvent("planned action has no source size".to_owned()))?;
+        .ok_or_else(|| {
+            StorageError::InvalidEvent("planned action has no source size".to_owned())
+        })?;
     let sha256 = decode_hash(sha256.as_deref())?;
     if item_type == "regular_file" && sha256.is_none() {
         return Err(StorageError::InvalidEvent(
@@ -5563,7 +5713,9 @@ fn report_status(
     if blocked {
         return RunReportStatus::Blocked;
     }
-    if items.iter().any(|item| matches!(item.outcome(), ActionOutcome::InProgress))
+    if items
+        .iter()
+        .any(|item| matches!(item.outcome(), ActionOutcome::InProgress))
         || (items.is_empty() && inventory_recorded && reconciliation.is_none())
     {
         return RunReportStatus::InProgress;
@@ -5870,9 +6022,7 @@ fn decode_snapshot_peer(
                 remote_path,
             )
             .map_err(|error| {
-                StorageError::CorruptEvidence(format!(
-                    "invalid SSH peer in run snapshot: {error}"
-                ))
+                StorageError::CorruptEvidence(format!("invalid SSH peer in run snapshot: {error}"))
             })?;
             Ok(Peer::from_ssh(name, ssh))
         }
@@ -5925,7 +6075,9 @@ fn decode_source(source: &str) -> Result<OneWaySource, StorageError> {
     match source {
         "peer_a" => Ok(OneWaySource::PeerA),
         "peer_b" => Ok(OneWaySource::PeerB),
-        value => Err(StorageError::CorruptEvidence(format!("unknown source {value}"))),
+        value => Err(StorageError::CorruptEvidence(format!(
+            "unknown source {value}"
+        ))),
     }
 }
 
@@ -5978,7 +6130,9 @@ fn decode_operation(operation: &str) -> Result<PlanActionKind, StorageError> {
         "overwrite_destination" => Ok(PlanActionKind::OverwriteDestination),
         "remove_destination" => Ok(PlanActionKind::RemoveDestination),
         "remove_source_after_verification" => Ok(PlanActionKind::RemoveSourceAfterVerification),
-        value => Err(StorageError::CorruptEvidence(format!("unknown operation {value}"))),
+        value => Err(StorageError::CorruptEvidence(format!(
+            "unknown operation {value}"
+        ))),
     }
 }
 
@@ -5993,7 +6147,9 @@ fn decode_side(side: &str) -> Result<PeerSide, StorageError> {
     match side {
         "peer_a" => Ok(PeerSide::PeerA),
         "peer_b" => Ok(PeerSide::PeerB),
-        value => Err(StorageError::CorruptEvidence(format!("unknown peer side {value}"))),
+        value => Err(StorageError::CorruptEvidence(format!(
+            "unknown peer side {value}"
+        ))),
     }
 }
 
@@ -6012,7 +6168,9 @@ fn decode_item_type(item_type: &str) -> Result<ItemType, StorageError> {
         "directory" => Ok(ItemType::Directory),
         "symlink" => Ok(ItemType::Symlink),
         "unsupported" => Ok(ItemType::Unsupported),
-        value => Err(StorageError::CorruptEvidence(format!("unknown item type {value}"))),
+        value => Err(StorageError::CorruptEvidence(format!(
+            "unknown item type {value}"
+        ))),
     }
 }
 
@@ -6081,13 +6239,17 @@ fn decode_finding_kind(kind: &str) -> Result<ReconciliationFindingKind, StorageE
     }
 }
 
-fn encode_reconciliation_reason(reason: &ReconciliationReason) -> (&'static str, Option<&'static str>) {
+fn encode_reconciliation_reason(
+    reason: &ReconciliationReason,
+) -> (&'static str, Option<&'static str>) {
     match reason {
         ReconciliationReason::Unexplained => ("unexplained", None),
         ReconciliationReason::Excluded => ("excluded", None),
         ReconciliationReason::NewlyAppeared => ("newly_appeared", None),
         ReconciliationReason::Changed => ("changed", None),
-        ReconciliationReason::Failed(action_reason) => ("failed", Some(encode_reason(*action_reason))),
+        ReconciliationReason::Failed(action_reason) => {
+            ("failed", Some(encode_reason(*action_reason)))
+        }
         ReconciliationReason::Unavailable => ("unavailable", None),
         ReconciliationReason::Unverifiable => ("unverifiable", None),
     }
@@ -6134,7 +6296,9 @@ fn encode_reason(reason: ActionReason) -> &'static str {
 fn encode_resolution(resolution: &RecoveryResolution) -> &'static str {
     match resolution {
         RecoveryResolution::Completed { .. } => "completed",
-        RecoveryResolution::Unresolved(ActionReason::TransferFailed) => "unresolved:transfer_failed",
+        RecoveryResolution::Unresolved(ActionReason::TransferFailed) => {
+            "unresolved:transfer_failed"
+        }
         RecoveryResolution::Unresolved(ActionReason::VerificationMismatch) => {
             "unresolved:verification_mismatch"
         }
@@ -6186,7 +6350,9 @@ fn decode_reason(reason: &str) -> Result<ActionReason, StorageError> {
         "filesystem_uncertain" => Ok(ActionReason::FilesystemUncertain),
         "interrupted_boundary" => Ok(ActionReason::InterruptedBoundary),
         "destination_unavailable" => Ok(ActionReason::DestinationUnavailable),
-        value => Err(StorageError::CorruptEvidence(format!("unknown action reason {value}"))),
+        value => Err(StorageError::CorruptEvidence(format!(
+            "unknown action reason {value}"
+        ))),
     }
 }
 
@@ -6284,7 +6450,9 @@ fn decode_volume_identity(bytes: Option<&[u8]>) -> Result<Option<VolumeIdentity>
         return Ok(None);
     };
     let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
-        StorageError::CorruptEvidence("volume identity must contain an 8-byte device number".to_owned())
+        StorageError::CorruptEvidence(
+            "volume identity must contain an 8-byte device number".to_owned(),
+        )
     })?;
     Ok(Some(VolumeIdentity::new(u64::from_le_bytes(bytes))))
 }
@@ -6328,7 +6496,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
         assert!(
             migrated
                 .connection
@@ -6361,7 +6529,9 @@ mod tests {
                 AuthorizationSnapshot::default(),
             )
             .expect("legacy run should be valid");
-            store.begin_run(&run).expect("legacy evidence should persist");
+            store
+                .begin_run(&run)
+                .expect("legacy evidence should persist");
             store
                 .connection
                 .execute_batch(
@@ -6373,14 +6543,19 @@ mod tests {
                 .expect("fixture should represent a version fourteen database");
         }
 
-        let migrated = RunEvidenceStore::open(&path).expect("version fourteen database should migrate");
+        let migrated =
+            RunEvidenceStore::open(&path).expect("version fourteen database should migrate");
         let version: i64 = migrated
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 19);
-        for table in ["application_settings", "sync_profiles", "sync_profile_exclusions"] {
+        assert_eq!(version, 20);
+        for table in [
+            "application_settings",
+            "sync_profiles",
+            "sync_profile_exclusions",
+        ] {
             assert!(
                 migrated
                     .connection
@@ -6432,7 +6607,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            19
+            20
         );
     }
 
