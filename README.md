@@ -39,7 +39,7 @@ SOURCE_DATE_EPOCH=0 ./packaging/build-deb.sh
 ```
 
 The resulting versioned package is written under `target/debian/`. It contains
-the application, desktop entry, icon, Help asset, and fixed per-user systemd
+the application, desktop entry, Brand Mark and desktop icons, Help asset, and fixed per-user systemd
 service/timer. Installing the package does not enable a root daemon. Enable or
 disable the scheduler explicitly as the desktop user with the desktop-menu
 actions or `syncplus-scheduler-register` and `syncplus-scheduler-unregister`.

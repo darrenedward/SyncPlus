@@ -73,6 +73,14 @@ install -Dm0644 packaging/syncplus.desktop \
     "$staging/usr/share/applications/syncplus.desktop"
 install -Dm0644 packaging/icons/syncplus.svg \
     "$staging/usr/share/icons/hicolor/scalable/apps/syncplus.svg"
+install -Dm0644 packaging/icons/syncplus-light.svg \
+    "$staging/usr/share/syncplus/brand-mark/syncplus-light.svg"
+install -Dm0644 packaging/icons/syncplus-symbolic.svg \
+    "$staging/usr/share/icons/hicolor/symbolic/apps/syncplus-symbolic.svg"
+for size in 16 22 24 32 48 64 128 256 512; do
+    install -Dm0644 "packaging/icons/hicolor/${size}x${size}/apps/syncplus.png" \
+        "$staging/usr/share/icons/hicolor/${size}x${size}/apps/syncplus.png"
+done
 install -Dm0644 packaging/systemd/syncplus-background.service \
     "$staging/usr/lib/systemd/user/syncplus-background.service"
 install -Dm0644 packaging/systemd/syncplus-background.timer \

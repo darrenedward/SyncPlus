@@ -328,6 +328,7 @@ SyncPlus/
 │   └── syncplus/
 │       └── src/
 │           ├── main.rs
+│           ├── brand_mark.rs     # Brand Mark catalog and window icon loader
 │           ├── app.rs            # UI state machine and event handling
 │           ├── theme.rs
 │           ├── help.rs
@@ -399,7 +400,7 @@ Each milestone must be independently testable and leave the workspace buildable.
 - **M8 — Scheduling v1:** per-user background scheduler, profile authorization wizard, missed-run/catch-up behavior, retry/backoff, tray/quit behavior, notifications.
 - **M9 — Release hardening:** real external filesystem matrix, crash/interrupt tests, permission fixtures, SQLite corruption/recovery, SSH failure matrix, packaging, documentation, and release gates.
 
-The release artifact includes a versioned Debian package (`.deb`) for the supported Linux architecture, a desktop entry, application icons, Help/docs assets, and the per-user Background Scheduler integration. Installation must not enable a root daemon or grant runtime privileges.
+The release artifact includes a versioned Debian package (`.deb`) for the supported Linux architecture, a desktop entry, application icons, Help/docs assets, and the per-user Background Scheduler integration. Installation must not enable a root daemon or grant runtime privileges. The desktop menu icon and the window icon are the same Brand Mark: one SVG source plus hicolor rasters (16–512px), with light and monochrome variants so the mark remains legible on ink and paper.
 
 ## Required tests and release gates
 

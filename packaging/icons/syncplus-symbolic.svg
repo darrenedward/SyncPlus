@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">SyncPlus</title>
+  <desc id="desc">Monochrome Brand Mark: outbound and inbound arrows in a protected loop for constrained backgrounds</desc>
+  <path d="M18 27a16 16 0 0 1 27-8l4 4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="6"/>
+  <path d="m45 13 4 10-11 1" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="6"/>
+  <path d="M46 37a16 16 0 0 1-27 8l-4-4" fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="6"/>
+  <path d="m19 51-4-10 11-1" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="6"/>
+</svg>

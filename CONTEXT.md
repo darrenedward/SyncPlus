@@ -493,3 +493,7 @@ Backups are created only before a file-changing run, database migration, or repa
 A UI state shown when the live Application Database fails integrity validation or cannot be opened safely. It explains the problem and offers only validated backups for explicit user-selected restoration; it never silently replaces the live database or treats a corrupt snapshot as recoverable.
 
 Before restoring, SyncPlus quarantines the corrupt live database under a timestamped diagnostic name. The quarantined copy is excluded from active storage and has a separate user-controlled Remove action.
+
+**Brand Mark**:
+The SyncPlus identity mark: a rounded square with a copper outbound arrow and a steel inbound arrow in a protected loop. The packaged desktop icon and the window icon are this mark. The dark mark sits on warm ink; a light mark on warm paper and a monochrome mark exist so it stays legible without a white box.
+_Avoid_: Seafoam, neon mint, magenta, teal, a procedural window glyph, a menu icon that differs from the window icon
