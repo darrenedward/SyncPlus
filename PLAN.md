@@ -332,6 +332,7 @@ SyncPlus/
 │           ├── brand_mark.rs     # Brand Mark catalog and window icon loader
 │           ├── brand_kit.rs      # Public Brand Kit file, size, and promise contracts
 │           ├── app.rs            # UI state machine and event handling
+│           ├── chrome.rs         # sidebar destinations and Overview identity
 │           ├── theme.rs
 │           ├── help.rs
 │           └── panels/
@@ -495,6 +496,10 @@ Examples of required messages:
 - “This scheduled sync did not run because the external drive was unavailable. Would you like to run it now?”
 - “This profile allows unattended data deletion. Continue copying this authorization to the new profile?”
 - “The destination file was verified, but the source changed during transfer. The source was preserved and needs review.”
+
+## Follow-on visual identity
+
+Brand Theme tokens for Dark Appearance and Light Appearance live in `crates/syncplus/src/theme.rs`. Core still stores only the named preference System, Light, or Dark. Brand Mark catalog and window icon loading live in `crates/syncplus/src/brand_mark.rs`. Navigation chrome and Overview identity live in `crates/syncplus/src/chrome.rs`. Workspace type roles, Help grouping, and Execution Confirmation presentation live in the desktop GUI. The public Brand Kit lives under `docs/brand/` and must not weaken the v1 safety contract.
 
 ## Deferred design work
 

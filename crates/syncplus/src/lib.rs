@@ -12,6 +12,9 @@ mod app;
 #[cfg(test)]
 mod brand_kit;
 mod brand_mark;
+mod chrome;
+mod theme;
 
 pub use app::{EndpointKind, SyncPlusApp, UiValidationError, run_background_scheduler_once};
 pub use brand_mark::window_icon;
+pub use theme::BrandTheme;

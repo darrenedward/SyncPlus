@@ -27,6 +27,9 @@ use syncplus_core::{
     SyncProfile, SyncProfileId, ThemePreference,
 };
 
+use crate::chrome::{self, ChromeAccent, ChromeSurface, OverviewAction};
+use crate::theme::{BrandTheme, TypeRole};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EndpointKind {
     #[default]
@@ -116,7 +119,7 @@ enum SidebarIcon {
     Profiles,
     SyncWorkspace,
     Reports,
-    Recovery,
+    Settings,
     Help,
 }
 
@@ -128,79 +131,8 @@ enum ProfileWizardStep {
     ReviewAndSave,
 }
 
-#[derive(Clone, Copy)]
-struct UiPalette {
-    canvas: egui::Color32,
-    surface: egui::Color32,
-    elevated: egui::Color32,
-    field: egui::Color32,
-    border: egui::Color32,
-    border_subtle: egui::Color32,
-    text: egui::Color32,
-    muted: egui::Color32,
-    accent: egui::Color32,
-    on_accent: egui::Color32,
-    accent_soft: egui::Color32,
-    secondary: egui::Color32,
-    hot: egui::Color32,
-    danger: egui::Color32,
-    danger_soft: egui::Color32,
-    on_danger_soft: egui::Color32,
-    amber: egui::Color32,
-    amber_soft: egui::Color32,
-    logo_background: egui::Color32,
-}
-
-fn ui_palette(ui: &egui::Ui) -> UiPalette {
-    ui_palette_for_dark_mode(ui.visuals().dark_mode)
-}
-
-fn ui_palette_for_dark_mode(dark_mode: bool) -> UiPalette {
-    if dark_mode {
-        UiPalette {
-            canvas: egui::Color32::from_rgb(13, 13, 13),
-            surface: egui::Color32::from_rgb(20, 22, 25),
-            elevated: egui::Color32::from_rgb(27, 31, 36),
-            field: egui::Color32::from_rgb(12, 15, 18),
-            border: egui::Color32::from_rgb(114, 133, 150),
-            border_subtle: egui::Color32::from_rgb(89, 104, 117),
-            text: egui::Color32::WHITE,
-            muted: egui::Color32::from_rgb(169, 181, 193),
-            accent: egui::Color32::from_rgb(0, 255, 133),
-            on_accent: egui::Color32::from_rgb(0, 27, 14),
-            accent_soft: egui::Color32::from_rgb(12, 62, 43),
-            secondary: egui::Color32::from_rgb(30, 144, 255),
-            hot: egui::Color32::from_rgb(255, 0, 153),
-            danger: egui::Color32::from_rgb(225, 83, 98),
-            danger_soft: egui::Color32::from_rgb(71, 24, 32),
-            on_danger_soft: egui::Color32::from_rgb(255, 237, 239),
-            amber: egui::Color32::from_rgb(255, 209, 102),
-            amber_soft: egui::Color32::from_rgb(72, 60, 30),
-            logo_background: egui::Color32::from_rgb(20, 24, 28),
-        }
-    } else {
-        UiPalette {
-            canvas: egui::Color32::from_rgb(244, 247, 250),
-            surface: egui::Color32::WHITE,
-            elevated: egui::Color32::from_rgb(238, 243, 248),
-            field: egui::Color32::from_rgb(247, 250, 252),
-            border: egui::Color32::from_rgb(96, 117, 134),
-            border_subtle: egui::Color32::from_rgb(114, 133, 150),
-            text: egui::Color32::from_rgb(16, 24, 32),
-            muted: egui::Color32::from_rgb(74, 91, 106),
-            accent: egui::Color32::from_rgb(0, 122, 71),
-            on_accent: egui::Color32::WHITE,
-            accent_soft: egui::Color32::from_rgb(222, 245, 235),
-            secondary: egui::Color32::from_rgb(20, 100, 184),
-            hot: egui::Color32::from_rgb(178, 0, 105),
-            danger: egui::Color32::from_rgb(183, 39, 56),
-            danger_soft: egui::Color32::from_rgb(253, 235, 238),
-            on_danger_soft: egui::Color32::from_rgb(111, 19, 31),
-            amber: egui::Color32::from_rgb(142, 93, 0),
-            amber_soft: egui::Color32::from_rgb(250, 239, 211),
-            logo_background: egui::Color32::from_rgb(20, 24, 28),
-        }
-    }
+fn ui_palette(ui: &egui::Ui) -> BrandTheme {
+    BrandTheme::from_ui(ui)
 }
 
 impl ProfileWizardStep {
@@ -1595,6 +1527,10 @@ fn format_ssh_precheck_boundary_diagnostic(profile: &SyncProfile) -> String {
     )
 }
 
+const PATH_RISK_WARNING_LABEL: &str = "Path Risk Warning";
+const QUIT_ACTIVE_RUN_COPY: &str = "Stop and Quit requests cancellation. The core workflow records the cancellation boundary, preserves affected source data, and may leave the Run Report in Recovery Review.";
+const QUIT_STOPPING_COPY: &str = "SyncPlus will quit only after the durable cancellation boundary is recorded. The Run Report remains available for Recovery Review.";
+
 fn format_warning_diagnostic(
     profile: &SyncProfile,
     warning: &syncplus_core::PathRiskWarning,
@@ -1810,6 +1746,42 @@ impl SyncPlusApp {
         self.help_topic = topic;
         self.view = AppView::Help;
         self.wizard_step = None;
+    }
+
+    fn chrome_surface(&self) -> ChromeSurface {
+        match self.view {
+            AppView::Welcome => ChromeSurface::Overview,
+            AppView::Profiles => ChromeSurface::Profiles,
+            AppView::Settings => ChromeSurface::Settings,
+            AppView::Wizard | AppView::Sync => ChromeSurface::SyncWorkspace,
+            AppView::Reports => ChromeSurface::Reports,
+            AppView::Help => ChromeSurface::Help,
+        }
+    }
+
+    fn recovery_review_pending(&self) -> bool {
+        chrome::recovery_review_is_pending(self.run_reports.iter().map(RunReport::status))
+    }
+
+    fn report_review_pending(&self) -> bool {
+        chrome::report_review_is_pending(self.run_reports.iter().map(RunReport::status))
+    }
+
+    fn last_run_status_for_active_profile(&self) -> Option<RunReportStatus> {
+        self.run_reports.iter().find_map(|report| {
+            (report.snapshot().profile().name() == self.form.name).then_some(report.status())
+        })
+    }
+
+    fn recovery_review_pending_for_active_profile(&self) -> bool {
+        chrome::recovery_review_is_pending(self.run_reports.iter().filter_map(|report| {
+            (report.snapshot().profile().name() == self.form.name).then_some(report.status())
+        }))
+    }
+
+    fn open_recovery_review(&mut self) {
+        self.show_reports();
+        self.help_topic = HelpTopic::Recovery;
     }
 
     pub fn refresh_run_reports(&mut self) -> Result<(), UiValidationError> {
@@ -2173,7 +2145,7 @@ impl SyncPlusApp {
                         ui.heading("A manual Sync Run is active");
                         ui.label(format!("Manual Sync Run {} is still running.", run_id.value()));
                         ui.label("Keep running and hide leaves the run active and moves SyncPlus to the tray.");
-                        ui.label("Stop and Quit requests cancellation. The core workflow records the cancellation boundary, preserves affected source data, and may leave the Run Report in Recovery Review.");
+                        ui.label(QUIT_ACTIVE_RUN_COPY);
                         ui.horizontal(|ui| {
                             if ui.button("Keep running and hide").clicked() {
                                 keep_running = true;
@@ -2193,8 +2165,11 @@ impl SyncPlusApp {
                     .resizable(false)
                     .show(context, |ui| {
                         ui.heading("Waiting for the active Sync Run to settle");
-                        ui.label(format!("Cancellation is settling for Manual Sync Run {}.", run_id.value()));
-                        ui.label("SyncPlus will quit only after the durable cancellation boundary is recorded. The Run Report remains available for Recovery Review.");
+                        ui.label(format!(
+                            "Cancellation is settling for Manual Sync Run {}.",
+                            run_id.value()
+                        ));
+                        ui.label(QUIT_STOPPING_COPY);
                     });
             }
         }
@@ -3077,7 +3052,7 @@ impl SyncPlusApp {
             self.form = ProfileForm::from_persisted(profile);
             self.review = None;
             let name = profile.profile().name().to_owned();
-            self.show_sync_workspace();
+            self.show_profiles();
             self.status = format!("Editing {name}. Changes apply to future runs.");
         }
     }
@@ -3090,59 +3065,41 @@ impl SyncPlusApp {
         };
         context.set_theme(preference);
         context.all_styles_mut(|style| {
-            let palette = ui_palette_for_dark_mode(style.visuals.dark_mode);
+            match self.settings.theme() {
+                ThemePreference::Light => style.visuals.dark_mode = false,
+                ThemePreference::Dark => style.visuals.dark_mode = true,
+                ThemePreference::System => {}
+            }
+            BrandTheme::for_dark_mode(style.visuals.dark_mode).apply_to_style(style);
             style.spacing.item_spacing = egui::vec2(10.0, 8.0);
             style.spacing.button_padding = egui::vec2(14.0, 8.0);
             style.spacing.interact_size = egui::vec2(44.0, 36.0);
-            style.visuals.button_frame = true;
-            style.visuals.override_text_color = Some(palette.text);
-            style.visuals.weak_text_color = Some(palette.muted);
-            style.visuals.selection.bg_fill = palette.accent_soft;
-            style.visuals.selection.stroke = egui::Stroke::new(1.0, palette.accent);
-            style.visuals.hyperlink_color = palette.secondary;
-            style.visuals.warn_fg_color = palette.amber;
-            style.visuals.error_fg_color = palette.hot;
-            style.visuals.faint_bg_color = palette.elevated;
-            style.visuals.panel_fill = palette.canvas;
-            style.visuals.window_fill = palette.surface;
-            style.visuals.extreme_bg_color = palette.field;
-            style.visuals.text_edit_bg_color = Some(palette.field);
-            style.visuals.window_corner_radius = egui::CornerRadius::same(14);
-            style.visuals.menu_corner_radius = egui::CornerRadius::same(10);
-            style.visuals.widgets.noninteractive.bg_fill = palette.surface;
-            style.visuals.widgets.noninteractive.bg_stroke =
-                egui::Stroke::new(1.0, palette.border_subtle);
-            style.visuals.widgets.inactive.bg_fill = palette.elevated;
-            style.visuals.widgets.inactive.weak_bg_fill = palette.elevated;
-            style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette.border);
-            style.visuals.widgets.hovered.bg_fill = palette.accent_soft;
-            style.visuals.widgets.hovered.weak_bg_fill = palette.accent_soft;
-            style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, palette.hot);
-            style.visuals.widgets.active.bg_fill = palette.accent_soft;
-            style.visuals.widgets.active.weak_bg_fill = palette.accent_soft;
-            style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, palette.accent);
-            style.visuals.widgets.open.bg_fill = palette.accent_soft;
-            style.visuals.widgets.open.weak_bg_fill = palette.accent_soft;
-            style.visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, palette.accent);
-            style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
-            style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
-            style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
-            style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
-            style.visuals.widgets.open.corner_radius = egui::CornerRadius::same(8);
             style
                 .text_styles
                 .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Heading, egui::FontId::proportional(20.0));
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::proportional(TypeRole::Body.size()),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Body,
+                egui::FontId::proportional(TypeRole::Body.size()),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Small,
+                egui::FontId::proportional(TypeRole::Caption.size()),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                egui::FontId::proportional(TypeRole::Title.size()),
+            );
         });
     }
 
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
         let palette = ui_palette(ui);
+        let pending = self.recovery_review_pending();
+        let review_pending = self.report_review_pending();
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             Self::draw_brand_mark_sized(ui, 34.0);
@@ -3158,64 +3115,49 @@ impl SyncPlusApp {
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(14.0);
-        for (label, selected, action, icon, icon_color) in [
-            (
-                "Overview",
-                self.view == AppView::Welcome,
-                0,
-                SidebarIcon::Overview,
-                palette.accent,
-            ),
-            (
-                "Profiles",
-                self.view == AppView::Profiles,
-                1,
-                SidebarIcon::Profiles,
-                palette.secondary,
-            ),
-            (
-                "Sync workspace",
-                matches!(self.view, AppView::Sync | AppView::Wizard),
-                2,
-                SidebarIcon::SyncWorkspace,
-                palette.hot,
-            ),
-            (
-                "Run Reports",
-                self.view == AppView::Reports && self.help_topic != HelpTopic::Recovery,
-                3,
-                SidebarIcon::Reports,
-                palette.amber,
-            ),
-            (
-                "Recovery Review",
-                self.view == AppView::Reports && self.help_topic == HelpTopic::Recovery,
-                4,
-                SidebarIcon::Recovery,
-                palette.danger,
-            ),
-            (
-                "Help & Support",
-                self.view == AppView::Help,
-                5,
-                SidebarIcon::Help,
-                palette.muted,
-            ),
-        ] {
-            if sidebar_nav_button(ui, label, selected, icon, icon_color).clicked() {
-                match action {
-                    0 => self.show_welcome(),
-                    1 => self.show_profiles(),
-                    2 => self.open_sync_workspace(),
-                    3 => self.show_reports(),
-                    4 => {
-                        self.show_reports();
-                        self.help_topic = HelpTopic::Recovery;
-                    }
-                    5 => self.show_help(self.help_topic),
-                    _ => unreachable!(),
+        let mut opened = None;
+        let mut open_recovery = false;
+        for item in chrome::sidebar_items(self.chrome_surface()) {
+            let icon = match item.surface {
+                ChromeSurface::Overview => SidebarIcon::Overview,
+                ChromeSurface::Profiles => SidebarIcon::Profiles,
+                ChromeSurface::SyncWorkspace => SidebarIcon::SyncWorkspace,
+                ChromeSurface::Reports => SidebarIcon::Reports,
+                ChromeSurface::Settings => SidebarIcon::Settings,
+                ChromeSurface::Help => SidebarIcon::Help,
+            };
+            let icon_color = match item.accent {
+                ChromeAccent::Copper => palette.copper,
+                ChromeAccent::Muted => palette.muted,
+            };
+            let label = if item.surface == ChromeSurface::Reports {
+                match chrome::reports_badge(review_pending) {
+                    Some(badge) => format!("{} · {badge}", item.label),
+                    None => item.label.to_owned(),
                 }
+            } else {
+                item.label.to_owned()
+            };
+            if sidebar_nav_button(ui, &label, item.selected, icon, icon_color).clicked() {
+                opened = Some(item.surface);
             }
+        }
+        if let Some(notice) = chrome::recovery_review_notice(pending) {
+            if recovery_review_notice_button(ui, notice).clicked() {
+                open_recovery = true;
+            }
+        }
+        if let Some(surface) = opened {
+            match surface {
+                ChromeSurface::Overview => self.show_welcome(),
+                ChromeSurface::Profiles => self.show_profiles(),
+                ChromeSurface::SyncWorkspace => self.open_sync_workspace(),
+                ChromeSurface::Reports => self.show_reports(),
+                ChromeSurface::Settings => self.show_settings(),
+                ChromeSurface::Help => self.show_help(self.help_topic),
+            }
+        } else if open_recovery {
+            self.open_recovery_review();
         }
     }
 
@@ -3302,10 +3244,10 @@ impl SyncPlusApp {
                                     ))
                                     .small()
                                     .strong()
-                                    .color(palette.accent),
+                                    .color(palette.copper),
                                 );
                                 ui.label(
-                                    egui::RichText::new("Select one to open its Sync workspace.")
+                                    egui::RichText::new("Select one to edit the Sync Profile.")
                                         .small()
                                         .color(palette.muted),
                                 );
@@ -3320,9 +3262,9 @@ impl SyncPlusApp {
                                                 status_dot(
                                                     ui,
                                                     if selected {
-                                                        palette.accent
+                                                        palette.copper
                                                     } else {
-                                                        palette.secondary
+                                                        palette.steel
                                                     },
                                                 );
                                                 ui.label(
@@ -3346,7 +3288,7 @@ impl SyncPlusApp {
                                                         egui::RichText::new("SOURCE")
                                                             .small()
                                                             .strong()
-                                                            .color(palette.accent),
+                                                            .color(palette.copper),
                                                     );
                                                     ui.label(egui::RichText::new(source).monospace());
                                                 });
@@ -3355,7 +3297,7 @@ impl SyncPlusApp {
                                                         egui::RichText::new("DESTINATION")
                                                             .small()
                                                             .strong()
-                                                            .color(palette.secondary),
+                                                            .color(palette.steel),
                                                     );
                                                     ui.label(
                                                         egui::RichText::new(destination).monospace(),
@@ -3366,7 +3308,7 @@ impl SyncPlusApp {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if secondary_button(ui, "Open workspace").clicked() {
+                                                if secondary_button(ui, "Edit profile").clicked() {
                                                     open_profile = Some(id);
                                                 }
                                             },
@@ -3374,6 +3316,11 @@ impl SyncPlusApp {
                                     });
                                 });
                             }
+                        }
+
+                        if self.form.id.is_some() {
+                            ui.add_space(16.0);
+                            self.draw_profile_form(ui);
                         }
 
                         ui.add_space(16.0);
@@ -3384,7 +3331,7 @@ impl SyncPlusApp {
                             .inner_margin(egui::Margin::symmetric(16, 13))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    status_dot(ui, palette.accent);
+                                    status_dot(ui, palette.copper);
                                     ui.label(egui::RichText::new("Safe by default").strong());
                                     ui.label(
                                         egui::RichText::new(
@@ -3469,14 +3416,14 @@ impl SyncPlusApp {
                                                         }),
                                                 )
                                                 .fill(if selected {
-                                                    palette.accent_soft
+                                                    palette.copper_soft
                                                 } else {
                                                     palette.elevated
                                                 })
                                                 .stroke(egui::Stroke::new(
                                                     1.0,
                                                     if selected {
-                                                        palette.accent
+                                                        palette.copper
                                                     } else {
                                                         palette.border_subtle
                                                     },
@@ -3542,9 +3489,9 @@ impl SyncPlusApp {
                             ui.add_space(12.0);
                             ui.columns(3, |columns| {
                                 for (column, theme, title, description) in [
-                                    (0, ThemePreference::System, "System", "Follow the desktop theme."),
-                                    (1, ThemePreference::Light, "Light", "Use a bright canvas."),
-                                    (2, ThemePreference::Dark, "Dark", "Use the dark canvas."),
+                                    (0, ThemePreference::System, "System", "Follow the desktop Dark Appearance or Light Appearance."),
+                                    (1, ThemePreference::Light, "Light", "Use the warm paper Light Appearance."),
+                                    (2, ThemePreference::Dark, "Dark", "Use the warm ink Dark Appearance."),
                                 ] {
                                     let selected = self.settings.theme() == theme;
                                     let width = columns[column].available_width();
@@ -3561,14 +3508,14 @@ impl SyncPlusApp {
                                                         }),
                                                 )
                                                 .fill(if selected {
-                                                    palette.accent_soft
+                                                    palette.copper_soft
                                                 } else {
                                                     palette.elevated
                                                 })
                                                 .stroke(egui::Stroke::new(
                                                     1.0,
                                                     if selected {
-                                                        palette.accent
+                                                        palette.copper
                                                     } else {
                                                         palette.border_subtle
                                                     },
@@ -3604,17 +3551,17 @@ impl SyncPlusApp {
                                 (
                                     "Fresh Analysis before every run",
                                     "The current filesystem state is reviewed before a plan can be confirmed.",
-                                    palette.accent,
+                                    palette.copper,
                                 ),
                                 (
                                     "Explicit confirmation before mutation",
                                     "No copy, overwrite, or removal begins from navigation or a stale plan.",
-                                    palette.secondary,
+                                    palette.steel,
                                 ),
                                 (
                                     "Preserve data when verification is uncertain",
                                     "Failures and unexplained changes stay open for Recovery Review.",
-                                    palette.amber,
+                                    palette.warning,
                                 ),
                             ] {
                                 inset_frame(ui).show(ui, |ui| {
@@ -3657,11 +3604,7 @@ impl SyncPlusApp {
         let painter = ui.painter();
         let palette = ui_palette(ui);
         let radius = (size * 0.22).round().clamp(6.0, 20.0) as u8;
-        painter.rect_filled(
-            rect,
-            egui::CornerRadius::same(radius),
-            palette.logo_background,
-        );
+        painter.rect_filled(rect, egui::CornerRadius::same(radius), palette.canvas);
         let margin = size * 0.2;
         let left = rect.left() + margin;
         let right = rect.right() - margin;
@@ -3673,399 +3616,150 @@ impl SyncPlusApp {
                 egui::pos2(left, upper),
                 egui::pos2(right - size * 0.045, upper),
             ],
-            egui::Stroke::new(stroke, palette.accent),
+            egui::Stroke::new(stroke, palette.copper),
         );
         painter.line_segment(
             [
                 egui::pos2(right - size * 0.045, upper),
                 egui::pos2(right - size * 0.155, upper - size * 0.09),
             ],
-            egui::Stroke::new(stroke, palette.accent),
+            egui::Stroke::new(stroke, palette.copper),
         );
         painter.line_segment(
             [
                 egui::pos2(right - size * 0.045, upper),
                 egui::pos2(right - size * 0.155, upper + size * 0.09),
             ],
-            egui::Stroke::new(stroke, palette.accent),
+            egui::Stroke::new(stroke, palette.copper),
         );
         painter.line_segment(
             [
                 egui::pos2(right, lower),
                 egui::pos2(left + size * 0.045, lower),
             ],
-            egui::Stroke::new(stroke, palette.hot),
+            egui::Stroke::new(stroke, palette.steel),
         );
         painter.line_segment(
             [
                 egui::pos2(left + size * 0.045, lower),
                 egui::pos2(left + size * 0.155, lower - size * 0.09),
             ],
-            egui::Stroke::new(stroke, palette.hot),
+            egui::Stroke::new(stroke, palette.steel),
         );
         painter.line_segment(
             [
                 egui::pos2(left + size * 0.045, lower),
                 egui::pos2(left + size * 0.155, lower + size * 0.09),
             ],
-            egui::Stroke::new(stroke, palette.hot),
+            egui::Stroke::new(stroke, palette.steel),
         );
     }
 
     fn draw_empty_welcome(&mut self, ui: &mut egui::Ui) {
         let mut open_wizard = false;
-        let mut open_help = false;
-        let mut open_settings = false;
-        let palette = ui_palette(ui);
+        let overview = chrome::empty_overview();
         egui::ScrollArea::vertical()
             .id_salt("empty-welcome-content")
             .show(ui, |ui| {
                 let available_width = ui.available_width();
-                let content_width = available_width.min(1180.0);
+                let content_width = available_width.min(720.0);
                 ui.horizontal(|ui| {
                     ui.add_space(((available_width - content_width) / 2.0).max(0.0));
                     ui.vertical(|ui| {
                         ui.set_width(content_width);
                         ui.add_space(28.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("WELCOME TO SYNCPLUS")
-                                    .small()
-                                    .strong()
-                                    .color(palette.accent),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    active_mode_badge(ui, self.settings.mode());
-                                    ui.add_space(8.0);
-                                    if ui.link("Change mode in Settings").clicked() {
-                                        open_settings = true;
-                                    }
-                                },
-                            );
-                        });
-                        ui.add_space(8.0);
-                        egui::Frame::new()
-                            .fill(palette.surface)
-                            .stroke(egui::Stroke::new(1.0, palette.border_subtle))
-                            .corner_radius(egui::CornerRadius::same(18))
-                            .inner_margin(egui::Margin::symmetric(26, 24))
-                            .shadow(if ui.visuals().dark_mode {
-                                egui::Shadow {
-                                    offset: [0, 8],
-                                    blur: 22,
-                                    spread: 1,
-                                    color: egui::Color32::from_black_alpha(90),
-                                }
-                            } else {
-                                egui::Shadow {
-                                    offset: [0, 5],
-                                    blur: 14,
-                                    spread: 0,
-                                    color: egui::Color32::from_black_alpha(22),
-                                }
-                            })
-                            .show(ui, |ui| {
-                                ui.columns(2, |columns| {
-                                    columns[0].vertical(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("SAFE FILE SYNCHRONIZATION")
-                                                .small()
-                                                .strong()
-                                                .color(palette.secondary),
-                                        );
-                                        ui.add_space(8.0);
-                                        ui.label(
-                                            egui::RichText::new("A calmer way to\nmove your files.")
-                                                .size(38.0)
-                                                .strong(),
-                                        );
-                                        ui.add_space(10.0);
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "Define the path, review the plan, and confirm only what you understand. Nothing changes until you say so.",
-                                            )
-                                            .size(16.0)
-                                            .color(palette.muted),
-                                        );
-                                        ui.add_space(20.0);
-                                        ui.horizontal(|ui| {
-                                            if primary_button(ui, "Create your first profile").clicked() {
-                                                open_wizard = true;
-                                            }
-                                            if secondary_button(ui, "See how it works").clicked() {
-                                                open_help = true;
-                                            }
-                                        });
-                                    });
-                                    columns[1].vertical_centered(|ui| {
-                                        sync_illustration(ui, palette);
-                                    });
-                                });
-                            });
-
-                        ui.add_space(24.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("YOUR FIRST SYNC").small().strong().color(palette.accent));
-                            ui.add_space(10.0);
-                            ui.label(egui::RichText::new("Three deliberate steps. Nothing runs before review.").color(palette.muted));
-                        });
-                        ui.add_space(10.0);
-                        ui.columns(3, |columns| {
-                            for (index, (title, description, color)) in [
-                                ("Choose a method", "Start with safe, source-authoritative One-Way Sync.", palette.accent),
-                                ("Set two endpoints", "Select the source and destination with visible labels.", palette.secondary),
-                                ("Review and sync", "Fresh Analysis and confirmation happen before mutation.", palette.amber),
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            {
-                                egui::Frame::new()
-                                    .fill(palette.elevated)
-                                    .stroke(egui::Stroke::new(1.0, palette.border_subtle))
-                                    .corner_radius(egui::CornerRadius::same(12))
-                                    .inner_margin(egui::Margin::symmetric(16, 15))
-                                    .show(&mut columns[index], |ui| {
-                                        ui.horizontal(|ui| {
-                                            egui::Frame::new()
-                                                .fill(palette.field)
-                                                .stroke(egui::Stroke::new(1.0, color))
-                                                .corner_radius(egui::CornerRadius::same(8))
-                                                .inner_margin(egui::Margin::symmetric(9, 6))
-                                                .show(ui, |ui| {
-                                                    ui.label(egui::RichText::new(format!("0{}", index + 1)).strong().color(color));
-                                                });
-                                            ui.label(egui::RichText::new(title).strong());
-                                        });
-                                        ui.add_space(10.0);
-                                        ui.label(egui::RichText::new(description).color(palette.muted));
-                                    });
+                        card_frame(ui).show(ui, |ui| {
+                            section_intro(ui, overview.eyebrow, &overview.title, &overview.body);
+                            ui.add_space(8.0);
+                            active_mode_badge(ui, self.settings.mode());
+                            ui.add_space(16.0);
+                            if primary_button(ui, overview.primary_action.label()).clicked() {
+                                open_wizard = true;
                             }
                         });
-
-                        ui.add_space(18.0);
-                        egui::Frame::new()
-                            .fill(palette.field)
-                            .stroke(egui::Stroke::new(1.0, palette.border_subtle))
-                            .corner_radius(egui::CornerRadius::same(12))
-                            .inner_margin(egui::Margin::symmetric(16, 13))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    status_dot(ui, palette.accent);
-                                    ui.label(egui::RichText::new("Safe by default").strong());
-                                    ui.label(egui::RichText::new("Simple Mode starts non-destructive, keeps both endpoints visible, and explains the next safe action.").color(palette.muted));
-                                });
-                            });
                         ui.add_space(20.0);
                     });
                 });
             });
         if open_wizard {
             self.start_new_profile();
-        } else if open_help {
-            self.show_help(HelpTopic::Modes);
-        } else if open_settings {
-            self.show_settings();
         }
     }
 
     fn draw_welcome(&mut self, ui: &mut egui::Ui) {
-        let mut create_profile = false;
         let mut open_sync = false;
         let mut request_sync = false;
-        let mut open_settings = false;
-        let has_profile = self.form.id.is_some();
-        if !has_profile {
+        let mut open_recovery = false;
+        if self.form.id.is_none() {
             self.draw_empty_welcome(ui);
             return;
         }
+        let pending = self.recovery_review_pending_for_active_profile();
+        let overview = chrome::populated_overview(
+            &self.form.name,
+            sync_mode_label(self.form.mode),
+            self.last_run_status_for_active_profile(),
+            pending,
+        );
         let source = endpoint_summary(&self.form.peer_a);
         let destination = endpoint_summary(&self.form.peer_b);
-        let mode = sync_mode_label(self.form.mode);
-        let report_count = self.run_reports.len();
         egui::ScrollArea::vertical()
             .id_salt("welcome-content")
             .show(ui, |ui| {
                 ui.add_space(28.0);
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(egui::RichText::new(if has_profile {
-                            "OVERVIEW · ACTIVE PROFILE"
-                        } else {
-                            "OVERVIEW · START HERE"
-                        }).small().strong().color(ui_palette(ui).accent));
-                        ui.label(egui::RichText::new("Your files,").size(46.0).strong());
-                        ui.label(egui::RichText::new("in rhythm.").size(46.0).strong().color(ui_palette(ui).accent));
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new(
-                            "A clear, reviewable path between your folders. SyncPlus keeps the important decision visible before work begins.",
-                        ).size(17.0).color(ui_palette(ui).muted));
-                    });
-                    ui.add_space(20.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        active_mode_badge(ui, self.settings.mode());
-                        ui.add_space(8.0);
-                        if ui.link("Change mode in Settings").clicked() {
-                            open_settings = true;
-                        }
-                        ui.add_space(12.0);
-                        if has_profile {
-                            if primary_button(ui, "Synchronise").clicked() {
-                                request_sync = true;
-                            }
-                            if secondary_button(ui, "Edit profile").clicked() {
-                                open_sync = true;
-                            }
-                        } else if primary_button(ui, "Create a Sync Profile").clicked() {
-                            create_profile = true;
-                        }
-                    });
-                });
-                ui.add_space(24.0);
-                neon_gradient(ui, ui.available_width(), 3.0);
-                ui.add_space(20.0);
-
                 card_frame(ui).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.heading("Sync path");
-                            ui.label(egui::RichText::new(if has_profile {
-                                format!("{mode} · source-authoritative · no destructive actions enabled")
-                            } else {
-                                "Create a profile to define a source-authoritative path.".to_owned()
-                            }).color(ui_palette(ui).muted));
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            info_badge(ui, if has_profile { "Fresh analysis required" } else { "Profile not configured" });
-                        });
-                    });
-                    ui.add_space(14.0);
-                    let palette = ui_palette(ui);
-                    ui.columns(3, |columns| {
-                        egui::Frame::new()
-                            .fill(palette.field)
-                            .stroke(egui::Stroke::new(1.0, palette.border))
-                            .corner_radius(egui::CornerRadius::same(10))
-                            .inner_margin(egui::Margin::symmetric(14, 12))
-                            .show(&mut columns[0], |ui| {
-                                ui.horizontal(|ui| {
-                                    status_dot(ui, palette.accent);
-                                    ui.label(egui::RichText::new("Source folder").strong());
-                                });
-                                ui.label(egui::RichText::new(&source).monospace());
-                                ui.label(egui::RichText::new(if has_profile { "Authoritative" } else { "Not selected" }).small().color(palette.muted));
-                            });
-                        columns[1].vertical_centered(|ui| {
-                            sync_path_arrow(ui, palette.accent);
-                            ui.label(egui::RichText::new("SYNC PATH").small().color(palette.secondary));
-                        });
-                        egui::Frame::new()
-                            .fill(palette.field)
-                            .stroke(egui::Stroke::new(1.0, palette.border))
-                            .corner_radius(egui::CornerRadius::same(10))
-                            .inner_margin(egui::Margin::symmetric(14, 12))
-                            .show(&mut columns[2], |ui| {
-                                ui.horizontal(|ui| {
-                                    status_dot(ui, palette.secondary);
-                                    ui.label(egui::RichText::new("Destination folder").strong());
-                                });
-                                ui.label(egui::RichText::new(&destination).monospace());
-                                ui.label(egui::RichText::new(if has_profile { "Protected" } else { "Not selected" }).small().color(palette.muted));
-                            });
-                    });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(if has_profile {
-                            "Last run · Review the current plan before starting"
-                        } else {
-                            "Next · Create a profile, then review the current plan"
-                        }).color(ui_palette(ui).muted));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if has_profile {
-                                if secondary_button(ui, "Review plan").clicked() {
-                                    request_sync = true;
-                                }
-                            } else if secondary_button(ui, "Open the wizard").clicked() {
-                                create_profile = true;
-                            }
-                        });
-                    });
-                });
-
-                ui.add_space(12.0);
-                let palette = ui_palette(ui);
-                let report_count_label = report_count.to_string();
-                ui.columns(2, |columns| {
-                    let left_frame = card_frame(&columns[0]);
-                    left_frame.show(&mut columns[0], |ui| {
-                        ui.horizontal(|ui| {
-                            ui.heading("Next safe action");
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                status_badge(ui, if has_profile { "Protected" } else { "Start here" }, true);
-                            });
-                        });
-                        ui.label(egui::RichText::new(if has_profile {
-                            "Everything is ready for a fresh read-only analysis."
-                        } else {
-                            "Build the safe path before any sync can be considered."
-                        }).color(palette.muted));
-                        for (step, title, body, color) in [
-                            ("STEP 1", "Fresh Analysis", "Build the current explainable action plan.", palette.accent),
-                            ("STEP 2", "Run Precheck", "Confirm both endpoints and the approved scope.", palette.secondary),
-                            ("STEP 3", "Execution Confirmation", "Approve the exact reviewed work immediately before mutation.", palette.amber),
-                        ] {
-                            inset_frame(ui).show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    status_dot(ui, color);
-                                    ui.vertical(|ui| {
-                                        ui.label(egui::RichText::new(title).strong());
-                                        ui.label(egui::RichText::new(body).small().color(palette.muted));
-                                    });
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(egui::RichText::new(step).small().strong().color(palette.secondary));
-                                    });
-                                });
-                            });
-                        }
-                    });
-                    let right_frame = card_frame(&columns[1]);
-                    right_frame.show(&mut columns[1], |ui| {
-                        ui.heading("Profile health");
-                        ui.label(egui::RichText::new("Quiet evidence, always available.").color(palette.muted));
+                    section_intro(ui, overview.eyebrow, &overview.title, &overview.body);
+                    ui.add_space(8.0);
+                    active_mode_badge(ui, self.settings.mode());
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new(&source).monospace());
+                    ui.label(egui::RichText::new(&destination).monospace());
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new(&overview.last_run).color(ui_palette(ui).text));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Next safe action · {}",
+                            overview.next_safe_action
+                        ))
+                        .color(ui_palette(ui).muted),
+                    );
+                    if let Some(notice) = overview.recovery_notice {
                         ui.add_space(10.0);
-                        ui.columns(2, |metrics| {
-                            for (index, (metric, value)) in [
-                                ("unresolved items", "0"),
-                                ("saved reports", report_count_label.as_str()),
-                                ("sync mode", mode),
-                                ("safety", "Gated"),
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            {
-                                egui::Frame::new()
-                                    .fill(palette.field)
-                                    .stroke(egui::Stroke::new(1.0, palette.border))
-                                    .corner_radius(egui::CornerRadius::same(9))
-                                    .inner_margin(egui::Margin::symmetric(10, 10))
-                                    .show(&mut metrics[index % 2], |ui| {
-                                        ui.label(egui::RichText::new(value).size(22.0).strong());
-                                        ui.label(egui::RichText::new(metric).small().color(palette.muted));
-                                    });
+                        let palette = ui_palette(ui);
+                        egui::Frame::new()
+                            .fill(palette.danger_soft)
+                            .stroke(egui::Stroke::new(1.0, palette.danger))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(notice)
+                                        .strong()
+                                        .color(palette.on_danger_soft),
+                                );
+                            });
+                    }
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        if primary_button(ui, overview.primary_action.label()).clicked() {
+                            match overview.primary_action {
+                                OverviewAction::OpenRecoveryReview => open_recovery = true,
+                                OverviewAction::Synchronise | OverviewAction::CreateProfile => {
+                                    request_sync = true
+                                }
                             }
-                        });
+                        }
+                        if secondary_button(ui, "Edit profile").clicked() {
+                            open_sync = true;
+                        }
                     });
                 });
                 ui.add_space(16.0);
-                ui.label(egui::RichText::new("Need guidance? Open Help & Support from the menu or the contextual links in the Sync workspace.").color(ui_palette(ui).muted));
-        });
-        if create_profile {
-            self.start_new_profile();
-        } else if open_sync {
-            self.show_sync_workspace();
-        } else if open_settings {
-            self.show_settings();
+            });
+        if open_sync {
+            self.show_profiles();
+        } else if open_recovery {
+            self.open_recovery_review();
         } else if request_sync {
             self.show_sync_workspace();
             self.request_synchronise_async(ui.ctx());
@@ -4079,22 +3773,22 @@ impl SyncPlusApp {
                 let completed = step.number() < current.number();
                 let selected = step == current;
                 let color = if selected || completed {
-                    palette.accent
+                    palette.copper
                 } else {
-                    palette.amber
+                    palette.muted
                 };
                 egui::Frame::new()
                     .fill(if selected || completed {
-                        palette.accent_soft
+                        palette.copper_soft
                     } else {
-                        palette.amber_soft
+                        palette.elevated
                     })
                     .stroke(egui::Stroke::new(
                         1.0,
                         if selected || completed {
-                            palette.accent
+                            palette.copper
                         } else {
-                            palette.amber
+                            palette.border
                         },
                     ))
                     .corner_radius(egui::CornerRadius::same(9))
@@ -4103,9 +3797,9 @@ impl SyncPlusApp {
                         ui.horizontal(|ui| {
                             egui::Frame::new()
                                 .fill(if selected || completed {
-                                    palette.accent
+                                    palette.copper
                                 } else {
-                                    palette.amber
+                                    palette.field
                                 })
                                 .stroke(egui::Stroke::new(1.0, color))
                                 .corner_radius(egui::CornerRadius::same(7))
@@ -4114,27 +3808,21 @@ impl SyncPlusApp {
                                     ui.label(
                                         egui::RichText::new(step.number().to_string())
                                             .strong()
-                                            .color(palette.on_accent),
+                                            .color(if selected || completed {
+                                                palette.on_copper
+                                            } else {
+                                                palette.text
+                                            }),
                                     );
                                 });
                             ui.vertical(|ui| {
                                 ui.label(egui::RichText::new(step.title()).strong().color(color));
                                 ui.label(
-                                    egui::RichText::new(if selected {
-                                        "Current step"
-                                    } else if completed {
-                                        "Complete"
-                                    } else {
-                                        "Required"
-                                    })
+                                    egui::RichText::new(chrome::wizard_step_caption(
+                                        selected, completed,
+                                    ))
                                     .small()
-                                    .color(
-                                        if selected || completed {
-                                            palette.muted
-                                        } else {
-                                            palette.amber
-                                        },
-                                    ),
+                                    .color(palette.muted),
                                 );
                             });
                         });
@@ -4256,7 +3944,7 @@ impl SyncPlusApp {
                                 draw_endpoint(ui, "Source endpoint", &mut self.form.peer_a);
                                 inset_frame(ui).show(ui, |ui| {
                                     ui.horizontal(|ui| {
-                                        status_dot(ui, palette.secondary);
+                                        status_dot(ui, palette.steel);
                                         ui.label(egui::RichText::new("Next").strong());
                                     });
                                     ui.label(egui::RichText::new("When the source folder is selected, continue to choose the destination folder.").color(palette.muted));
@@ -4304,7 +3992,7 @@ impl SyncPlusApp {
                                     columns[1].vertical(|ui| {
                                         inset_frame(ui).show(ui, |ui| {
                                             ui.horizontal(|ui| {
-                                                status_dot(ui, palette.accent);
+                                                status_dot(ui, palette.copper);
                                                 ui.label(egui::RichText::new("What happens next").strong());
                                             });
                                             ui.add_space(8.0);
@@ -4320,7 +4008,7 @@ impl SyncPlusApp {
                             full_width_inset_frame(ui, |ui| {
                                 let one_way = self.form.mode == SyncMode::OneWay;
                                 ui.horizontal_wrapped(|ui| {
-                                    status_dot(ui, if one_way { palette.accent } else { palette.amber });
+                                    status_dot(ui, if one_way { palette.copper } else { palette.warning });
                                     ui.label(egui::RichText::new(if one_way {
                                         "Simple default:"
                                     } else {
@@ -4333,7 +4021,7 @@ impl SyncPlusApp {
                                 });
                                 ui.add_space(2.0);
                                 ui.horizontal_wrapped(|ui| {
-                                    status_dot(ui, palette.accent);
+                                    status_dot(ui, palette.copper);
                                     ui.label(egui::RichText::new("No changes yet:").strong());
                                     ui.label(egui::RichText::new("SyncPlus will first run Fresh Analysis and a precheck. You confirm the exact reviewed work immediately before mutation.").color(palette.muted));
                                 });
@@ -4352,7 +4040,7 @@ impl SyncPlusApp {
                                         ui.label(
                                             egui::RichText::new("Complete the required fields to continue.")
                                                 .small()
-                                                .color(palette.amber),
+                                                .color(palette.warning),
                                         );
                                     }
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4413,10 +4101,9 @@ impl SyncPlusApp {
 
     fn draw_profile_form(&mut self, ui: &mut egui::Ui) {
         let form_before_draw = self.form.clone();
-        let mut request_analyze = false;
         let mut request_validate = false;
         let mut request_save = false;
-        let mut request_synchronise = false;
+        let mut open_sync = false;
         let mut profile_to_select = None;
         let profile_options = self
             .profiles
@@ -4433,52 +4120,10 @@ impl SyncPlusApp {
                     .map(|(_, name)| name.as_str())
             })
             .unwrap_or("Unsaved profile draft");
-        let review_confirmed = self.review.as_ref().is_some_and(|review| review.confirmed);
-        let review_exists = self.review.is_some();
         let review_blocked = self
             .review
             .as_ref()
             .is_some_and(|review| review.error.is_some());
-        let analysis_active = self.active_analysis.is_some();
-        let synchronise_enabled =
-            review_confirmed && self.active_manual_run.is_none() && !analysis_active;
-        let (phase_label, phase_description, phase_positive) = if analysis_active {
-            (
-                "Analysis in progress",
-                "Fresh Analysis is hashing the selected scope in the background. The workspace remains available.",
-                false,
-            )
-        } else if self.active_manual_run.is_some() {
-            (
-                "Sync Run active",
-                "The reviewed Sync Run is executing. Progress and durable evidence are shown below.",
-                true,
-            )
-        } else if review_confirmed {
-            (
-                "Ready to synchronise",
-                "Execution Confirmation is recorded for this exact reviewed scope.",
-                true,
-            )
-        } else if review_blocked {
-            (
-                "Review blocked",
-                "Correct the named profile or endpoint problem, then run the dry run again.",
-                false,
-            )
-        } else if review_exists {
-            (
-                "Review required",
-                "The read-only plan is ready. Inspect it, resolve any blockers, and confirm the exact scope.",
-                false,
-            )
-        } else {
-            (
-                "Ready for dry run",
-                "Dry run performs Fresh Analysis and Run Precheck. It does not change files.",
-                false,
-            )
-        };
         let palette = ui_palette(ui);
         card_frame(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -4486,12 +4131,12 @@ impl SyncPlusApp {
                     section_intro(
                         ui,
                         "Active Sync Profile",
-                        "Sync workspace",
-                        "Run a read-only dry run, review the exact plan, then confirm before anything changes.",
+                        "Profile",
+                        "Edit the named Sync Profile. Fresh Analysis, plan review, and Execution Confirmation stay in the Sync workspace.",
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    status_badge(ui, phase_label, phase_positive);
+                    status_badge(ui, "Configuration", true);
                 });
             });
             ui.add_space(12.0);
@@ -4509,27 +4154,18 @@ impl SyncPlusApp {
                             );
                         }
                     });
-                ui.label(egui::RichText::new(phase_description).color(palette.muted));
+                ui.label(egui::RichText::new("Changes apply to a later Sync Run.").color(palette.muted));
             });
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
-                if primary_button_enabled(
-                    ui,
-                    if review_exists { "Run dry run again" } else { "Dry run · Analyze" },
-                    !analysis_active,
-                )
-                .clicked()
-                {
-                    request_analyze = true;
-                }
                 if secondary_button(ui, "Validate profile").clicked() {
                     request_validate = true;
                 }
                 if secondary_button(ui, "Save profile").clicked() {
                     request_save = true;
                 }
-                if primary_button_enabled(ui, "Synchronise", synchronise_enabled).clicked() {
-                    request_synchronise = true;
+                if primary_button(ui, "Open Sync workspace").clicked() {
+                    open_sync = true;
                 }
             });
             ui.add_space(10.0);
@@ -4540,7 +4176,7 @@ impl SyncPlusApp {
                 .inner_margin(egui::Margin::symmetric(12, 9))
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        status_dot(ui, palette.secondary);
+                        status_dot(ui, palette.steel);
                         ui.label(egui::RichText::new("No arbitrary commands").strong());
                         ui.label(egui::RichText::new("SyncPlus uses validated profile fields and the same reviewed process specification for analysis and execution.").color(palette.muted));
                     });
@@ -4551,10 +4187,8 @@ impl SyncPlusApp {
                     ui,
                     if review_blocked {
                         palette.danger
-                    } else if review_confirmed {
-                        palette.accent
                     } else {
-                        palette.amber
+                        palette.muted
                     },
                 );
                 ui.label(egui::RichText::new("Latest status").strong());
@@ -4632,7 +4266,7 @@ impl SyncPlusApp {
             }
         }
         card_frame(ui).show(ui, |ui| {
-            ui.label(egui::RichText::new("PROFILE IDENTITY").small().strong().color(palette.accent));
+            ui.label(egui::RichText::new("PROFILE IDENTITY").small().strong().color(palette.copper));
             ui.heading("Name this Sync Profile");
             ui.label(egui::RichText::new("A clear name makes schedules, Run Reports, and recovery decisions easier to identify.").color(palette.muted));
             ui.add_space(10.0);
@@ -4644,7 +4278,7 @@ impl SyncPlusApp {
             );
         });
         card_frame(ui).show(ui, |ui| {
-            ui.label(egui::RichText::new("SYNC POLICY").small().strong().color(palette.secondary));
+            ui.label(egui::RichText::new("SYNC POLICY").small().strong().color(palette.steel));
             ui.heading("Choose how files move");
             ui.label(egui::RichText::new("One-Way Sync has an explicit authority. Mirror Sync never assumes a winner and requires Conflict Review.").color(palette.muted));
             ui.add_space(10.0);
@@ -4856,21 +4490,19 @@ impl SyncPlusApp {
         if let Some(id) = profile_to_select {
             self.select_profile(id);
         }
-        if request_analyze && let Err(error) = self.start_analysis(ui.ctx()) {
-            self.status = format_form_validation_diagnostic(&self.form, &error);
-        }
         if request_validate && let Err(error) = self.validate_profile() {
             self.status = format_form_validation_diagnostic(&self.form, &error);
         }
         if request_save && let Err(error) = self.save_profile() {
             self.status = format_form_validation_diagnostic(&self.form, &error);
         }
-        if request_synchronise {
-            self.request_synchronise_async(ui.ctx());
+        if open_sync {
+            self.show_sync_workspace();
         }
     }
 
     fn draw_review(&mut self, ui: &mut egui::Ui) {
+        let mut request_analyze = false;
         let mut request_confirmation = false;
         let mut request_start = false;
         let mut request_resolution_start = false;
@@ -4881,6 +4513,20 @@ impl SyncPlusApp {
             "Plan review and Execution Confirmation",
             "Read the exact scope, resolve every blocker, then confirm this plan before any file-changing action.",
         );
+        ui.add_space(8.0);
+        if primary_button_enabled(
+            ui,
+            if self.review.is_some() {
+                "Run dry run again"
+            } else {
+                "Dry run · Analyze"
+            },
+            self.active_analysis.is_none(),
+        )
+        .clicked()
+        {
+            request_analyze = true;
+        }
         draw_contextual_help_link(
             ui,
             "Plan and confirmation",
@@ -4960,7 +4606,7 @@ impl SyncPlusApp {
                     }
                     for warning in precheck.warnings() {
                         ui.label(format!(
-                            "WARNING: {}",
+                            "{PATH_RISK_WARNING_LABEL}: {}",
                             format_warning_diagnostic(&review.profile, warning)
                         ));
                     }
@@ -5003,7 +4649,13 @@ impl SyncPlusApp {
                     && !unresolved
                     && !conflicts_pending
                     && (!stronger_required || stronger_confirmation);
-                card_frame(ui).show(ui, |ui| {
+                let palette = ui_palette(ui);
+                egui::Frame::new()
+                    .fill(palette.surface)
+                    .stroke(egui::Stroke::new(2.0, palette.copper))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(16, 14))
+                    .show(ui, |ui| {
                     section_intro(
                         ui,
                         "Final gate",
@@ -5052,6 +4704,9 @@ impl SyncPlusApp {
             ui.label("No plan has been analyzed. Select Analyze current state to review the intended work.");
         }
 
+        if request_analyze && let Err(error) = self.start_analysis(ui.ctx()) {
+            self.status = format_form_validation_diagnostic(&self.form, &error);
+        }
         if request_resolution_start && let Err(error) = self.start_resolution_run() {
             self.status = format!("Resolution Run was not started: {error}");
         }
@@ -5485,7 +5140,17 @@ fn draw_conflict_review(
 }
 
 fn draw_conflict_evidence(ui: &mut egui::Ui, evidence: &syncplus_core::ConflictEvidence) {
-    ui.group(|ui| {
+    let palette = ui_palette(ui);
+    let (fill, stroke) = match evidence.side() {
+        syncplus_core::PeerSide::PeerA => (palette.copper_soft, palette.copper),
+        syncplus_core::PeerSide::PeerB => (palette.steel_soft, palette.steel),
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
         ui.label(format!("{} evidence", peer_side_label(evidence.side())));
         ui.label(format!("Path: {}", evidence.relative_path().display()));
         ui.label(format!("Type: {:?} | Size: {} bytes", evidence.item_type(), evidence.size()));
@@ -5508,7 +5173,7 @@ fn draw_conflict_evidence(ui: &mut egui::Ui, evidence: &syncplus_core::ConflictE
             ui.label("SHA-256 evidence: unavailable; do not assume the contents match.");
         }
         ui.label("File contents are not shown. Conflict Review uses safe classification, metadata, and hash evidence only.");
-    });
+        });
 }
 
 fn draw_compatibility_review(ui: &mut egui::Ui, profile: &SyncProfile, precheck: &PrecheckResult) {
@@ -5983,9 +5648,7 @@ impl SyncPlusApp {
                         self.draw_notifications(ui);
                         self.draw_missed_schedule_notices(ui);
                         self.draw_scheduler_events(ui);
-                        self.draw_profile_form(ui);
                         self.draw_review(ui);
-                        self.draw_run_reports(ui);
                     });
             }
         }
@@ -6022,7 +5685,7 @@ impl SyncPlusApp {
                             ui.add_space(14.0);
                             inset_frame(ui).show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
-                                    status_dot(ui, ui_palette(ui).accent);
+                                    status_dot(ui, ui_palette(ui).copper);
                                     ui.label(egui::RichText::new("Safety promise").strong());
                                     ui.label(egui::RichText::new(
                                         "Every guide explains the next safe action. Help informs decisions; it never bypasses a safety gate.",
@@ -6255,17 +5918,7 @@ fn draw_explainable_action(ui: &mut egui::Ui, item: &syncplus_core::RunReportIte
 }
 
 fn run_report_status_label(status: RunReportStatus) -> &'static str {
-    match status {
-        RunReportStatus::InProgress => "In progress",
-        RunReportStatus::Completed => "Completed",
-        RunReportStatus::Failed => "Failed",
-        RunReportStatus::Cancelled => "Cancelled",
-        RunReportStatus::Interrupted => "Interrupted",
-        RunReportStatus::Blocked => "Blocked",
-        RunReportStatus::CompletedWithReviewRequired => "Pending review",
-        RunReportStatus::RecoveryReview => "Recovery Review required",
-        RunReportStatus::ReviewCleared => "Review cleared",
-    }
+    chrome::run_report_status_phrase(status)
 }
 
 fn run_execution_result_label(result: RunExecutionResult) -> &'static str {
@@ -6357,12 +6010,12 @@ fn primary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
 fn primary_button_enabled(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
     let palette = ui_palette(ui);
     let fill = if enabled {
-        palette.accent
+        palette.copper
     } else {
         palette.elevated
     };
     let text_color = if enabled {
-        palette.on_accent
+        palette.on_copper
     } else {
         palette.muted
     };
@@ -6373,7 +6026,7 @@ fn primary_button_enabled(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui
             .stroke(egui::Stroke::new(
                 1.0,
                 if enabled {
-                    palette.accent
+                    palette.copper
                 } else {
                     palette.border_subtle
                 },
@@ -6381,7 +6034,7 @@ fn primary_button_enabled(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui
             .corner_radius(egui::CornerRadius::same(8))
             .min_size(egui::vec2(0.0, 40.0)),
     );
-    paint_focus_ring(ui, &response, palette.on_accent);
+    paint_focus_ring(ui, &response, palette.on_copper);
     response
 }
 
@@ -6416,14 +6069,14 @@ fn sidebar_nav_button(
             }),
         )
         .fill(if selected {
-            palette.accent_soft
+            palette.copper_soft
         } else {
             egui::Color32::TRANSPARENT
         })
         .stroke(egui::Stroke::new(
             1.0,
             if selected {
-                palette.accent
+                palette.copper
             } else {
                 egui::Color32::TRANSPARENT
             },
@@ -6547,30 +6200,14 @@ fn paint_sidebar_icon(
                 );
             }
         }
-        SidebarIcon::Recovery => {
-            let shield = [
-                egui::pos2(rect.center().x, rect.top() + 1.0),
-                egui::pos2(rect.right() - 3.0, rect.top() + 5.0),
-                egui::pos2(rect.right() - 4.0, rect.bottom() - 5.0),
-                egui::pos2(rect.center().x, rect.bottom() - 1.0),
-                egui::pos2(rect.left() + 4.0, rect.bottom() - 5.0),
-                egui::pos2(rect.left() + 3.0, rect.top() + 5.0),
-            ];
-            painter.line(shield.to_vec(), stroke);
-            painter.line_segment(
-                [
-                    egui::pos2(rect.left() + 6.5, rect.center().y),
-                    egui::pos2(rect.center().x - 1.0, rect.bottom() - 5.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(rect.center().x - 1.0, rect.bottom() - 5.0),
-                    egui::pos2(rect.right() - 5.5, rect.top() + 7.0),
-                ],
-                stroke,
-            );
+        SidebarIcon::Settings => {
+            painter.circle_stroke(rect.center(), 4.2, stroke);
+            for degrees in [0.0, 60.0, 120.0, 180.0, 240.0, 300.0] {
+                let radians = degrees * std::f32::consts::PI / 180.0;
+                let inner = rect.center() + egui::vec2(radians.cos() * 5.2, radians.sin() * 5.2);
+                let outer = rect.center() + egui::vec2(radians.cos() * 8.0, radians.sin() * 8.0);
+                painter.line_segment([inner, outer], stroke);
+            }
         }
         SidebarIcon::Help => {
             painter.circle_stroke(rect.center(), 7.0, stroke);
@@ -6589,17 +6226,32 @@ fn sidebar_exit_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let palette = ui_palette(ui);
     let width = ui.available_width();
     let response = ui.add(
+        egui::Button::new(egui::RichText::new(label).color(palette.muted))
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+            .corner_radius(egui::CornerRadius::same(8))
+            .min_size(egui::vec2(width, 32.0)),
+    );
+    paint_focus_ring(ui, &response, palette.text);
+    response
+}
+
+fn recovery_review_notice_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let palette = ui_palette(ui);
+    let width = ui.available_width();
+    ui.add_space(12.0);
+    let response = ui.add(
         egui::Button::new(
             egui::RichText::new(label)
-                .strong()
+                .small()
                 .color(palette.on_danger_soft),
         )
         .fill(palette.danger_soft)
         .stroke(egui::Stroke::new(1.0, palette.danger))
         .corner_radius(egui::CornerRadius::same(8))
-        .min_size(egui::vec2(width, 40.0)),
+        .min_size(egui::vec2(width, 28.0)),
     );
-    paint_focus_ring(ui, &response, palette.danger);
+    paint_focus_ring(ui, &response, palette.text);
     response
 }
 
@@ -6608,146 +6260,16 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 3.5, color);
 }
 
-fn sync_path_arrow(ui: &mut egui::Ui, color: egui::Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 28.0), egui::Sense::hover());
-    let stroke = egui::Stroke::new(2.5, color);
-    let center_y = rect.center().y;
-    let start_x = rect.left() + 5.0;
-    let tip_x = rect.right() - 5.0;
-    ui.painter().line_segment(
-        [egui::pos2(start_x, center_y), egui::pos2(tip_x, center_y)],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [
-            egui::pos2(tip_x - 8.0, center_y - 7.0),
-            egui::pos2(tip_x, center_y),
-        ],
-        stroke,
-    );
-    ui.painter().line_segment(
-        [
-            egui::pos2(tip_x - 8.0, center_y + 7.0),
-            egui::pos2(tip_x, center_y),
-        ],
-        stroke,
-    );
-}
-
-fn sync_illustration(ui: &mut egui::Ui, palette: UiPalette) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(300.0, 200.0), egui::Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, egui::CornerRadius::same(16), palette.field);
-    painter.rect_stroke(
-        rect,
-        egui::CornerRadius::same(16),
-        egui::Stroke::new(1.0, palette.border_subtle),
-        egui::StrokeKind::Inside,
-    );
-
-    let panel_size = egui::vec2(88.0, 68.0);
-    let source =
-        egui::Rect::from_center_size(egui::pos2(rect.left() + 72.0, rect.center().y), panel_size);
-    let destination =
-        egui::Rect::from_center_size(egui::pos2(rect.right() - 72.0, rect.center().y), panel_size);
-    for (panel, color) in [(source, palette.accent), (destination, palette.secondary)] {
-        painter.rect_filled(panel, egui::CornerRadius::same(12), palette.elevated);
-        painter.rect_stroke(
-            panel,
-            egui::CornerRadius::same(12),
-            egui::Stroke::new(1.5, color),
-            egui::StrokeKind::Inside,
-        );
-        for row in 0..3 {
-            let y = panel.top() + 22.0 + row as f32 * 10.0;
-            painter.line_segment(
-                [
-                    egui::pos2(panel.left() + 14.0, y),
-                    egui::pos2(panel.right() - 14.0 - row as f32 * 7.0, y),
-                ],
-                egui::Stroke::new(2.0, color.gamma_multiply(0.7)),
-            );
-        }
-    }
-    let arrow_y = rect.center().y - 1.0;
-    let start_x = source.right() + 12.0;
-    let tip_x = destination.left() - 12.0;
-    let stroke = egui::Stroke::new(2.5, palette.accent);
-    painter.line_segment(
-        [egui::pos2(start_x, arrow_y), egui::pos2(tip_x, arrow_y)],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            egui::pos2(tip_x - 8.0, arrow_y - 7.0),
-            egui::pos2(tip_x, arrow_y),
-        ],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            egui::pos2(tip_x - 8.0, arrow_y + 7.0),
-            egui::pos2(tip_x, arrow_y),
-        ],
-        stroke,
-    );
-    painter.text(
-        egui::pos2(source.center().x, source.bottom() + 18.0),
-        egui::Align2::CENTER_TOP,
-        "SOURCE",
-        egui::FontId::proportional(11.0),
-        palette.muted,
-    );
-    painter.text(
-        egui::pos2(destination.center().x, destination.bottom() + 18.0),
-        egui::Align2::CENTER_TOP,
-        "DESTINATION",
-        egui::FontId::proportional(11.0),
-        palette.muted,
-    );
-    painter.text(
-        egui::pos2(rect.center().x, rect.top() + 22.0),
-        egui::Align2::CENTER_TOP,
-        "REVIEW BEFORE RUN",
-        egui::FontId::proportional(11.0),
-        palette.secondary,
-    );
-}
-
-fn paint_focus_ring(ui: &egui::Ui, response: &egui::Response, inner_color: egui::Color32) {
+fn paint_focus_ring(ui: &egui::Ui, response: &egui::Response, _inner_color: egui::Color32) {
     if response.has_focus() {
         let palette = ui_palette(ui);
         ui.painter().rect_stroke(
-            response.rect.expand(3.0),
-            egui::CornerRadius::same(11),
-            egui::Stroke::new(2.0, palette.hot),
-            egui::StrokeKind::Outside,
-        );
-        ui.painter().rect_stroke(
-            response.rect.expand(1.0),
-            egui::CornerRadius::same(9),
-            egui::Stroke::new(2.0, inner_color),
+            response.rect.expand(2.0),
+            egui::CornerRadius::same(10),
+            egui::Stroke::new(2.0, palette.copper),
             egui::StrokeKind::Outside,
         );
     }
-}
-
-fn neon_gradient(ui: &mut egui::Ui, width: f32, height: f32) {
-    let palette = ui_palette(ui);
-    let width = width.min(ui.available_width()).max(0.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    if !rect.is_positive() {
-        return;
-    }
-
-    let mut mesh = egui::epaint::Mesh::default();
-    mesh.colored_vertex(rect.left_top(), palette.accent);
-    mesh.colored_vertex(rect.right_top(), palette.secondary);
-    mesh.colored_vertex(rect.right_bottom(), palette.secondary);
-    mesh.colored_vertex(rect.left_bottom(), palette.accent);
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    ui.painter().add(egui::Shape::mesh(mesh));
 }
 
 fn card_frame(ui: &egui::Ui) -> egui::Frame {
@@ -6758,21 +6280,6 @@ fn card_frame(ui: &egui::Ui) -> egui::Frame {
         .corner_radius(egui::CornerRadius::same(12))
         .inner_margin(egui::Margin::symmetric(16, 14))
         .outer_margin(egui::Margin::symmetric(0, 6))
-        .shadow(if ui.visuals().dark_mode {
-            egui::Shadow {
-                offset: [0, 3],
-                blur: 12,
-                spread: 1,
-                color: egui::Color32::from_black_alpha(80),
-            }
-        } else {
-            egui::Shadow {
-                offset: [0, 2],
-                blur: 8,
-                spread: 0,
-                color: egui::Color32::from_black_alpha(24),
-            }
-        })
 }
 
 fn inset_frame(ui: &egui::Ui) -> egui::Frame {
@@ -6797,25 +6304,33 @@ fn section_intro(ui: &mut egui::Ui, eyebrow: &str, title: &str, description: &st
     let palette = ui_palette(ui);
     ui.label(
         egui::RichText::new(eyebrow.to_uppercase())
-            .small()
+            .size(TypeRole::Eyebrow.size())
             .strong()
-            .color(palette.accent),
+            .color(palette.copper),
     );
-    ui.heading(title);
-    ui.label(egui::RichText::new(description).color(palette.muted));
+    ui.label(
+        egui::RichText::new(title)
+            .size(TypeRole::Title.size())
+            .strong(),
+    );
+    ui.label(
+        egui::RichText::new(description)
+            .size(TypeRole::Body.size())
+            .color(palette.muted),
+    );
 }
 
 fn status_badge(ui: &mut egui::Ui, label: &str, positive: bool) {
     let palette = ui_palette(ui);
     let fill = if positive {
-        palette.accent_soft
+        palette.copper_soft
     } else {
-        palette.amber_soft
+        palette.warning_soft
     };
     let text = if positive {
-        palette.accent
+        palette.copper
     } else {
-        palette.amber
+        palette.warning
     };
     egui::Frame::new()
         .fill(fill)
@@ -6835,7 +6350,7 @@ fn info_badge(ui: &mut egui::Ui, label: &str) {
     let palette = ui_palette(ui);
     egui::Frame::new()
         .fill(palette.elevated)
-        .stroke(egui::Stroke::new(1.0, palette.secondary))
+        .stroke(egui::Stroke::new(1.0, palette.steel))
         .corner_radius(egui::CornerRadius::same(7))
         .inner_margin(egui::Margin::symmetric(9, 5))
         .show(ui, |ui| {
@@ -6843,7 +6358,7 @@ fn info_badge(ui: &mut egui::Ui, label: &str) {
                 egui::RichText::new(label)
                     .small()
                     .strong()
-                    .color(palette.secondary),
+                    .color(palette.steel),
             );
         });
 }
@@ -7105,14 +6620,14 @@ fn help_topic_button(ui: &mut egui::Ui, topic: HelpTopic, selected: bool) -> egu
             },
         ))
         .fill(if selected {
-            palette.accent_soft
+            palette.copper_soft
         } else {
             egui::Color32::TRANSPARENT
         })
         .stroke(egui::Stroke::new(
             1.0,
             if selected {
-                palette.accent
+                palette.copper
             } else {
                 egui::Color32::TRANSPARENT
             },
@@ -7125,27 +6640,12 @@ fn help_topic_button(ui: &mut egui::Ui, topic: HelpTopic, selected: bool) -> egu
         3.0,
         help_topic_color(topic, palette),
     );
-    paint_focus_ring(ui, &response, palette.accent);
+    paint_focus_ring(ui, &response, palette.copper);
     response
 }
 
-fn help_topic_color(topic: HelpTopic, palette: UiPalette) -> egui::Color32 {
-    match topic {
-        HelpTopic::GettingStarted | HelpTopic::Modes | HelpTopic::OneWaySync => palette.accent,
-        HelpTopic::SafeDelete
-        | HelpTopic::Recovery
-        | HelpTopic::DestructiveActions
-        | HelpTopic::ExecutionFailures => palette.danger,
-        HelpTopic::MirrorSync
-        | HelpTopic::SshAuthentication
-        | HelpTopic::ProgressAndCancellation
-        | HelpTopic::Diagnostics => palette.secondary,
-        HelpTopic::ConflictReview | HelpTopic::CloneProfile => palette.hot,
-        HelpTopic::Exclusions | HelpTopic::RunReports | HelpTopic::PrecheckBlockers => {
-            palette.amber
-        }
-        HelpTopic::PlanAndConfirmation => palette.accent,
-    }
+fn help_topic_color(_topic: HelpTopic, palette: BrandTheme) -> egui::Color32 {
+    palette.muted
 }
 
 fn draw_help_article(ui: &mut egui::Ui, topic: HelpTopic) {
@@ -7171,8 +6671,8 @@ fn draw_help_article(ui: &mut egui::Ui, topic: HelpTopic) {
         ui.separator();
         ui.add_space(8.0);
         help_article_section(ui, "At a glance", entry.what, topic_color);
-        help_article_section(ui, "Why it matters", entry.why, palette.secondary);
-        help_article_section(ui, "How to use it", entry.how, palette.accent);
+        help_article_section(ui, "Why it matters", entry.why, palette.steel);
+        help_article_section(ui, "How to use it", entry.how, palette.copper);
         help_article_section(ui, "When to use it", entry.when, palette.muted);
         help_callout(
             ui,
@@ -7186,16 +6686,16 @@ fn draw_help_article(ui: &mut egui::Ui, topic: HelpTopic) {
             ui,
             "Limitations",
             entry.limitations,
-            palette.amber_soft,
-            palette.amber,
+            palette.warning_soft,
+            palette.warning,
             palette.text,
         );
         help_callout(
             ui,
             "Next safe action",
             entry.next_action,
-            palette.accent_soft,
-            palette.accent,
+            palette.copper_soft,
+            palette.copper,
             palette.text,
         );
     });
@@ -7255,68 +6755,13 @@ mod tests {
 
     use super::*;
 
-    fn relative_luminance(color: egui::Color32) -> f32 {
-        fn linear_channel(channel: u8) -> f32 {
-            let channel = f32::from(channel) / 255.0;
-            if channel <= 0.04045 {
-                channel / 12.92
-            } else {
-                ((channel + 0.055) / 1.055).powf(2.4)
-            }
-        }
-
-        0.2126 * linear_channel(color.r())
-            + 0.7152 * linear_channel(color.g())
-            + 0.0722 * linear_channel(color.b())
-    }
-
-    fn contrast_ratio(foreground: egui::Color32, background: egui::Color32) -> f32 {
-        let foreground = relative_luminance(foreground);
-        let background = relative_luminance(background);
-        (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
-    }
+    const FORBIDDEN_MAGENTA: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x00, 0x99);
+    const FORBIDDEN_NEON_MINT: egui::Color32 = egui::Color32::from_rgb(0x00, 0xFF, 0x85);
+    const FORBIDDEN_TEAL: egui::Color32 = egui::Color32::from_rgb(0x79, 0xD2, 0xC3);
 
     fn app() -> SyncPlusApp {
         SyncPlusApp::new_with_store(RunEvidenceStore::open_in_memory().expect("database"))
             .expect("app")
-    }
-
-    #[test]
-    fn option_a_palettes_meet_wcag_contrast_contract() {
-        for (name, palette) in [
-            ("dark", ui_palette_for_dark_mode(true)),
-            ("light", ui_palette_for_dark_mode(false)),
-        ] {
-            for (label, foreground, background) in [
-                ("primary text", palette.text, palette.canvas),
-                ("muted text", palette.muted, palette.canvas),
-                ("green accent", palette.accent, palette.canvas),
-                ("blue accent", palette.secondary, palette.canvas),
-                ("pink accent", palette.hot, palette.canvas),
-                (
-                    "exit button text",
-                    palette.on_danger_soft,
-                    palette.danger_soft,
-                ),
-                ("warning text", palette.amber, palette.amber_soft),
-                ("button text", palette.on_accent, palette.accent),
-            ] {
-                assert!(
-                    contrast_ratio(foreground, background) >= 4.5,
-                    "{name} {label} must meet WCAG AA normal-text contrast"
-                );
-            }
-
-            for (label, foreground, background) in [
-                ("card border", palette.border, palette.surface),
-                ("subtle card border", palette.border_subtle, palette.surface),
-            ] {
-                assert!(
-                    contrast_ratio(foreground, background) >= 3.0,
-                    "{name} {label} must meet WCAG non-text contrast"
-                );
-            }
-        }
     }
 
     #[test]
@@ -7387,7 +6832,7 @@ mod tests {
     }
 
     #[test]
-    fn selecting_a_saved_profile_loads_it_into_the_sync_workspace() {
+    fn selecting_a_saved_profile_loads_it_into_the_profiles_editor() {
         let mut syncplus = app();
         let profile = SyncProfile::new(
             "Documents backup",
@@ -7399,7 +6844,7 @@ mod tests {
 
         syncplus.select_profile(persisted.id());
 
-        assert_eq!(syncplus.view, AppView::Sync);
+        assert_eq!(syncplus.view, AppView::Profiles);
         assert_eq!(syncplus.form.id, Some(persisted.id()));
         assert_eq!(syncplus.form.name, "Documents backup");
         assert!(syncplus.status().contains("Editing Documents backup"));
@@ -8281,6 +7726,461 @@ mod tests {
                 assert_eq!(selected_topic, HelpTopic::Modes);
             });
         }
+    }
+
+    fn collect_painted_text(shape: &egui::Shape, texts: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => texts.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_painted_text(shape, texts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_painted_colors(shape: &egui::Shape, colors: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_painted_colors(shape, colors);
+                }
+            }
+            egui::Shape::Circle(circle) => {
+                colors.push(circle.fill);
+                colors.push(circle.stroke.color);
+            }
+            egui::Shape::Ellipse(ellipse) => {
+                colors.push(ellipse.fill);
+                colors.push(ellipse.stroke.color);
+            }
+            egui::Shape::LineSegment { stroke, .. } => colors.push(stroke.color),
+            egui::Shape::Path(path) => {
+                colors.push(path.fill);
+                if let egui::epaint::ColorMode::Solid(color) = path.stroke.color {
+                    colors.push(color);
+                }
+            }
+            egui::Shape::Rect(rect) => {
+                colors.push(rect.fill);
+                colors.push(rect.stroke.color);
+            }
+            egui::Shape::Text(text) => {
+                colors.push(text.fallback_color);
+                if let Some(color) = text.override_text_color {
+                    colors.push(color);
+                }
+                colors.push(text.underline.color);
+            }
+            egui::Shape::Mesh(mesh) => {
+                for vertex in &mesh.vertices {
+                    colors.push(vertex.color);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn painted_output_for(
+        app: &mut SyncPlusApp,
+        theme: ThemePreference,
+    ) -> (Vec<String>, Vec<egui::Color32>) {
+        painted_shapes_for(app, theme, false)
+    }
+
+    fn painted_window_for(
+        app: &mut SyncPlusApp,
+        theme: ThemePreference,
+    ) -> (Vec<String>, Vec<egui::Color32>) {
+        painted_shapes_for(app, theme, true)
+    }
+
+    fn painted_shapes_for(
+        app: &mut SyncPlusApp,
+        theme: ThemePreference,
+        include_sidebar: bool,
+    ) -> (Vec<String>, Vec<egui::Color32>) {
+        painted_shapes_for_size(app, theme, include_sidebar, None)
+    }
+
+    fn painted_shapes_for_size(
+        app: &mut SyncPlusApp,
+        theme: ThemePreference,
+        include_sidebar: bool,
+        screen: Option<egui::Vec2>,
+    ) -> (Vec<String>, Vec<egui::Color32>) {
+        app.set_theme(theme);
+        let context = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        if let Some(size) = screen {
+            input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size));
+        }
+        let output = context.run_ui(input, |context| {
+            app.apply_theme(context);
+            if include_sidebar {
+                let ctx = context.clone();
+                egui::Panel::left("workspace-sidebar").show(context, |ui| {
+                    app.draw_sidebar(ui);
+                    app.draw_sidebar_actions(ui, &ctx);
+                });
+            }
+            egui::CentralPanel::default().show(context, |ui| app.draw_central_content(ui));
+        });
+        let mut texts = Vec::new();
+        let mut colors = Vec::new();
+        for clipped_shape in &output.shapes {
+            collect_painted_text(&clipped_shape.shape, &mut texts);
+            collect_painted_colors(&clipped_shape.shape, &mut colors);
+        }
+        output.drop_without_applying_deltas();
+        (texts, colors)
+    }
+
+    fn app_with_saved_profile() -> SyncPlusApp {
+        let mut syncplus = app();
+        let profile = SyncProfile::new(
+            "Documents backup",
+            Peer::new("source", PathBuf::from("/source")),
+            Peer::new("destination", PathBuf::from("/destination")),
+        );
+        let persisted = syncplus.store.create_profile(&profile).expect("profile");
+        syncplus.profiles = syncplus.store.list_profiles().expect("profiles");
+        syncplus.form = ProfileForm::from_persisted(&persisted);
+        syncplus.show_welcome();
+        syncplus
+    }
+
+    fn assert_no_forbidden_hues(colors: &[egui::Color32], screen: &str, appearance: &str) {
+        for color in colors {
+            let opaque = egui::Color32::from_rgb(color.r(), color.g(), color.b());
+            assert_ne!(
+                opaque, FORBIDDEN_MAGENTA,
+                "{appearance} {screen} painted magenta"
+            );
+            assert_ne!(
+                opaque, FORBIDDEN_NEON_MINT,
+                "{appearance} {screen} painted neon mint"
+            );
+            assert_ne!(opaque, FORBIDDEN_TEAL, "{appearance} {screen} painted teal");
+        }
+    }
+
+    #[test]
+    fn theme_preference_is_persisted_in_application_database() {
+        let store = RunEvidenceStore::open_in_memory().expect("database");
+        let mut app = SyncPlusApp::new_with_store(store).expect("app");
+        for theme in [
+            ThemePreference::Light,
+            ThemePreference::Dark,
+            ThemePreference::System,
+        ] {
+            app.set_theme(theme);
+            assert_eq!(app.theme(), theme);
+        }
+    }
+
+    #[test]
+    fn switching_appearance_restyles_window_tokens_immediately() {
+        let mut app = app();
+        let context = egui::Context::default();
+
+        app.set_theme(ThemePreference::Dark);
+        app.apply_theme(&context);
+        context.all_styles_mut(|style| {
+            assert_eq!(style.visuals.panel_fill, BrandTheme::dark().canvas);
+            assert_eq!(style.visuals.window_fill, BrandTheme::dark().surface);
+            assert_eq!(
+                style.visuals.selection.stroke.color,
+                BrandTheme::dark().copper
+            );
+            assert_eq!(style.visuals.hyperlink_color, BrandTheme::dark().steel);
+            assert_eq!(style.visuals.error_fg_color, BrandTheme::dark().danger);
+            assert_eq!(style.visuals.warn_fg_color, BrandTheme::dark().warning);
+            assert_ne!(style.visuals.panel_fill, egui::Color32::BLACK);
+            assert_ne!(
+                style.visuals.widgets.hovered.bg_stroke.color,
+                FORBIDDEN_MAGENTA
+            );
+        });
+
+        app.set_theme(ThemePreference::Light);
+        app.apply_theme(&context);
+        context.all_styles_mut(|style| {
+            assert_eq!(style.visuals.panel_fill, BrandTheme::light().canvas);
+            assert_eq!(style.visuals.window_fill, BrandTheme::light().surface);
+            assert_eq!(
+                style.visuals.selection.stroke.color,
+                BrandTheme::light().copper
+            );
+            assert_ne!(style.visuals.panel_fill, egui::Color32::WHITE);
+            assert_ne!(style.visuals.window_fill, egui::Color32::WHITE);
+        });
+    }
+
+    #[test]
+    fn representative_screens_render_in_both_appearances() {
+        let screens: [(&str, fn(&mut SyncPlusApp), &[&str]); 7] = [
+            (
+                "Overview",
+                |app| app.show_welcome(),
+                &[
+                    crate::chrome::EMPTY_OVERVIEW_TITLE,
+                    crate::chrome::EMPTY_OVERVIEW_PRIMARY,
+                ],
+            ),
+            ("Profiles", |app| app.show_profiles(), &["Profiles"]),
+            (
+                "Settings",
+                |app| app.show_settings(),
+                &["Appearance", "System", "Light", "Dark"],
+            ),
+            ("wizard", |app| app.start_new_profile(), &["Sync method"]),
+            (
+                "Sync workspace",
+                |app| app.show_sync_workspace(),
+                &["Execution Confirmation"],
+            ),
+            (
+                "Run Reports",
+                |app| app.show_reports(),
+                &["Recovery Review"],
+            ),
+            (
+                "Help",
+                |app| app.show_help(HelpTopic::Recovery),
+                &["Recovery Review"],
+            ),
+        ];
+
+        for theme in [ThemePreference::Light, ThemePreference::Dark] {
+            let appearance = match theme {
+                ThemePreference::Light => "light",
+                ThemePreference::Dark => "dark",
+                ThemePreference::System => "system",
+            };
+            for (screen, setup, required) in screens {
+                let mut app = app();
+                setup(&mut app);
+                let (texts, colors) = painted_output_for(&mut app, theme);
+                let joined = texts.join("\n");
+                for needle in required {
+                    assert!(
+                        texts.iter().any(|text| text.contains(needle)),
+                        "{appearance} {screen} missing {needle:?} in {joined}"
+                    );
+                }
+                assert_no_forbidden_hues(&colors, screen, appearance);
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_populated_overview_are_evidenced_in_both_appearances() {
+        for theme in [ThemePreference::Light, ThemePreference::Dark] {
+            let appearance = match theme {
+                ThemePreference::Light => "light",
+                ThemePreference::Dark => "dark",
+                ThemePreference::System => "system",
+            };
+            let mut empty = app();
+            empty.show_welcome();
+            let (texts, colors) = painted_window_for(&mut empty, theme);
+            let joined = texts.join("\n");
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains(crate::chrome::EMPTY_OVERVIEW_TITLE)),
+                "{appearance} empty Overview missing title in {joined}"
+            );
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains(crate::chrome::EMPTY_OVERVIEW_PRIMARY)),
+                "{appearance} empty Overview missing primary action in {joined}"
+            );
+            assert!(
+                texts.iter().any(|text| text.contains("Settings")),
+                "{appearance} chrome missing Settings in {joined}"
+            );
+            assert!(
+                texts.iter().any(|text| text.contains("Exit")),
+                "{appearance} chrome missing quiet Exit in {joined}"
+            );
+            assert!(
+                !texts.iter().any(|text| text.trim() == "Recovery Review"),
+                "{appearance} Recovery Review remained a permanent nav item in {joined}"
+            );
+            assert!(
+                !joined.contains("in rhythm."),
+                "{appearance} empty Overview kept marketing display type"
+            );
+            assert_no_forbidden_hues(&colors, "empty Overview", appearance);
+
+            let mut populated = app_with_saved_profile();
+            let (texts, colors) = painted_window_for(&mut populated, theme);
+            let joined = texts.join("\n");
+            assert!(
+                texts.iter().any(|text| text.contains("Documents backup")),
+                "{appearance} populated Overview missing Sync Profile in {joined}"
+            );
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains(crate::chrome::NO_SYNC_RUN_YET)),
+                "{appearance} populated Overview missing last Sync Run in {joined}"
+            );
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains(crate::chrome::NEXT_ACTION_REVIEW_PLAN)),
+                "{appearance} populated Overview missing next safe action in {joined}"
+            );
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains(crate::chrome::PRIMARY_SYNCHRONISE)),
+                "{appearance} populated Overview missing Synchronise in {joined}"
+            );
+            assert!(
+                !joined.contains("in rhythm.") && !joined.contains("A calmer way to"),
+                "{appearance} populated Overview kept marketing display type"
+            );
+            assert_no_forbidden_hues(&colors, "populated Overview", appearance);
+        }
+    }
+
+    #[test]
+    fn sync_workspace_is_analyze_plan_and_confirmation_not_editor_and_reports() {
+        let mut app = app_with_saved_profile();
+        app.show_sync_workspace();
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("Execution Confirmation"),
+            "Sync workspace missing Execution Confirmation in {joined}"
+        );
+        assert!(
+            joined.contains("Dry run · Analyze"),
+            "Sync workspace missing Fresh Analysis in {joined}"
+        );
+        assert!(
+            !joined.contains("Sync Runs and Recovery Review"),
+            "Sync workspace still dumped historical Run Reports in {joined}"
+        );
+        assert!(
+            !joined.contains("Save profile"),
+            "Sync workspace still dumped the profile editor in {joined}"
+        );
+        app.show_profiles();
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("Documents backup"),
+            "Profiles missing Sync Profile editor in {joined}"
+        );
+        assert!(
+            joined.contains("Save profile"),
+            "Profiles missing profile save in {joined}"
+        );
+        assert!(
+            !joined.contains("Dry run · Analyze"),
+            "Profiles still hosted Fresh Analysis in {joined}"
+        );
+        app.show_reports();
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("Sync Runs and Recovery Review"),
+            "Reports missing Run Reports in {joined}"
+        );
+    }
+
+    #[test]
+    fn workspace_help_and_confirmation_render_at_minimum_and_typical_widths() {
+        let screens: [(&str, fn(&mut SyncPlusApp), &[&str]); 3] = [
+            (
+                "wizard",
+                |app| app.start_new_profile(),
+                &["Upcoming", "Current step"],
+            ),
+            (
+                "Sync workspace",
+                |app| app.show_sync_workspace(),
+                &["Execution Confirmation"],
+            ),
+            (
+                "Help",
+                |app| app.show_help(HelpTopic::GettingStarted),
+                &["Help & Support"],
+            ),
+        ];
+        for width in [960.0_f32, 1280.0_f32] {
+            for theme in [ThemePreference::Light, ThemePreference::Dark] {
+                for (screen, setup, required) in screens {
+                    let mut app = app();
+                    setup(&mut app);
+                    let (texts, colors) = painted_shapes_for_size(
+                        &mut app,
+                        theme,
+                        false,
+                        Some(egui::vec2(width, 600.0)),
+                    );
+                    let joined = texts.join("\n");
+                    for needle in required {
+                        assert!(
+                            texts.iter().any(|text| text.contains(needle)),
+                            "{width} {screen} missing {needle:?} in {joined}"
+                        );
+                    }
+                    assert_no_forbidden_hues(&colors, screen, "appearance");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quit_dialog_copy_keeps_recovery_review_and_inherits_appearance_tokens() {
+        assert!(QUIT_ACTIVE_RUN_COPY.contains("Recovery Review"));
+        assert!(QUIT_STOPPING_COPY.contains("Recovery Review"));
+        let mut app = app();
+        let context = egui::Context::default();
+        for (theme, expected) in [
+            (ThemePreference::Dark, BrandTheme::dark()),
+            (ThemePreference::Light, BrandTheme::light()),
+        ] {
+            app.set_theme(theme);
+            app.apply_theme(&context);
+            context.all_styles_mut(|style| {
+                assert_eq!(style.visuals.window_fill, expected.surface);
+                assert_eq!(style.visuals.panel_fill, expected.canvas);
+            });
+        }
+    }
+
+    #[test]
+    fn safety_copy_keeps_labels_and_does_not_rely_on_colour_alone() {
+        assert_eq!(
+            run_report_status_label(RunReportStatus::RecoveryReview),
+            "Recovery Review required"
+        );
+        assert_eq!(
+            run_report_status_label(RunReportStatus::Completed),
+            "Completed"
+        );
+        assert_eq!(run_report_status_label(RunReportStatus::Blocked), "Blocked");
+        assert!(run_recovery_message(RunReportStatus::Interrupted).contains("Recovery Review"));
+        assert!(
+            help_entry(HelpTopic::PlanAndConfirmation)
+                .what
+                .contains("Execution Confirmation")
+        );
+        assert!(
+            help_entry(HelpTopic::Recovery)
+                .title
+                .contains("Recovery Review")
+        );
+        assert_eq!(PATH_RISK_WARNING_LABEL, "Path Risk Warning");
     }
 
     #[test]

@@ -501,3 +501,21 @@ _Avoid_: Seafoam, neon mint, magenta, teal, a procedural window glyph, a menu ic
 **Brand Kit**:
 The repository public identity pack under `docs/brand/`. It contains the Brand Mark, wordmark, horizontal lockup, and monochrome variants in Dark Appearance and Light Appearance, plus the GitHub avatar, 1280×640 social preview, Facebook profile, 1640×924 cover source, and 1200×630 post image. It documents clear space, minimum size, allowed backgrounds, and forbidden treatments. The public promise is “Review the plan. Confirm what changes. Uncertainty preserves the source.” The kit does not create live social accounts.
 _Avoid_: Recolour to pink or teal, neon glow, slogans that imply silent deletion, treating Light Appearance as a white-only lockup
+
+## Appearance
+
+**Dark Appearance**:
+The first-class dark theme: warm ink surfaces, copper primary accent, and steel companion accent. It is not pure black and not a neon-on-black HUD.
+_Avoid_: OLED black, cyberpunk, treating dark as the only real product
+
+**Light Appearance**:
+The first-class light theme: warm paper, cream, and stone surfaces. The canvas is not white and is not a brightness-inverted Dark Appearance.
+_Avoid_: White sheet, bright fallback, leftover dark-mode chrome
+
+**Brand Theme**:
+The desktop GUI token set that supplies canvas, surface, elevated, field, text, muted, border, copper, steel, danger, warning, and their on/soft pairs for both appearances. Core stores only the named preference System, Light, or Dark; it does not store colours.
+_Avoid_: Per-screen one-off colours, user-supplied chrome, colours in SQLite
+
+**Overview**:
+The home surface of the desktop app. Empty Overview explains first-run calmly and offers one action to create a Sync Profile. Populated Overview shows the active Sync Profile, last Sync Run or review state, and the next safe action.
+_Avoid_: Marketing landing page, neon hero, fake metrics
