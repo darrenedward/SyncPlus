@@ -33,6 +33,25 @@ const fn rgb(red: u8, green: u8, blue: u8) -> egui::Color32 {
     egui::Color32::from_rgb(red, green, blue)
 }
 
+/// Type roles for the desktop instrument. Titles stay in a tool range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeRole {
+    Eyebrow,
+    Title,
+    Body,
+    Caption,
+}
+
+impl TypeRole {
+    pub const fn size(self) -> f32 {
+        match self {
+            Self::Eyebrow | Self::Caption => 12.0,
+            Self::Title => 20.0,
+            Self::Body => 14.0,
+        }
+    }
+}
+
 impl BrandTheme {
     /// Warm-ink Dark Appearance. Canvas is not pure black.
     pub const fn dark() -> Self {
@@ -318,6 +337,17 @@ mod tests {
             assert_eq!(style.visuals.error_fg_color, theme.danger);
             assert_eq!(style.visuals.widgets.hovered.bg_stroke.color, theme.copper);
         }
+    }
+
+    #[test]
+    fn type_roles_are_eyebrow_title_body_and_caption_in_a_tool_range() {
+        assert_eq!(TypeRole::Eyebrow.size(), 12.0);
+        assert_eq!(TypeRole::Title.size(), 20.0);
+        assert_eq!(TypeRole::Body.size(), 14.0);
+        assert_eq!(TypeRole::Caption.size(), 12.0);
+        assert!(TypeRole::Title.size() <= 24.0);
+        assert!(TypeRole::Title.size() < 38.0);
+        assert!(TypeRole::Title.size() < 46.0);
     }
 
     #[test]

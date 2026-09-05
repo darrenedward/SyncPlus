@@ -168,6 +168,16 @@ pub fn populated_overview(
     }
 }
 
+pub fn wizard_step_caption(selected: bool, completed: bool) -> &'static str {
+    if selected {
+        "Current step"
+    } else if completed {
+        "Complete"
+    } else {
+        "Upcoming"
+    }
+}
+
 pub fn last_run_label(status: Option<RunReportStatus>) -> String {
     match status {
         None => NO_SYNC_RUN_YET.to_owned(),
@@ -319,5 +329,13 @@ mod tests {
             "Last Sync Run · Recovery Review required"
         );
         assert_eq!(last_run_label(None), NO_SYNC_RUN_YET);
+    }
+
+    #[test]
+    fn wizard_upcoming_steps_are_not_warnings() {
+        assert_eq!(wizard_step_caption(true, false), "Current step");
+        assert_eq!(wizard_step_caption(false, true), "Complete");
+        assert_eq!(wizard_step_caption(false, false), "Upcoming");
+        assert_ne!(wizard_step_caption(false, false), "Required");
     }
 }
