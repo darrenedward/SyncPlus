@@ -1865,21 +1865,15 @@ impl PrecheckProbe for LocalPrecheckProbe {
     }
 
     fn peer_available(&self, path: &Path, destination: bool) -> Result<bool, PrecheckError> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => Ok(metadata.is_dir()),
-            Err(error) if crate::volume::io_error_means_unavailable(&error) => {
-                if destination && error.kind() == io::ErrorKind::NotFound {
-                    Ok(path.parent().is_some_and(|parent| {
-                        fs::symlink_metadata(parent)
-                            .map(|metadata| metadata.is_dir())
-                            .unwrap_or(false)
-                    }))
-                } else {
-                    Ok(false)
-                }
-            }
-            Err(_) => Ok(false),
+        if crate::local_mount::local_directory_present(path) {
+            return Ok(true);
         }
+        if destination {
+            return Ok(path
+                .parent()
+                .is_some_and(crate::local_mount::local_directory_present));
+        }
+        Ok(false)
     }
 
     fn scopes_overlap(&self, source: &Path, destination: &Path) -> Result<bool, PrecheckError> {
