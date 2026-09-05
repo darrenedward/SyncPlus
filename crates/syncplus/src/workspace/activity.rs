@@ -19,6 +19,10 @@ impl AnalysisPhase {
     }
 }
 
+pub fn format_clock(seconds: u64) -> String {
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
+
 pub fn format_elapsed(seconds: u64) -> String {
     match seconds {
         0 => "just started".to_owned(),
@@ -38,7 +42,7 @@ pub fn format_elapsed(seconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnalysisPhase, format_elapsed};
+    use super::{AnalysisPhase, format_clock, format_elapsed};
 
     #[test]
     fn dry_run_phases_explain_the_current_work_without_implying_mutation() {
@@ -71,5 +75,7 @@ mod tests {
         assert_eq!(format_elapsed(12), "12 seconds");
         assert_eq!(format_elapsed(60), "1 min");
         assert_eq!(format_elapsed(75), "1 min 15 s");
+        assert_eq!(format_clock(9), "00:09");
+        assert_eq!(format_clock(75), "01:15");
     }
 }

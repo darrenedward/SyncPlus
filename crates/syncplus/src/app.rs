@@ -3908,6 +3908,7 @@ impl SyncPlusApp {
                     ui.set_width(content_width);
                     ui.add_space(28.0);
                     self.draw_fresh_analysis_banner(ui);
+                    if !has_profile {
                     card_frame(ui).show(ui, |ui| {
                         ui.columns(2, |columns| {
                             columns[0].vertical(|ui| {
@@ -3944,6 +3945,7 @@ impl SyncPlusApp {
                         });
                     });
                     ui.add_space(16.0);
+                    }
                     draw_overview_activity(ui, activity);
                     ui.add_space(16.0);
                     card_frame(ui).show(ui, |ui| {
@@ -4386,9 +4388,9 @@ impl SyncPlusApp {
                 ui.vertical(|ui| {
                     section_intro(
                         ui,
-                        "Active Sync Profile",
+                        "Sync",
                         "Sync workspace",
-                        "Select a Sync Profile to populate these fields. Save becomes available when something has changed.",
+                        "Choose how files move, pick two folders, then run a Dry run.",
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4547,66 +4549,55 @@ impl SyncPlusApp {
                         );
                     }
                 }
-                card_frame(ui).show(ui, |ui| {
-            ui.label(egui::RichText::new("PROFILE IDENTITY").small().strong().color(palette.copper));
-            ui.heading("Name this Sync Profile");
-            ui.label(egui::RichText::new("A clear name makes schedules, Run Reports, and recovery decisions easier to identify.").color(palette.muted));
-            ui.add_space(10.0);
-            ui.label(egui::RichText::new("Profile name").strong());
-            ui.add_sized(
-                egui::vec2(ui.available_width(), 38.0),
-                egui::TextEdit::singleline(&mut self.form.name)
-                    .vertical_align(egui::Align::Center),
-            );
-        });
-                card_frame(ui).show(ui, |ui| {
-            ui.label(egui::RichText::new("SYNC POLICY").small().strong().color(palette.steel));
-            ui.heading("Choose how files move");
-            ui.label(egui::RichText::new("One-Way Sync has an explicit authority. Mirror Sync never assumes a winner and requires Conflict Review.").color(palette.muted));
-            ui.add_space(10.0);
-            ui.label(egui::RichText::new("Sync method").strong());
-            egui::ComboBox::from_id_salt("sync-method")
-                .selected_text(sync_mode_label(self.form.mode))
-                .width(ui.available_width())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut self.form.mode,
-                        SyncMode::OneWay,
-                        "One-Way Sync (recommended)",
-                    );
-                    ui.selectable_value(
-                        &mut self.form.mode,
-                        SyncMode::Mirror,
-                        "Mirror Sync (review required)",
-                    );
+                ui.add_space(4.0);
+                ui.columns(2, |columns| {
+                    if draw_method_card(
+                        &mut columns[0],
+                        self.form.mode == SyncMode::OneWay,
+                        workspace::ONE_WAY_TITLE,
+                        workspace::ONE_WAY_CAPTION,
+                    ) {
+                        self.form.mode = SyncMode::OneWay;
+                    }
+                    if draw_method_card(
+                        &mut columns[1],
+                        self.form.mode == SyncMode::Mirror,
+                        workspace::MIRROR_TITLE,
+                        workspace::MIRROR_CAPTION,
+                    ) {
+                        self.form.mode = SyncMode::Mirror;
+                    }
                 });
-            ui.add_space(14.0);
-            ui.separator();
-            ui.add_space(10.0);
-            ui.label(match self.form.mode {
-                SyncMode::OneWay => "One-Way Sync copies from the authoritative source endpoint to the other endpoint.",
-                SyncMode::Mirror => "Mirror Sync keeps both endpoints populated and requires explicit conflict review.",
-            });
-            if self.form.mode == SyncMode::OneWay {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("Authoritative source").strong());
-                    ui.radio_value(&mut self.form.source, OneWaySource::PeerA, "Source endpoint");
-                    ui.radio_value(&mut self.form.source, OneWaySource::PeerB, "Destination endpoint");
-                });
-            }
-        });
+                ui.add_space(16.0);
                 card_frame(ui).show(ui, |ui| {
-            section_intro(
-                ui,
-                "Connections",
-                "Source and destination",
-                "Both endpoints remain visible so the direction and scope are always clear.",
-            );
-            ui.add_space(4.0);
-            draw_endpoint(ui, "Source endpoint", &mut self.form.peer_a);
-            ui.add_space(12.0);
-            draw_endpoint(ui, "Destination endpoint", &mut self.form.peer_b);
-        });
+                    ui.label(egui::RichText::new("Task name").strong());
+                    ui.add_sized(
+                        egui::vec2(ui.available_width(), 40.0),
+                        egui::TextEdit::singleline(&mut self.form.name)
+                            .hint_text("Documents backup")
+                            .vertical_align(egui::Align::Center),
+                    );
+                    ui.add_space(16.0);
+                    draw_simple_folder_picker(ui, "Source folder", &mut self.form.peer_a);
+                    ui.add_space(14.0);
+                    draw_simple_folder_picker(ui, "Destination folder", &mut self.form.peer_b);
+                    if self.form.mode == SyncMode::OneWay {
+                        ui.add_space(10.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new("Authoritative source").strong());
+                            ui.radio_value(
+                                &mut self.form.source,
+                                OneWaySource::PeerA,
+                                "Source folder",
+                            );
+                            ui.radio_value(
+                                &mut self.form.source,
+                                OneWaySource::PeerB,
+                                "Destination folder",
+                            );
+                        });
+                    }
+                });
             }
             WorkspaceTab::Options => {
                 card_frame(ui).show(ui, |ui| {
@@ -4840,46 +4831,64 @@ impl SyncPlusApp {
     fn draw_activity_dialog(&self, ui: &mut egui::Ui) {
         let palette = ui_palette(ui);
         if let Some(active) = self.active_analysis.as_ref() {
-            let elapsed = workspace::format_elapsed(active.started.elapsed().as_secs());
-            egui::Frame::new()
-                .fill(palette.warning_soft)
-                .stroke(egui::Stroke::new(1.0, palette.warning))
-                .corner_radius(egui::CornerRadius::same(8))
-                .inner_margin(egui::Margin::symmetric(16, 14))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            egui::RichText::new(active.phase.heading())
-                                .heading()
-                                .color(palette.on_warning_soft),
-                        );
-                    });
+            let seconds = active.started.elapsed().as_secs();
+            let clock = workspace::format_clock(seconds);
+            card_frame(ui).show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(12.0);
+                    ui.spinner();
+                    ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new(active.phase.detail()).color(palette.on_warning_soft),
+                        egui::RichText::new(active.phase.heading())
+                            .size(28.0)
+                            .strong(),
                     );
-                    ui.label(
-                        egui::RichText::new(format!("Sync Profile: {}", active.profile_name))
-                            .color(palette.on_warning_soft),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("Source: {}", active.source))
-                            .color(palette.on_warning_soft),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("Destination: {}", active.destination))
-                            .color(palette.on_warning_soft),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("Elapsed: {elapsed}"))
-                            .color(palette.on_warning_soft),
-                    );
+                    ui.label(egui::RichText::new(active.phase.detail()).color(palette.muted));
+                    ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new("No files are being changed.")
                             .strong()
-                            .color(palette.on_warning_soft),
+                            .color(palette.copper),
                     );
+                    ui.add_space(16.0);
                 });
+                ui.columns(4, |columns| {
+                    draw_progress_chip(&mut columns[0], "Status", "Running");
+                    draw_progress_chip(&mut columns[1], "Files reviewed", "—");
+                    draw_progress_chip(
+                        &mut columns[2],
+                        "Method",
+                        if self.form.mode == SyncMode::Mirror {
+                            workspace::MIRROR_TITLE
+                        } else {
+                            workspace::ONE_WAY_TITLE
+                        },
+                    );
+                    draw_progress_chip(&mut columns[3], "Elapsed time", &clock);
+                });
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new("Source").small().color(palette.muted));
+                        ui.label(egui::RichText::new(&active.source).strong());
+                    });
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("› › ›")
+                            .size(22.0)
+                            .color(palette.copper),
+                    );
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new("Destination")
+                                .small()
+                                .color(palette.muted),
+                        );
+                        ui.label(egui::RichText::new(&active.destination).strong());
+                    });
+                });
+            });
             ui.add_space(12.0);
             return;
         }
@@ -7021,6 +7030,125 @@ fn endpoint_form_label(ui: &mut egui::Ui, label: &str) {
     );
 }
 
+fn draw_method_card(ui: &mut egui::Ui, selected: bool, title: &str, caption: &str) -> bool {
+    let palette = ui_palette(ui);
+    let fill = if selected {
+        palette.copper_soft
+    } else {
+        palette.field
+    };
+    let stroke = if selected {
+        palette.copper
+    } else {
+        palette.border
+    };
+    let inner = egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(if selected { 2.0 } else { 1.0 }, stroke))
+        .corner_radius(egui::CornerRadius::same(14))
+        .inner_margin(egui::Margin::symmetric(16, 18))
+        .show(ui, |ui| {
+            ui.set_min_height(168.0);
+            ui.set_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+                ui.painter().circle_filled(
+                    rect.center(),
+                    28.0,
+                    if selected {
+                        palette.copper
+                    } else {
+                        palette.elevated
+                    },
+                );
+                ui.painter().circle_stroke(
+                    rect.center(),
+                    28.0,
+                    egui::Stroke::new(
+                        1.5,
+                        if selected {
+                            palette.on_copper
+                        } else {
+                            palette.steel
+                        },
+                    ),
+                );
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(title).size(18.0).strong());
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(caption).color(palette.muted));
+                if selected {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Selected")
+                            .small()
+                            .strong()
+                            .color(palette.copper),
+                    );
+                }
+            });
+        });
+    inner.response.interact(egui::Sense::click()).clicked()
+}
+
+fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
+    let palette = ui_palette(ui);
+    ui.label(egui::RichText::new(title).size(15.0).strong());
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut endpoint.kind, EndpointKind::Local, "This computer");
+        ui.radio_value(&mut endpoint.kind, EndpointKind::Ssh, "SSH peer");
+    });
+    ui.add_space(6.0);
+    match endpoint.kind {
+        EndpointKind::Local => {
+            ui.horizontal(|ui| {
+                let browse_width = 110.0;
+                let field_width =
+                    (ui.available_width() - browse_width - ui.spacing().item_spacing.x).max(200.0);
+                ui.add_sized(
+                    egui::vec2(field_width, 40.0),
+                    egui::TextEdit::singleline(&mut endpoint.local_path)
+                        .hint_text("Select a folder")
+                        .vertical_align(egui::Align::Center),
+                );
+                if secondary_button(ui, "Browse").clicked()
+                    && let Some(path) = FileDialog::new()
+                        .set_title(format!("Select {title}"))
+                        .pick_folder()
+                {
+                    endpoint.local_path = path.to_string_lossy().into_owned();
+                    if endpoint.name.trim().is_empty() {
+                        endpoint.name = title.to_owned();
+                    }
+                }
+            });
+        }
+        EndpointKind::Ssh => {
+            draw_endpoint(ui, title, endpoint);
+        }
+    }
+    ui.label(
+        egui::RichText::new("The folder is a validated path. No shell command is accepted.")
+            .small()
+            .color(palette.muted),
+    );
+}
+
+fn draw_progress_chip(ui: &mut egui::Ui, label: &str, value: &str) {
+    let palette = ui_palette(ui);
+    egui::Frame::new()
+        .fill(palette.field)
+        .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(label).small().color(palette.muted));
+            ui.label(egui::RichText::new(value).strong());
+        });
+}
+
 fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
     inset_frame(ui).show(ui, |ui| {
         ui.label(egui::RichText::new(title).heading().strong());
@@ -8698,7 +8826,7 @@ mod tests {
             (
                 "Sync workspace",
                 |app| app.show_sync_workspace(),
-                &["Folders", "Options", "Plan"],
+                &["Folders", "One-Way Sync", "Source folder"],
             ),
             (
                 "Run Reports",
@@ -8848,6 +8976,18 @@ mod tests {
         assert!(
             joined.contains("Folders") && joined.contains("Options") && joined.contains("Plan"),
             "Sync workspace missing Folders, Options, and Plan tabs in {joined}"
+        );
+        assert!(
+            joined.contains(workspace::ONE_WAY_TITLE),
+            "Sync workspace missing One-Way Sync method card in {joined}"
+        );
+        assert!(
+            joined.contains("Source folder") && joined.contains("Destination folder"),
+            "Sync workspace missing the two folder pickers in {joined}"
+        );
+        assert!(
+            joined.contains("Browse"),
+            "Sync workspace missing folder browse in {joined}"
         );
         assert!(
             !texts.iter().any(|text| text.trim() == "Advance"),
