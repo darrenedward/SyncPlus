@@ -9,6 +9,8 @@
 )]
 
 mod app;
+#[cfg(test)]
+mod brand_kit;
 mod brand_mark;
 
 pub use app::{EndpointKind, SyncPlusApp, UiValidationError, run_background_scheduler_once};
