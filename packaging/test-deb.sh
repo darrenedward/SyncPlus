@@ -94,11 +94,29 @@ for path in \
     usr/bin/syncplus-scheduler-unregister \
     usr/share/applications/syncplus.desktop \
     usr/share/icons/hicolor/scalable/apps/syncplus.svg \
+    usr/share/icons/hicolor/symbolic/apps/syncplus-symbolic.svg \
+    usr/share/syncplus/brand-mark/syncplus-light.svg \
     usr/share/syncplus/help/index.md \
     usr/lib/systemd/user/syncplus-background.service \
     usr/lib/systemd/user/syncplus-background.timer; do
     test -e "$extract_root/$path"
 done
+for size in 16 22 24 32 48 64 128 256 512; do
+    test -e "$extract_root/usr/share/icons/hicolor/${size}x${size}/apps/syncplus.png"
+done
+grep -F 'Icon=syncplus' "$extract_root/usr/share/applications/syncplus.desktop" >/dev/null
+cmp -s packaging/icons/syncplus.svg \
+    "$extract_root/usr/share/icons/hicolor/scalable/apps/syncplus.svg"
+cmp -s packaging/icons/hicolor/256x256/apps/syncplus.png \
+    "$extract_root/usr/share/icons/hicolor/256x256/apps/syncplus.png"
+if grep -Ei '#ff0099|#00ff85|#79d2c3' \
+    "$extract_root/usr/share/icons/hicolor/scalable/apps/syncplus.svg" \
+    "$extract_root/usr/share/syncplus/brand-mark/syncplus-light.svg" \
+    "$extract_root/usr/share/icons/hicolor/symbolic/apps/syncplus-symbolic.svg" \
+    >/dev/null; then
+    echo "packaged Brand Mark must not contain magenta, neon mint, or teal" >&2
+    exit 1
+fi
 
 test ! -e "$extract_root/etc/systemd/system"
 if dpkg-deb --contents "$second_package" | grep -E ' /etc/| /var/| /home/|usr/lib/systemd/system/' >/dev/null; then
