@@ -13,6 +13,7 @@ mod app;
 mod brand_kit;
 mod brand_mark;
 mod chrome;
+mod folder_dialog;
 mod fonts;
 mod theme;
 mod tray;

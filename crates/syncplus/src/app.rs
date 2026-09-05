@@ -12,7 +12,7 @@ use std::{
 
 use eframe::egui;
 use notify_rust::Notification;
-use rfd::FileDialog;
+
 use syncplus_core::{
     ActionOutcome, AnalysisOutcome, ApplicationMode, ApplicationSettings, AuthorizationSnapshot,
     BackgroundScheduler, ConfirmedPlan, ConflictDecision, ConflictEntry, ConflictEntryKey,
@@ -28,6 +28,7 @@ use syncplus_core::{
 };
 
 use crate::chrome::{self, ChromeAccent, ChromeSurface, OverviewAction};
+use crate::folder_dialog::PendingFolderPick;
 use crate::theme::{self, BrandTheme, TypeRole, add_singleline, singleline_edit};
 use crate::tray::{self, TrayCommand, TrayRuntime};
 use crate::workspace::{
@@ -1648,6 +1649,7 @@ pub struct SyncPlusApp {
     reconnect_prompt: Option<ReconnectPrompt>,
     folder_gate: FolderGate,
     pending_folder_check: bool,
+    pending_folder_pick: Option<PendingFolderPick>,
 }
 
 impl SyncPlusApp {
@@ -1715,6 +1717,7 @@ impl SyncPlusApp {
             reconnect_prompt: None,
             folder_gate: FolderGate::Unknown,
             pending_folder_check: view == AppView::Sync,
+            pending_folder_pick: None,
         })
     }
 
@@ -2152,6 +2155,28 @@ impl SyncPlusApp {
                 "Cancellation for Manual Sync Run {} could not be confirmed in a durable terminal Run Report; SyncPlus remains open for Recovery Review.",
                 completion.run_id.value()
             );
+        }
+    }
+
+    fn resolve_pending_folder_pick(&mut self, frame: &eframe::Frame) {
+        let Some(pending) = self.pending_folder_pick.take() else {
+            return;
+        };
+        let Some(path) = crate::folder_dialog::pick_folder(frame, &pending.title) else {
+            return;
+        };
+        let endpoint = if pending.peer_a {
+            &mut self.form.peer_a
+        } else {
+            &mut self.form.peer_b
+        };
+        endpoint.local_path = path.to_string_lossy().into_owned();
+        if endpoint.name.trim().is_empty() {
+            endpoint.name = pending.title.clone();
+        }
+        if pending.check_folders {
+            self.folder_gate = FolderGate::Unknown;
+            self.pending_folder_check = true;
         }
     }
 
@@ -4218,7 +4243,10 @@ impl SyncPlusApp {
                                     "Choose the folder whose contents should be copied. The selected path is kept as a validated endpoint, not a shell command.",
                                 );
                                 ui.add_space(12.0);
-                                draw_endpoint(ui, "Source endpoint", &mut self.form.peer_a);
+                                if draw_endpoint(ui, "Source endpoint", &mut self.form.peer_a) {
+                                    self.pending_folder_pick =
+                                        Some(PendingFolderPick::source(false));
+                                }
                                 inset_frame(ui).show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         status_dot(ui, palette.steel);
@@ -4239,7 +4267,11 @@ impl SyncPlusApp {
                                     ui.label(egui::RichText::new("Source selected").strong());
                                     ui.label(egui::RichText::new(endpoint_summary(&self.form.peer_a)).monospace().color(palette.muted));
                                 });
-                                draw_endpoint(ui, "Destination endpoint", &mut self.form.peer_b);
+                                if draw_endpoint(ui, "Destination endpoint", &mut self.form.peer_b)
+                                {
+                                    self.pending_folder_pick =
+                                        Some(PendingFolderPick::destination(false));
+                                }
                             }
                             ProfileWizardStep::ReviewAndSave => {
                                 section_intro(
@@ -4566,16 +4598,14 @@ impl SyncPlusApp {
                             "Source folder",
                             &mut self.form.peer_a,
                         ) {
-                            self.folder_gate = FolderGate::Unknown;
-                            self.pending_folder_check = true;
+                            self.pending_folder_pick = Some(PendingFolderPick::source(true));
                         }
                         if draw_simple_folder_picker(
                             &mut columns[1],
                             "Destination folder",
                             &mut self.form.peer_b,
                         ) {
-                            self.folder_gate = FolderGate::Unknown;
-                            self.pending_folder_check = true;
+                            self.pending_folder_pick = Some(PendingFolderPick::destination(true));
                         }
                     });
                     if self.form.mode == SyncMode::OneWay {
@@ -6155,7 +6185,7 @@ impl eframe::App for SyncPlusApp {
         self.tick_while_running(ctx);
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         if self.exit_requested {
             return;
@@ -6199,6 +6229,7 @@ impl eframe::App for SyncPlusApp {
             });
         egui::CentralPanel::default().show(ui, |ui| self.draw_central_content(ui));
         self.draw_quit_dialog(&context);
+        self.resolve_pending_folder_pick(frame);
     }
 }
 
@@ -7137,15 +7168,7 @@ fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut Endp
                             egui::vec2(field_width, theme::FIELD_HEIGHT),
                             singleline_edit(&mut endpoint.local_path).hint_text("Select a folder"),
                         );
-                        if compact_button(ui, "Browse").clicked()
-                            && let Some(path) = FileDialog::new()
-                                .set_title(format!("Select {title}"))
-                                .pick_folder()
-                        {
-                            endpoint.local_path = path.to_string_lossy().into_owned();
-                            if endpoint.name.trim().is_empty() {
-                                endpoint.name = title.to_owned();
-                            }
+                        if compact_button(ui, "Browse").clicked() {
                             browsed = true;
                         }
                     });
@@ -7226,7 +7249,8 @@ fn draw_progress_chip(ui: &mut egui::Ui, label: &str, value: &str) {
         });
 }
 
-fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
+fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) -> bool {
+    let mut browsed = false;
     inset_frame(ui).show(ui, |ui| {
         ui.label(egui::RichText::new(title).heading().strong());
         ui.label(egui::RichText::new("A named endpoint keeps the sync scope explicit and reviewable.").color(ui_palette(ui).muted));
@@ -7250,13 +7274,9 @@ fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
                         - ui.spacing().item_spacing.x)
                         .max(180.0);
                     add_singleline(ui, &mut endpoint.local_path, field_width);
-                    if secondary_button(ui, "Browse…").clicked()
-                        && let Some(path) = FileDialog::new()
-                            .set_title(format!("Select {title} folder"))
-                            .pick_folder()
-                        {
-                            endpoint.local_path = path.to_string_lossy().into_owned();
-                        }
+                    if secondary_button(ui, "Browse…").clicked() {
+                        browsed = true;
+                    }
                 });
                 ui.label("The folder is passed as a validated path argument; no shell command is accepted.");
             }
@@ -7320,6 +7340,7 @@ fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
             }
         }
     });
+    browsed
 }
 
 fn mode_label(mode: ApplicationMode) -> &'static str {
