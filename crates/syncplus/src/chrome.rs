@@ -26,10 +26,11 @@ pub struct SidebarItem {
     pub accent: ChromeAccent,
 }
 
-pub const EMPTY_OVERVIEW_EYEBROW: &str = "Overview";
-pub const EMPTY_OVERVIEW_TITLE: &str = "Create a Sync Profile";
-pub const EMPTY_OVERVIEW_BODY: &str = "SyncPlus reviews a plan and waits for confirmation before anything is overwritten or removed. Create a Sync Profile to choose the folders.";
-pub const EMPTY_OVERVIEW_PRIMARY: &str = "Create your first profile";
+pub const EMPTY_OVERVIEW_EYEBROW: &str = "Welcome to SyncPlus";
+pub const EMPTY_OVERVIEW_TITLE: &str = "Welcome to SyncPlus";
+pub const EMPTY_OVERVIEW_KICKER: &str = "Your trusted data transfer application";
+pub const EMPTY_OVERVIEW_BODY: &str = "Securely and safely transfer your data. Review the plan, confirm what changes, and uncertainty preserves the source.";
+pub const EMPTY_OVERVIEW_PRIMARY: &str = "Create Sync Profile now";
 
 pub const POPULATED_OVERVIEW_EYEBROW: &str = "Overview";
 pub const NO_SYNC_RUN_YET: &str = "No Sync Run yet";
@@ -54,6 +55,42 @@ impl OverviewAction {
             Self::Synchronise => PRIMARY_SYNCHRONISE,
             Self::OpenRecoveryReview => PRIMARY_OPEN_RECOVERY,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OverviewActivity {
+    pub files_transferred: u64,
+    pub bytes_transferred: u64,
+    pub active_profiles: u64,
+    pub completed_runs: u64,
+}
+
+impl OverviewActivity {
+    #[cfg(test)]
+    pub const fn empty() -> Self {
+        Self {
+            files_transferred: 0,
+            bytes_transferred: 0,
+            active_profiles: 0,
+            completed_runs: 0,
+        }
+    }
+}
+
+pub fn format_transferred_data(bytes: u64) -> String {
+    const KILOBYTE: f64 = 1024.0;
+    const MEGABYTE: f64 = KILOBYTE * 1024.0;
+    const GIGABYTE: f64 = MEGABYTE * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIGABYTE {
+        format!("{:.1} GB", bytes / GIGABYTE)
+    } else if bytes >= MEGABYTE {
+        format!("{:.1} MB", bytes / MEGABYTE)
+    } else if bytes >= KILOBYTE {
+        format!("{:.0} KB", bytes / KILOBYTE)
+    } else {
+        format!("{bytes:.0} B")
     }
 }
 
@@ -203,7 +240,7 @@ pub fn run_report_status_phrase(status: RunReportStatus) -> &'static str {
 mod tests {
     use super::*;
 
-    const MARKETING_PHRASES: [&str; 3] = ["in rhythm.", "A calmer way to", "WELCOME TO SYNCPLUS"];
+    const MARKETING_PHRASES: [&str; 2] = ["in rhythm.", "A calmer way to"];
 
     fn copy_avoids_marketing(text: &str) -> bool {
         MARKETING_PHRASES.iter().all(|phrase| {
@@ -290,10 +327,18 @@ mod tests {
         assert_eq!(overview.primary_action, OverviewAction::CreateProfile);
         assert_eq!(overview.primary_action.label(), EMPTY_OVERVIEW_PRIMARY);
         assert_eq!(overview.last_run, NO_SYNC_RUN_YET);
-        assert!(overview.body.contains("confirmation"));
+        assert!(overview.body.contains("Securely and safely transfer"));
+        assert!(overview.body.contains("confirm"));
+        assert_eq!(
+            EMPTY_OVERVIEW_KICKER,
+            "Your trusted data transfer application"
+        );
         assert!(copy_avoids_marketing(&overview.title));
         assert!(copy_avoids_marketing(&overview.body));
         assert!(copy_avoids_marketing(overview.primary_action.label()));
+        assert_eq!(OverviewActivity::empty().files_transferred, 0);
+        assert_eq!(format_transferred_data(0), "0 B");
+        assert_eq!(format_transferred_data(1024 * 1024 * 1024), "1.0 GB");
     }
 
     #[test]

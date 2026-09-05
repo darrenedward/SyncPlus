@@ -18,9 +18,9 @@ use syncplus_core::{
     BackgroundScheduler, ConfirmedPlan, ConflictDecision, ConflictEntry, ConflictEntryKey,
     ConflictResolution, ConflictReview, DeletionMethod, FreshAnalysis, LocalPrecheckProbe,
     MetadataRequirements, MissedScheduleDecision, MissedScheduleNotice, OneWaySource,
-    PartialTransferPolicy, Peer, PeerEndpoint, PersistedSyncProfile, PrecheckErrorKind,
-    PrecheckResult, RecoveryMethod, RemotePrecheckRequest, ResolutionRun, RetryPolicy,
-    RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle, RunPrecheck, RunReport,
+    PartialTransferPolicy, Peer, PeerEndpoint, PersistedSyncProfile, PlanActionKind,
+    PrecheckErrorKind, PrecheckResult, RecoveryMethod, RemotePrecheckRequest, ResolutionRun,
+    RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle, RunPrecheck, RunReport,
     RunReportStatus, SavedSecretReference, ScheduleDefinition, SchedulerEvent,
     SchedulerNotification, SchedulerNotificationAction, SchedulerNotificationSink, SecretStore,
     SecretStoreError, SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions,
@@ -1777,6 +1777,36 @@ impl SyncPlusApp {
         chrome::recovery_review_is_pending(self.run_reports.iter().filter_map(|report| {
             (report.snapshot().profile().name() == self.form.name).then_some(report.status())
         }))
+    }
+
+    fn overview_activity(&self) -> chrome::OverviewActivity {
+        let mut activity = chrome::OverviewActivity {
+            files_transferred: 0,
+            bytes_transferred: 0,
+            active_profiles: self.profiles.len() as u64,
+            completed_runs: 0,
+        };
+        for report in &self.run_reports {
+            if report.status() == RunReportStatus::Completed {
+                activity.completed_runs += 1;
+            }
+            for item in report.items() {
+                if !matches!(item.outcome(), ActionOutcome::Completed) {
+                    continue;
+                }
+                if !matches!(
+                    item.operation(),
+                    PlanActionKind::CopyToDestination | PlanActionKind::OverwriteDestination
+                ) {
+                    continue;
+                }
+                activity.files_transferred += 1;
+                activity.bytes_transferred += item
+                    .progress_bytes()
+                    .max(item.journal().plan().planned_bytes().unwrap_or(0));
+            }
+        }
+        activity
     }
 
     fn profile_form_is_dirty(&self) -> bool {
@@ -3663,25 +3693,129 @@ impl SyncPlusApp {
         );
     }
 
-    fn draw_empty_welcome(&mut self, ui: &mut egui::Ui) {
+    fn draw_welcome(&mut self, ui: &mut egui::Ui) {
         let mut open_wizard = false;
-        let overview = chrome::empty_overview();
+        let mut open_sync = false;
+        let mut request_sync = false;
+        let mut open_recovery = false;
+        let has_profile = self.form.id.is_some();
+        let pending = self.recovery_review_pending_for_active_profile();
+        let overview = if has_profile {
+            chrome::populated_overview(
+                &self.form.name,
+                sync_mode_label(self.form.mode),
+                self.last_run_status_for_active_profile(),
+                pending,
+            )
+        } else {
+            chrome::empty_overview()
+        };
+        let source = endpoint_summary(&self.form.peer_a);
+        let destination = endpoint_summary(&self.form.peer_b);
+        let activity = self.overview_activity();
         egui::ScrollArea::vertical()
-            .id_salt("empty-welcome-content")
+            .id_salt("welcome-content")
             .show(ui, |ui| {
                 let content_width = ui.available_width();
                 ui.vertical(|ui| {
                     ui.set_width(content_width);
                     ui.add_space(28.0);
                     card_frame(ui).show(ui, |ui| {
-                        section_intro(ui, overview.eyebrow, &overview.title, &overview.body);
-                        ui.add_space(8.0);
-                        active_mode_badge(ui, self.settings.mode());
-                        ui.add_space(16.0);
-                        draw_endpoint_pair(ui, "Not selected", "Not selected");
-                        ui.add_space(16.0);
-                        if primary_button(ui, overview.primary_action.label()).clicked() {
-                            open_wizard = true;
+                        ui.columns(2, |columns| {
+                            columns[0].vertical(|ui| {
+                                let palette = ui_palette(ui);
+                                egui::Frame::new()
+                                    .fill(palette.field)
+                                    .stroke(egui::Stroke::new(1.0, palette.border))
+                                    .corner_radius(egui::CornerRadius::same(18))
+                                    .inner_margin(egui::Margin::symmetric(22, 22))
+                                    .show(ui, |ui| {
+                                        ui.vertical_centered(|ui| {
+                                            Self::draw_brand_mark_sized(ui, 112.0);
+                                        });
+                                    });
+                            });
+                            columns[1].vertical(|ui| {
+                                section_intro(
+                                    ui,
+                                    chrome::EMPTY_OVERVIEW_EYEBROW,
+                                    chrome::EMPTY_OVERVIEW_TITLE,
+                                    chrome::EMPTY_OVERVIEW_KICKER,
+                                );
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new(chrome::EMPTY_OVERVIEW_BODY)
+                                        .size(TypeRole::Body.size())
+                                        .color(ui_palette(ui).muted),
+                                );
+                                ui.add_space(16.0);
+                                if primary_button(ui, chrome::EMPTY_OVERVIEW_PRIMARY).clicked() {
+                                    open_wizard = true;
+                                }
+                            });
+                        });
+                    });
+                    ui.add_space(16.0);
+                    draw_overview_activity(ui, activity);
+                    ui.add_space(16.0);
+                    card_frame(ui).show(ui, |ui| {
+                        if has_profile {
+                            section_intro(ui, overview.eyebrow, &overview.title, &overview.body);
+                            ui.add_space(8.0);
+                            active_mode_badge(ui, self.settings.mode());
+                            ui.add_space(16.0);
+                            draw_endpoint_pair(ui, &source, &destination);
+                            ui.add_space(12.0);
+                            ui.label(
+                                egui::RichText::new(&overview.last_run).color(ui_palette(ui).text),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Next safe action · {}",
+                                    overview.next_safe_action
+                                ))
+                                .color(ui_palette(ui).muted),
+                            );
+                            if let Some(notice) = overview.recovery_notice {
+                                ui.add_space(10.0);
+                                let palette = ui_palette(ui);
+                                egui::Frame::new()
+                                    .fill(palette.danger_soft)
+                                    .stroke(egui::Stroke::new(1.0, palette.danger))
+                                    .corner_radius(egui::CornerRadius::same(8))
+                                    .inner_margin(egui::Margin::symmetric(12, 8))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new(notice)
+                                                .strong()
+                                                .color(palette.on_danger_soft),
+                                        );
+                                    });
+                            }
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                if primary_button(ui, overview.primary_action.label()).clicked() {
+                                    match overview.primary_action {
+                                        OverviewAction::OpenRecoveryReview => {
+                                            open_recovery = true
+                                        }
+                                        OverviewAction::Synchronise
+                                        | OverviewAction::CreateProfile => request_sync = true,
+                                    }
+                                }
+                                if secondary_button(ui, "Open Sync workspace").clicked() {
+                                    open_sync = true;
+                                }
+                            });
+                        } else {
+                            section_intro(
+                                ui,
+                                "Get started",
+                                "Create a Sync Profile",
+                                "Choose the folders, review the plan, and confirm before anything changes.",
+                            );
+                            ui.add_space(16.0);
+                            draw_endpoint_pair(ui, "Not selected", "Not selected");
                         }
                     });
                     ui.add_space(20.0);
@@ -3689,79 +3823,7 @@ impl SyncPlusApp {
             });
         if open_wizard {
             self.start_new_profile();
-        }
-    }
-
-    fn draw_welcome(&mut self, ui: &mut egui::Ui) {
-        let mut open_sync = false;
-        let mut request_sync = false;
-        let mut open_recovery = false;
-        if self.form.id.is_none() {
-            self.draw_empty_welcome(ui);
-            return;
-        }
-        let pending = self.recovery_review_pending_for_active_profile();
-        let overview = chrome::populated_overview(
-            &self.form.name,
-            sync_mode_label(self.form.mode),
-            self.last_run_status_for_active_profile(),
-            pending,
-        );
-        let source = endpoint_summary(&self.form.peer_a);
-        let destination = endpoint_summary(&self.form.peer_b);
-        egui::ScrollArea::vertical()
-            .id_salt("welcome-content")
-            .show(ui, |ui| {
-                ui.add_space(28.0);
-                card_frame(ui).show(ui, |ui| {
-                    section_intro(ui, overview.eyebrow, &overview.title, &overview.body);
-                    ui.add_space(8.0);
-                    active_mode_badge(ui, self.settings.mode());
-                    ui.add_space(16.0);
-                    draw_endpoint_pair(ui, &source, &destination);
-                    ui.add_space(12.0);
-                    ui.label(egui::RichText::new(&overview.last_run).color(ui_palette(ui).text));
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Next safe action · {}",
-                            overview.next_safe_action
-                        ))
-                        .color(ui_palette(ui).muted),
-                    );
-                    if let Some(notice) = overview.recovery_notice {
-                        ui.add_space(10.0);
-                        let palette = ui_palette(ui);
-                        egui::Frame::new()
-                            .fill(palette.danger_soft)
-                            .stroke(egui::Stroke::new(1.0, palette.danger))
-                            .corner_radius(egui::CornerRadius::same(8))
-                            .inner_margin(egui::Margin::symmetric(12, 8))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new(notice)
-                                        .strong()
-                                        .color(palette.on_danger_soft),
-                                );
-                            });
-                    }
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        if primary_button(ui, overview.primary_action.label()).clicked() {
-                            match overview.primary_action {
-                                OverviewAction::OpenRecoveryReview => open_recovery = true,
-                                OverviewAction::Synchronise | OverviewAction::CreateProfile => {
-                                    request_sync = true
-                                }
-                            }
-                        }
-                        if secondary_button(ui, "Open Sync workspace").clicked() {
-                            open_sync = true;
-                        }
-                    });
-                });
-                ui.add_space(16.0);
-            });
-        if open_sync {
+        } else if open_sync {
             self.show_sync_workspace();
         } else if open_recovery {
             self.open_recovery_review();
@@ -6267,6 +6329,36 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 3.5, color);
 }
 
+fn draw_overview_activity(ui: &mut egui::Ui, activity: chrome::OverviewActivity) {
+    let palette = ui_palette(ui);
+    ui.columns(4, |columns| {
+        for (column, (label, value)) in columns.iter_mut().zip([
+            ("Files transferred", activity.files_transferred.to_string()),
+            (
+                "Data transferred",
+                chrome::format_transferred_data(activity.bytes_transferred),
+            ),
+            ("Active profiles", activity.active_profiles.to_string()),
+            ("Completed Sync Runs", activity.completed_runs.to_string()),
+        ]) {
+            egui::Frame::new()
+                .fill(palette.field)
+                .stroke(egui::Stroke::new(1.0, palette.border))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::symmetric(14, 12))
+                .show(column, |ui| {
+                    ui.label(
+                        egui::RichText::new(value)
+                            .size(22.0)
+                            .strong()
+                            .color(palette.text),
+                    );
+                    ui.label(egui::RichText::new(label).small().color(palette.muted));
+                });
+        }
+    });
+}
+
 fn draw_endpoint_pair(ui: &mut egui::Ui, source: &str, destination: &str) {
     let palette = ui_palette(ui);
     ui.columns(2, |columns| {
@@ -8035,6 +8127,20 @@ mod tests {
                     .iter()
                     .any(|text| text.contains(crate::chrome::EMPTY_OVERVIEW_PRIMARY)),
                 "{appearance} empty Overview missing primary action in {joined}"
+            );
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains(crate::chrome::EMPTY_OVERVIEW_KICKER)),
+                "{appearance} empty Overview missing trusted-transfer copy in {joined}"
+            );
+            assert!(
+                texts.iter().any(|text| text.contains("Files transferred")),
+                "{appearance} empty Overview missing Files transferred in {joined}"
+            );
+            assert!(
+                texts.iter().any(|text| text.contains("Active profiles")),
+                "{appearance} empty Overview missing Active profiles in {joined}"
             );
             assert!(
                 texts.iter().any(|text| text.contains("Source folder")),
