@@ -4843,6 +4843,11 @@ impl SyncPlusApp {
                             .size(28.0)
                             .strong(),
                     );
+                    ui.label(
+                        egui::RichText::new(&active.profile_name)
+                            .size(16.0)
+                            .color(palette.muted),
+                    );
                     ui.label(egui::RichText::new(active.phase.detail()).color(palette.muted));
                     ui.add_space(8.0);
                     ui.label(
