@@ -529,5 +529,5 @@ The desktop GUI token set that supplies canvas (navy rail), on-canvas text, surf
 _Avoid_: Per-screen one-off colours, user-supplied chrome, colours in SQLite
 
 **Overview**:
-The home surface of the desktop app. Empty Overview explains first-run calmly and offers one action to create a Sync Profile. Populated Overview shows the active Sync Profile, last Sync Run or review state, and the next safe action.
-_Avoid_: Marketing landing page, neon hero, fake metrics
+The home surface of the desktop app. It always shows the Brand Mark, a short welcome blurb, Create Sync Profile now, and the activity stats. When a Sync Profile is selected it also shows that profile, last Sync Run or review state, and the next safe action.
+_Avoid_: Marketing landing page, neon hero, fake metrics, hiding the welcome hero after the first profile exists

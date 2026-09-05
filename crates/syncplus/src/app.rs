@@ -3958,7 +3958,6 @@ impl SyncPlusApp {
                     ui.set_width(content_width);
                     ui.add_space(28.0);
                     self.draw_fresh_analysis_banner(ui);
-                    if !has_profile {
                     card_frame(ui).show(ui, |ui| {
                         ui.columns(2, |columns| {
                             columns[0].vertical(|ui| {
@@ -3995,7 +3994,6 @@ impl SyncPlusApp {
                         });
                     });
                     ui.add_space(16.0);
-                    }
                     draw_overview_activity(ui, activity);
                     ui.add_space(16.0);
                     card_frame(ui).show(ui, |ui| {
@@ -9076,6 +9074,18 @@ mod tests {
             let mut populated = app_with_saved_profile();
             let (texts, colors) = painted_window_for(&mut populated, theme);
             let joined = texts.join("\n");
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains(crate::chrome::EMPTY_OVERVIEW_TITLE)),
+                "{appearance} populated Overview missing welcome title in {joined}"
+            );
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text.contains(crate::chrome::EMPTY_OVERVIEW_PRIMARY)),
+                "{appearance} populated Overview missing Create Sync Profile now in {joined}"
+            );
             assert!(
                 texts.iter().any(|text| text.contains("Documents backup")),
                 "{appearance} populated Overview missing Sync Profile in {joined}"
