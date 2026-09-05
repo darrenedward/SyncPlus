@@ -1218,6 +1218,7 @@ pub fn help_entry(topic: HelpTopic) -> HelpEntry {
 enum HelpSurface {
     #[allow(dead_code)]
     Profile,
+    #[allow(dead_code)]
     Plan,
     ConflictReview,
     Progress,
