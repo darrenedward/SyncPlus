@@ -1,4 +1,23 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalysisKind {
+    FolderCheck,
+    DryRun,
+}
+
+impl AnalysisKind {
+    pub const fn heading(self) -> &'static str {
+        match self {
+            Self::FolderCheck => "Checking folders",
+            Self::DryRun => "Dry run in progress",
+        }
+    }
+
+    pub const fn inventory(self) -> bool {
+        matches!(self, Self::DryRun)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisPhase {
     CheckingFolders,
     ReadingFolders,
@@ -6,7 +25,7 @@ pub enum AnalysisPhase {
 
 impl AnalysisPhase {
     pub const fn heading(self) -> &'static str {
-        "Dry run in progress"
+        AnalysisKind::DryRun.heading()
     }
 
     pub const fn detail(self) -> &'static str {

@@ -261,6 +261,10 @@ _Avoid_: An Advance tab, hiding one endpoint, moving confirmation into Options, 
 While Fresh Analysis or a Manual Sync Run is active, SyncPlus shows a progress dialog on every workspace surface. Dry run names the current phase (checking folders, then reading files), the selected paths, and elapsed time, and states that no files are being changed. An active Sync Run names the current durable action and byte progress when that evidence exists. The dialog is not proof of completion.
 _Avoid_: A status line as the only live-work signal, or implying that a transfer finished because a spinner is moving
 
+**Folder gate**:
+Opening a saved Sync Profile runs a non-mutating availability check of local source and destination folders. If a folder is missing, unmounted, or unplugged, Dry run and Synchronise stay disabled. Retry on the reconnect prompt rechecks the same saved path. Dry run is for building a plan of folders that are present; it is not how a missing drive is recovered. SSH peers stay unproven until Dry run.
+_Avoid_: Auto-starting a Sync Run on open, enabling Synchronise on a missing folder, or treating an empty plan as success
+
 **Reconnect prompt**:
 When Dry run finds a missing, unmounted, or unplugged local peer, SyncPlus opens a dialog that names the source and/or destination folder, asks the user to connect or mount it, and offers Retry. Retry repeats Run Precheck on the same saved path and does not start a Sync Run. Closing the dialog leaves the Dry run blocked banner visible. A path under a common removable-mount prefix may be described as a removable drive; SyncPlus does not name USB, DVD, or memory-card hardware unless that identity is actually known.
 _Avoid_: Auto-starting a run when a drive reappears, guessing a different path, or naming a device type that has not been identified

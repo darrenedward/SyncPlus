@@ -29,7 +29,9 @@ use syncplus_core::{
 
 use crate::chrome::{self, ChromeAccent, ChromeSurface, OverviewAction};
 use crate::theme::{BrandTheme, TypeRole};
-use crate::workspace::{self, AnalysisPhase, ReconnectPrompt, WorkspaceTab};
+use crate::workspace::{
+    self, AnalysisKind, AnalysisPhase, FolderGate, ReconnectPrompt, WorkspaceTab,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EndpointKind {
@@ -428,6 +430,7 @@ struct ActiveAnalysis {
     source: String,
     destination: String,
     phase: AnalysisPhase,
+    kind: AnalysisKind,
 }
 
 struct ActiveManualRun {
@@ -1714,6 +1717,8 @@ pub struct SyncPlusApp {
     known_scheduler_event_ids: BTreeSet<u64>,
     workspace_tab: WorkspaceTab,
     reconnect_prompt: Option<ReconnectPrompt>,
+    folder_gate: FolderGate,
+    pending_folder_check: bool,
 }
 
 impl SyncPlusApp {
@@ -1779,6 +1784,8 @@ impl SyncPlusApp {
             known_scheduler_event_ids,
             workspace_tab: WorkspaceTab::Folders,
             reconnect_prompt: None,
+            folder_gate: FolderGate::Unknown,
+            pending_folder_check: view == AppView::Sync,
         })
     }
 
@@ -2024,6 +2031,11 @@ impl SyncPlusApp {
     }
 
     pub fn start_manual_run(&mut self) -> Result<(), UiValidationError> {
+        if !self.can_synchronise() {
+            return Err(UiValidationError::Core(
+                "Synchronise is unavailable until the folders are connected and Execution Confirmation is recorded.".to_owned(),
+            ));
+        }
         if self.active_manual_run.is_some() {
             return Err(UiValidationError::Core(
                 "a manual Sync Run is already active".to_owned(),
@@ -2103,13 +2115,12 @@ impl SyncPlusApp {
     }
 
     fn request_synchronise_async(&mut self, context: &egui::Context) {
-        if self.review.is_none() {
-            if let Err(error) = self.start_analysis(context) {
-                self.status = format_form_validation_diagnostic(&self.form, &error);
-            }
-        } else {
-            self.request_synchronise();
+        let _ = context;
+        if !self.can_synchronise() {
+            self.status = "Synchronise is unavailable until the folders are connected, Fresh Analysis passes, and Execution Confirmation is recorded.".to_owned();
+            return;
         }
+        self.request_synchronise();
     }
 
     fn request_manual_cancel(&mut self, run_id: RunId) {
@@ -2677,21 +2688,23 @@ impl SyncPlusApp {
     }
 
     fn analyze_profile_snapshot(profile: SyncProfile) -> ProfileAnalysisResult {
-        Self::analyze_profile_snapshot_with_progress(profile, |_| {})
+        Self::analyze_profile_snapshot_with_progress(profile, |_| {}, AnalysisKind::DryRun)
     }
 
     fn analyze_profile_snapshot_with_progress(
         profile: SyncProfile,
         mut on_phase: impl FnMut(AnalysisPhase),
+        kind: AnalysisKind,
     ) -> ProfileAnalysisResult {
         on_phase(AnalysisPhase::CheckingFolders);
         let precheck = Self::fresh_local_precheck(&profile);
         let analysis = match &precheck {
             Ok(result)
-                if !result
-                    .blockers()
-                    .iter()
-                    .any(|blocker| blocker.kind() == PrecheckBlockerKind::PeerUnavailable) =>
+                if kind.inventory()
+                    && !result
+                        .blockers()
+                        .iter()
+                        .any(|blocker| blocker.kind() == PrecheckBlockerKind::PeerUnavailable) =>
             {
                 on_phase(AnalysisPhase::ReadingFolders);
                 Some(FreshAnalysis::analyze(&profile).map_err(|error| error.to_string()))
@@ -2779,7 +2792,58 @@ impl SyncPlusApp {
         Ok(())
     }
 
+    fn can_dry_run(&self) -> bool {
+        self.folder_gate.dry_run_enabled() && self.active_analysis.is_none()
+    }
+
+    fn can_synchronise(&self) -> bool {
+        self.folder_gate
+            .synchronise_enabled(self.review.as_ref().is_some_and(|review| review.confirmed))
+            && self.active_manual_run.is_none()
+            && self
+                .review
+                .as_ref()
+                .and_then(|review| review.precheck.as_ref())
+                .is_some_and(PrecheckResult::can_execute)
+    }
+
     fn start_analysis(&mut self, context: &egui::Context) -> Result<(), UiValidationError> {
+        self.dispatch_analysis(context, AnalysisKind::DryRun)
+    }
+
+    fn request_workspace_analysis(
+        &mut self,
+        context: &egui::Context,
+    ) -> Result<(), UiValidationError> {
+        if self.folder_gate.check_folders_enabled() {
+            self.start_folder_check(context)
+        } else if self.can_dry_run() {
+            self.start_analysis(context)
+        } else {
+            Err(UiValidationError::Core(
+                "Connect the source and destination folders before Dry run.".to_owned(),
+            ))
+        }
+    }
+
+    fn start_folder_check(&mut self, context: &egui::Context) -> Result<(), UiValidationError> {
+        if self.form.peer_a.kind == EndpointKind::Ssh || self.form.peer_b.kind == EndpointKind::Ssh
+        {
+            self.folder_gate = FolderGate::RemoteUnproven;
+            self.reconnect_prompt = None;
+            self.status =
+                "SSH peers are proven on Dry run, not when the Sync Profile is opened.".to_owned();
+            return Ok(());
+        }
+        self.folder_gate = FolderGate::Checking;
+        self.dispatch_analysis(context, AnalysisKind::FolderCheck)
+    }
+
+    fn dispatch_analysis(
+        &mut self,
+        context: &egui::Context,
+        kind: AnalysisKind,
+    ) -> Result<(), UiValidationError> {
         if self.active_analysis.is_some() {
             return Err(UiValidationError::Core(
                 "Fresh Analysis is already running.".to_owned(),
@@ -2796,18 +2860,23 @@ impl SyncPlusApp {
         thread::Builder::new()
             .name("syncplus-fresh-analysis".to_owned())
             .spawn(move || {
-                let result =
-                    SyncPlusApp::analyze_profile_snapshot_with_progress(profile, |phase| {
+                let result = SyncPlusApp::analyze_profile_snapshot_with_progress(
+                    profile,
+                    |phase| {
                         let _ = progress_sender.send(AnalysisWorkerEvent::Phase(phase));
                         repaint_context.request_repaint();
-                    });
+                    },
+                    kind,
+                );
                 let _ = sender.send(AnalysisWorkerEvent::Done(result));
                 repaint_context.request_repaint();
             })
             .map_err(|error| {
                 UiValidationError::Core(format!("could not start Fresh Analysis: {error}"))
             })?;
-        self.clear_review();
+        if kind == AnalysisKind::DryRun {
+            self.clear_review();
+        }
         self.reconnect_prompt = None;
         self.active_analysis = Some(ActiveAnalysis {
             receiver,
@@ -2816,17 +2885,46 @@ impl SyncPlusApp {
             source,
             destination,
             phase: AnalysisPhase::CheckingFolders,
+            kind,
         });
-        self.status =
-            format!("Fresh Analysis is running for {profile_name}. No files are being changed.");
+        self.status = match kind {
+            AnalysisKind::FolderCheck => {
+                format!("Checking folders for {profile_name}. No files are being changed.")
+            }
+            AnalysisKind::DryRun => {
+                format!("Fresh Analysis is running for {profile_name}. No files are being changed.")
+            }
+        };
         Ok(())
+    }
+
+    fn apply_folder_check_result(&mut self, result: ProfileAnalysisResult) {
+        let ProfileAnalysisResult {
+            profile, precheck, ..
+        } = result;
+        match precheck {
+            Ok(precheck) if precheck.can_execute() => {
+                self.folder_gate = FolderGate::Ready;
+                self.reconnect_prompt = None;
+                self.status = "Source and destination are available.".to_owned();
+            }
+            Ok(precheck) => {
+                self.folder_gate = FolderGate::Blocked;
+                self.reconnect_prompt = ReconnectPrompt::from_profile_precheck(&profile, &precheck);
+                self.status = short_precheck_block_status(&profile, &precheck);
+            }
+            Err(message) => {
+                self.folder_gate = FolderGate::Blocked;
+                self.status = short_precheck_failure_status(&message);
+            }
+        }
     }
 
     fn poll_analysis(&mut self) {
         enum Poll {
             Idle,
             Disconnected,
-            Done(ProfileAnalysisResult),
+            Done(ProfileAnalysisResult, AnalysisKind),
         }
         let poll = {
             let Some(active) = self.active_analysis.as_mut() else {
@@ -2835,7 +2933,7 @@ impl SyncPlusApp {
             loop {
                 match active.receiver.try_recv() {
                     Ok(AnalysisWorkerEvent::Phase(phase)) => active.phase = phase,
-                    Ok(AnalysisWorkerEvent::Done(result)) => break Poll::Done(result),
+                    Ok(AnalysisWorkerEvent::Done(result)) => break Poll::Done(result, active.kind),
                     Err(TryRecvError::Empty) => break Poll::Idle,
                     Err(TryRecvError::Disconnected) => break Poll::Disconnected,
                 }
@@ -2845,18 +2943,37 @@ impl SyncPlusApp {
             Poll::Idle => {}
             Poll::Disconnected => {
                 self.active_analysis = None;
+                self.folder_gate = FolderGate::Unknown;
                 self.status =
                     "Fresh Analysis stopped before returning a result. Run it again.".to_owned();
             }
-            Poll::Done(result) => {
+            Poll::Done(result, kind) => {
                 self.active_analysis = None;
                 if let Ok(current_profile) = self.form.build()
                     && current_profile != result.profile
                 {
+                    self.folder_gate = FolderGate::Unknown;
                     self.status = "Fresh Analysis finished for an older profile state; run it again to review the current fields.".to_owned();
                     return;
                 }
-                let _ = self.apply_analysis_result(result);
+                match kind {
+                    AnalysisKind::FolderCheck => self.apply_folder_check_result(result),
+                    AnalysisKind::DryRun => {
+                        let blocked = result
+                            .precheck
+                            .as_ref()
+                            .ok()
+                            .is_some_and(|precheck| !precheck.can_execute());
+                        self.folder_gate = if blocked {
+                            FolderGate::Blocked
+                        } else if result.precheck.is_ok() {
+                            FolderGate::Ready
+                        } else {
+                            FolderGate::Blocked
+                        };
+                        let _ = self.apply_analysis_result(result);
+                    }
+                }
             }
         }
     }
@@ -3280,9 +3397,11 @@ impl SyncPlusApp {
             self.review = None;
             self.reconnect_prompt = None;
             self.workspace_tab = WorkspaceTab::Folders;
+            self.folder_gate = FolderGate::Checking;
+            self.pending_folder_check = true;
             let name = profile.profile().name().to_owned();
             self.show_sync_workspace();
-            self.status = format!("Editing {name}. Changes apply to future runs.");
+            self.status = format!("Checking folders for {name}. No files are being changed.");
         }
     }
 
@@ -3915,7 +4034,18 @@ impl SyncPlusApp {
                             }
                             ui.add_space(16.0);
                             ui.horizontal(|ui| {
-                                if primary_button(ui, overview.primary_action.label()).clicked() {
+                                let sync_enabled = match overview.primary_action {
+                                    OverviewAction::Synchronise => self.can_synchronise(),
+                                    OverviewAction::CreateProfile
+                                    | OverviewAction::OpenRecoveryReview => true,
+                                };
+                                if primary_button_enabled(
+                                    ui,
+                                    overview.primary_action.label(),
+                                    sync_enabled,
+                                )
+                                .clicked()
+                                {
                                     match overview.primary_action {
                                         OverviewAction::OpenRecoveryReview => {
                                             open_recovery = true
@@ -4355,12 +4485,18 @@ impl SyncPlusApp {
                 }
                 if primary_button_enabled(
                     ui,
-                    if self.review.is_some() {
+                    if self.folder_gate.check_folders_enabled() {
+                        "Check folders"
+                    } else if self.review.is_some() {
                         "Run dry run again"
                     } else {
                         "Dry run · Analyze"
                     },
-                    self.active_analysis.is_none(),
+                    if self.folder_gate.check_folders_enabled() {
+                        self.active_analysis.is_none()
+                    } else {
+                        self.can_dry_run()
+                    },
                 )
                 .clicked()
                 {
@@ -4509,9 +4645,15 @@ impl SyncPlusApp {
                             .vertical_align(egui::Align::Center),
                     );
                     ui.add_space(16.0);
-                    draw_simple_folder_picker(ui, "Source folder", &mut self.form.peer_a);
+                    if draw_simple_folder_picker(ui, "Source folder", &mut self.form.peer_a) {
+                        self.folder_gate = FolderGate::Unknown;
+                        self.pending_folder_check = true;
+                    }
                     ui.add_space(14.0);
-                    draw_simple_folder_picker(ui, "Destination folder", &mut self.form.peer_b);
+                    if draw_simple_folder_picker(ui, "Destination folder", &mut self.form.peer_b) {
+                        self.folder_gate = FolderGate::Unknown;
+                        self.pending_folder_check = true;
+                    }
                     if self.form.mode == SyncMode::OneWay {
                         ui.add_space(10.0);
                         ui.horizontal_wrapped(|ui| {
@@ -4700,6 +4842,13 @@ impl SyncPlusApp {
         }
         if self.form != form_before_draw {
             self.clear_review();
+            if self.form.peer_a.local_path != form_before_draw.peer_a.local_path
+                || self.form.peer_b.local_path != form_before_draw.peer_b.local_path
+                || self.form.peer_a.kind != form_before_draw.peer_a.kind
+                || self.form.peer_b.kind != form_before_draw.peer_b.kind
+            {
+                self.folder_gate = FolderGate::Unknown;
+            }
             self.status =
                 "Profile changed. Fresh Analysis and confirmation are required again.".to_owned();
         }
@@ -4712,7 +4861,7 @@ impl SyncPlusApp {
         if request_save && let Err(error) = self.save_profile() {
             self.status = format_form_validation_diagnostic(&self.form, &error);
         }
-        if request_analyze && let Err(error) = self.start_analysis(ui.ctx()) {
+        if request_analyze && let Err(error) = self.request_workspace_analysis(ui.ctx()) {
             self.status = format_form_validation_diagnostic(&self.form, &error);
         }
     }
@@ -4753,7 +4902,7 @@ impl SyncPlusApp {
         if close {
             self.reconnect_prompt = None;
         } else if retry {
-            if let Err(error) = self.start_analysis(ui.ctx()) {
+            if let Err(error) = self.start_folder_check(ui.ctx()) {
                 self.status = format_form_validation_diagnostic(&self.form, &error);
             }
         }
@@ -4770,7 +4919,7 @@ impl SyncPlusApp {
                     ui.spinner();
                     ui.add_space(8.0);
                     ui.label(
-                        egui::RichText::new(active.phase.heading())
+                        egui::RichText::new(active.kind.heading())
                             .size(28.0)
                             .strong(),
                     );
@@ -4996,12 +5145,18 @@ impl SyncPlusApp {
         ui.add_space(8.0);
         if primary_button_enabled(
             ui,
-            if self.review.is_some() {
+            if self.folder_gate.check_folders_enabled() {
+                "Check folders"
+            } else if self.review.is_some() {
                 "Run dry run again"
             } else {
                 "Dry run · Analyze"
             },
-            self.active_analysis.is_none(),
+            if self.folder_gate.check_folders_enabled() {
+                self.active_analysis.is_none()
+            } else {
+                self.can_dry_run()
+            },
         )
         .clicked()
         {
@@ -5014,6 +5169,7 @@ impl SyncPlusApp {
             &mut self.help_topic,
         );
 
+        let synchronise_enabled = self.can_synchronise();
         if let Some(review) = self.review.as_mut() {
             ui.label(egui::RichText::new("This is a read-only review of the current profile. No filesystem mutation starts from this view.").color(ui_palette(ui).muted));
             card_frame(ui).show(ui, |ui| {
@@ -5167,7 +5323,9 @@ impl SyncPlusApp {
                         ui.label("Execution Confirmation recorded. No filesystem mutation has started.");
                         if self.active_manual_run.is_some() {
                             ui.label("A Manual Sync Run is active. Closing the window hides SyncPlus and leaves it running.");
-                        } else if primary_button(ui, "Synchronise").clicked() {
+                        } else if primary_button_enabled(ui, "Synchronise", synchronise_enabled)
+                            .clicked()
+                        {
                             request_start = true;
                         }
                     } else if primary_button_enabled(
@@ -5197,7 +5355,7 @@ impl SyncPlusApp {
             ui.label("No plan has been analyzed. Select Analyze current state to review the intended work.");
         }
 
-        if request_analyze && let Err(error) = self.start_analysis(ui.ctx()) {
+        if request_analyze && let Err(error) = self.request_workspace_analysis(ui.ctx()) {
             self.status = format_form_validation_diagnostic(&self.form, &error);
         }
         if request_resolution_start && let Err(error) = self.start_resolution_run() {
@@ -6073,6 +6231,13 @@ impl eframe::App for SyncPlusApp {
         self.ensure_tray(&context);
         self.process_tray_commands(&context);
         self.poll_analysis();
+        if self.pending_folder_check && self.active_analysis.is_none() {
+            self.pending_folder_check = false;
+            if let Err(error) = self.start_folder_check(&context) {
+                self.folder_gate = FolderGate::Blocked;
+                self.status = format_form_validation_diagnostic(&self.form, &error);
+            }
+        }
         self.poll_manual_run(&context);
         if !self.exit_requested && context.input(|input| input.viewport().close_requested()) {
             self.handle_close_request(&context);
@@ -7028,8 +7193,9 @@ fn draw_method_card(ui: &mut egui::Ui, selected: bool, title: &str, caption: &st
     inner.response.interact(egui::Sense::click()).clicked()
 }
 
-fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
+fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) -> bool {
     let palette = ui_palette(ui);
+    let mut browsed = false;
     ui.label(egui::RichText::new(title).size(15.0).strong());
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -7058,6 +7224,7 @@ fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut Endp
                     if endpoint.name.trim().is_empty() {
                         endpoint.name = title.to_owned();
                     }
+                    browsed = true;
                 }
             });
         }
@@ -7070,6 +7237,7 @@ fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut Endp
             .small()
             .color(palette.muted),
     );
+    browsed
 }
 
 fn draw_progress_chip(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -7527,7 +7695,11 @@ mod tests {
         assert_eq!(syncplus.view, AppView::Sync);
         assert_eq!(syncplus.form.id, Some(persisted.id()));
         assert_eq!(syncplus.form.name, "Documents backup");
-        assert!(syncplus.status().contains("Editing Documents backup"));
+        assert!(
+            syncplus
+                .status()
+                .contains("Checking folders for Documents backup")
+        );
     }
 
     #[test]
@@ -7602,6 +7774,7 @@ mod tests {
             source: "/mnt/elements/Charts".to_owned(),
             destination: "/home/curryman/Charts".to_owned(),
             phase: AnalysisPhase::CheckingFolders,
+            kind: AnalysisKind::DryRun,
         });
         app.show_profiles();
         let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
@@ -7623,6 +7796,51 @@ mod tests {
             "progress dialog must say nothing is being changed, got {joined}"
         );
         drop(sender);
+    }
+
+    #[test]
+    fn missing_folders_disable_dry_run_and_synchronise() {
+        let (mut form, _source, base) = filesystem_form();
+        form.peer_a.local_path = base.join("unplugged-source").display().to_string();
+        form.peer_b.local_path = base.join("unplugged-destination").display().to_string();
+        let mut app = app();
+        app.form = form;
+        let context = egui::Context::default();
+        app.start_folder_check(&context)
+            .expect("folder check should dispatch");
+        for _ in 0..200 {
+            app.poll_analysis();
+            if app.active_analysis.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.folder_gate, FolderGate::Blocked);
+        assert!(!app.can_dry_run());
+        assert!(!app.can_synchronise());
+        assert!(app.reconnect_prompt.is_some());
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn available_folders_allow_dry_run_but_not_synchronise() {
+        let (form, _source, base) = filesystem_form();
+        let mut app = app();
+        app.form = form;
+        let context = egui::Context::default();
+        app.start_folder_check(&context)
+            .expect("folder check should dispatch");
+        for _ in 0..200 {
+            app.poll_analysis();
+            if app.active_analysis.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.folder_gate, FolderGate::Ready);
+        assert!(app.can_dry_run());
+        assert!(!app.can_synchronise());
+        fs::remove_dir_all(base).expect("test directory cleanup");
     }
 
     #[test]
@@ -8923,7 +9141,7 @@ mod tests {
             "Sync workspace must not use an Advance tab in {joined}"
         );
         assert!(
-            joined.contains("Dry run · Analyze"),
+            joined.contains("Check folders") || joined.contains("Dry run · Analyze"),
             "Sync workspace missing Fresh Analysis in {joined}"
         );
         assert!(
