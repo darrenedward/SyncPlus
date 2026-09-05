@@ -529,6 +529,41 @@ fn missing_local_peer_is_reported_as_a_typed_blocker_before_deep_probing() {
     assert!(!blocker.remediation().is_empty());
 }
 
+#[test]
+fn local_availability_check_reports_missing_peers_without_a_full_precheck() {
+    let destination = TestTree::new();
+    let profile = profile(
+        PathBuf::from("/path/that/is-not-mounted"),
+        destination.path().to_path_buf(),
+    );
+    let result = RunPrecheck::check_local_availability(
+        &profile,
+        &crate::LocalPrecheckProbe::default(),
+    )
+    .expect("availability belongs in the result");
+    assert!(!result.can_execute());
+    assert!(
+        result
+            .blockers()
+            .iter()
+            .any(|blocker| blocker.kind() == PrecheckBlockerKind::PeerUnavailable)
+    );
+}
+
+#[test]
+fn local_availability_check_accepts_present_directories() {
+    let source = TestTree::new();
+    let destination = TestTree::new();
+    let profile = profile(source.path().to_path_buf(), destination.path().to_path_buf());
+    let result = RunPrecheck::check_local_availability(
+        &profile,
+        &crate::LocalPrecheckProbe::default(),
+    )
+    .expect("present directories should be available");
+    assert!(result.can_execute());
+    assert!(result.blockers().is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn local_precheck_rejects_real_path_aliases_before_access_or_naming_probes() {

@@ -1127,6 +1127,25 @@ impl RunPrecheck {
         Self::check_with_expected_volumes(profile, probe, None, None)
     }
 
+    /// Fast local probe: are the selected folders present as directories?
+    /// Does not walk the tree, measure space, inspect permissions, or record volume identity.
+    pub fn check_local_availability<P: PrecheckProbe>(
+        profile: &SyncProfile,
+        probe: &P,
+    ) -> Result<PrecheckResult, PrecheckErrorKind> {
+        if profile.peer_a().is_ssh() || profile.peer_b().is_ssh() {
+            return Err(PrecheckErrorKind::InvalidSpecification(
+                ProcessSpecError::UnsupportedSshFilesystemOperation,
+            ));
+        }
+        let (source_peer, destination_peer) = selected_peers(profile);
+        let source = source_peer.root();
+        let destination = destination_peer.root();
+        let mut result = PrecheckResult::new(source, destination);
+        append_availability_blockers(&mut result, profile, probe)?;
+        Ok(result)
+    }
+
     pub fn check_with_expected_volumes<P: PrecheckProbe>(
         profile: &SyncProfile,
         probe: &P,
@@ -1244,71 +1263,10 @@ impl RunPrecheck {
             return Ok(result);
         }
 
-        let source_available = probe
-            .peer_available(source, false)
-            .map_err(PrecheckErrorKind::Probe)?;
-        if !source_available {
-            result.blockers.push(PrecheckBlocker::with_reason(
-                PrecheckBlockerKind::PeerUnavailable,
-                source,
-                "the source peer must be available and be a directory",
-                "the selected source path is missing, unavailable, or not a directory",
-                "connect or mount the source peer and select an available directory, then run the precheck again",
-            ));
-        }
-
-        let destination_available = probe
-            .peer_available(destination, true)
-            .map_err(PrecheckErrorKind::Probe)?;
-        if !destination_available {
-            result.blockers.push(PrecheckBlocker::with_reason(
-                PrecheckBlockerKind::PeerUnavailable,
-                destination,
-                "the destination peer must be available or have an available parent directory",
-                "the destination path and its parent are unavailable",
-                "connect or mount the destination peer and choose an available directory, then run the precheck again",
-            ));
-        }
-        let mirror = profile.mode() == SyncMode::Mirror;
-        let reverse_source_available = if mirror {
-            probe
-                .peer_available(destination, false)
-                .map_err(PrecheckErrorKind::Probe)?
-        } else {
-            true
-        };
-        if mirror && !reverse_source_available {
-            result.blockers.push(PrecheckBlocker::with_reason(
-                PrecheckBlockerKind::PeerUnavailable,
-                destination,
-                "both Mirror peers must be available as transfer sources",
-                "Peer B is missing, unavailable, or not a directory",
-                "connect or mount Peer B, then run the precheck again",
-            ));
-        }
-        let reverse_destination_available = if mirror {
-            probe
-                .peer_available(source, true)
-                .map_err(PrecheckErrorKind::Probe)?
-        } else {
-            true
-        };
-        if mirror && !reverse_destination_available {
-            result.blockers.push(PrecheckBlocker::with_reason(
-                PrecheckBlockerKind::PeerUnavailable,
-                source,
-                "both Mirror peers must be available as transfer destinations",
-                "Peer A and its parent are unavailable",
-                "connect or mount Peer A, then run the precheck again",
-            ));
-        }
-        if !source_available
-            || !destination_available
-            || !reverse_source_available
-            || !reverse_destination_available
-        {
+        if !append_availability_blockers(&mut result, profile, probe)? {
             return Ok(result);
         }
+        let mirror = profile.mode() == SyncMode::Mirror;
 
         let source_scope = PeerScope::new(source);
         let destination_scope = PeerScope::new(destination);
@@ -1760,6 +1718,78 @@ fn append_missing_recorded_identity_blocker(
         ),
         "start a new Sync Run after the peer is available so its volume identity can be recorded",
     ));
+}
+
+fn append_availability_blockers<P: PrecheckProbe>(
+    result: &mut PrecheckResult,
+    profile: &SyncProfile,
+    probe: &P,
+) -> Result<bool, PrecheckErrorKind> {
+    let (source_peer, destination_peer) = selected_peers(profile);
+    let source = source_peer.root();
+    let destination = destination_peer.root();
+    let source_available = probe
+        .peer_available(source, false)
+        .map_err(PrecheckErrorKind::Probe)?;
+    if !source_available {
+        result.blockers.push(PrecheckBlocker::with_reason(
+            PrecheckBlockerKind::PeerUnavailable,
+            source,
+            "the source peer must be available and be a directory",
+            "the selected source path is missing, unavailable, or not a directory",
+            "connect or mount the source peer and select an available directory, then run the precheck again",
+        ));
+    }
+
+    let destination_available = probe
+        .peer_available(destination, true)
+        .map_err(PrecheckErrorKind::Probe)?;
+    if !destination_available {
+        result.blockers.push(PrecheckBlocker::with_reason(
+            PrecheckBlockerKind::PeerUnavailable,
+            destination,
+            "the destination peer must be available or have an available parent directory",
+            "the destination path and its parent are unavailable",
+            "connect or mount the destination peer and choose an available directory, then run the precheck again",
+        ));
+    }
+    let mirror = profile.mode() == SyncMode::Mirror;
+    let reverse_source_available = if mirror {
+        probe
+            .peer_available(destination, false)
+            .map_err(PrecheckErrorKind::Probe)?
+    } else {
+        true
+    };
+    if mirror && !reverse_source_available {
+        result.blockers.push(PrecheckBlocker::with_reason(
+            PrecheckBlockerKind::PeerUnavailable,
+            destination,
+            "both Mirror peers must be available as transfer sources",
+            "Peer B is missing, unavailable, or not a directory",
+            "connect or mount Peer B, then run the precheck again",
+        ));
+    }
+    let reverse_destination_available = if mirror {
+        probe
+            .peer_available(source, true)
+            .map_err(PrecheckErrorKind::Probe)?
+    } else {
+        true
+    };
+    if mirror && !reverse_destination_available {
+        result.blockers.push(PrecheckBlocker::with_reason(
+            PrecheckBlockerKind::PeerUnavailable,
+            source,
+            "both Mirror peers must be available as transfer destinations",
+            "Peer A and its parent are unavailable",
+            "connect or mount Peer A, then run the precheck again",
+        ));
+    }
+    Ok(source_available
+        && destination_available
+        && reverse_source_available
+        && reverse_destination_available)
 }
 
 fn selected_peers(profile: &SyncProfile) -> (&Peer, &Peer) {

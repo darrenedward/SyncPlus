@@ -2687,7 +2687,12 @@ impl SyncPlusApp {
         kind: AnalysisKind,
     ) -> ProfileAnalysisResult {
         on_phase(AnalysisPhase::CheckingFolders);
-        let precheck = Self::fresh_local_precheck(&profile);
+        let precheck = if kind == AnalysisKind::FolderCheck {
+            RunPrecheck::check_local_availability(&profile, &LocalPrecheckProbe::default())
+                .map_err(|error| format_precheck_error(&profile, &error))
+        } else {
+            Self::fresh_local_precheck(&profile)
+        };
         let analysis = match &precheck {
             Ok(result)
                 if kind.inventory()
@@ -4895,6 +4900,9 @@ impl SyncPlusApp {
     fn draw_activity_dialog(&self, ui: &mut egui::Ui) {
         let palette = ui_palette(ui);
         if let Some(active) = self.active_analysis.as_ref() {
+            if active.kind == AnalysisKind::FolderCheck {
+                return;
+            }
             let seconds = active.started.elapsed().as_secs();
             let clock = workspace::format_clock(seconds);
             card_frame(ui).show(ui, |ui| {
@@ -7827,6 +7835,33 @@ mod tests {
         assert!(
             joined.contains("No files are being changed."),
             "progress dialog must say nothing is being changed, got {joined}"
+        );
+        drop(sender);
+    }
+
+    #[test]
+    fn opening_a_profile_folder_check_does_not_look_like_a_running_sync() {
+        let mut app = app();
+        let (sender, receiver) = mpsc::channel();
+        app.active_analysis = Some(ActiveAnalysis {
+            receiver,
+            started: Instant::now(),
+            profile_name: "Test profile".to_owned(),
+            source: "/mnt/elements/Charts".to_owned(),
+            destination: "/home/curryman/Charts".to_owned(),
+            phase: AnalysisPhase::CheckingFolders,
+            kind: AnalysisKind::FolderCheck,
+        });
+        app.show_sync_workspace();
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
+        let joined = texts.join("\n");
+        assert!(
+            !joined.contains("Elapsed time") && !joined.contains("Files reviewed"),
+            "folder check must not look like a running job, got {joined}"
+        );
+        assert!(
+            !joined.contains("01:"),
+            "folder check must not show a leftover elapsed clock, got {joined}"
         );
         drop(sender);
     }
