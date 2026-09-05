@@ -261,6 +261,10 @@ _Avoid_: An Advance tab, stacking source above destination so the setup requires
 While Fresh Analysis or a Manual Sync Run is active, SyncPlus shows a progress dialog on every workspace surface. Dry run names the current phase (checking folders, then reading files), the selected paths, and elapsed time, and states that no files are being changed. An active Sync Run names the current durable action and byte progress when that evidence exists. The dialog is not proof of completion.
 _Avoid_: A status line as the only live-work signal, or implying that a transfer finished because a spinner is moving
 
+**Desktop notification**:
+A best-effort operating-system balloon used only while the SyncPlus window is hidden in the tray, so a settled run or scheduler event can still be noticed. The body is the reason and next action as two sentences. While the window is visible, the same text stays in the workspace notice list. Marking Review Cleared never posts a balloon: that action already happened in the open window.
+_Avoid_: Reason:/Next action: labeled dumps, or balloons for in-app actions the user just completed
+
 **Folder gate**:
 Opening a saved Sync Profile runs a non-mutating availability check of local source and destination folders. If a folder is missing, unmounted, or unplugged, Dry run and Synchronise stay disabled. Retry on the reconnect prompt rechecks the same saved path. Dry run is for building a plan of folders that are present; it is not how a missing drive is recovered. SSH peers stay unproven until Dry run.
 _Avoid_: Auto-starting a Sync Run on open, enabling Synchronise on a missing folder, or treating an empty plan as success

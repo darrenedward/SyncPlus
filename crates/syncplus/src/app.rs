@@ -22,9 +22,9 @@ use syncplus_core::{
     PrecheckBlockerKind, PrecheckErrorKind, PrecheckResult, RecoveryMethod, RemotePrecheckRequest,
     ResolutionRun, RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle,
     RunPrecheck, RunReport, RunReportStatus, SavedSecretReference, ScheduleDefinition,
-    SchedulerEvent, SchedulerNotification, SchedulerNotificationAction, SchedulerNotificationSink,
-    SecretStore, SecretStoreError, SpecialistMetadataRequirements, SshAuthentication, SyncMode,
-    SyncOptions, SyncProfile, SyncProfileId, ThemePreference,
+    SchedulerEvent, SchedulerEventKind, SchedulerNotification, SchedulerNotificationAction,
+    SchedulerNotificationSink, SecretStore, SecretStoreError, SpecialistMetadataRequirements,
+    SshAuthentication, SyncMode, SyncOptions, SyncProfile, SyncProfileId, ThemePreference,
 };
 
 use crate::chrome::{self, ChromeAccent, ChromeSurface, OverviewAction};
@@ -244,6 +244,7 @@ pub struct UiNotification {
     reason: String,
     next_action: String,
     run_id: Option<RunId>,
+    suppress_desktop: bool,
 }
 
 impl UiNotification {
@@ -271,6 +272,7 @@ fn notification_for_report(report: &RunReport) -> UiNotification {
         reason: template.reason.to_owned(),
         next_action: template.next_action.to_owned(),
         run_id: Some(report.run_id()),
+        suppress_desktop: suppress_desktop_for_report(report.status()),
     }
 }
 
@@ -281,7 +283,23 @@ fn notification_for_scheduler_event(event: &SchedulerEvent) -> UiNotification {
         reason: notification.reason().to_owned(),
         next_action: notification.next_action().to_owned(),
         run_id: Some(notification.run_id()),
+        suppress_desktop: matches!(event.kind(), SchedulerEventKind::ReviewCleared),
     }
+}
+
+fn suppress_desktop_for_report(status: RunReportStatus) -> bool {
+    matches!(
+        status,
+        RunReportStatus::ReviewCleared | RunReportStatus::InProgress
+    )
+}
+
+fn should_post_desktop_notification(window_hidden_to_tray: bool, suppress: bool) -> bool {
+    window_hidden_to_tray && !suppress
+}
+
+fn desktop_notification_body(reason: &str, next_action: &str) -> String {
+    format!("{reason}\n{next_action}")
 }
 
 struct DesktopNotificationSink;
@@ -304,7 +322,7 @@ fn deliver_desktop_notification(title: &str, reason: &str, next_action: &str) ->
     Notification::new()
         .appname("SyncPlus")
         .summary(title)
-        .body(&format!("Reason: {reason}\nNext action: {next_action}"))
+        .body(&desktop_notification_body(reason, next_action))
         .show()
         .map(|_| ())
         .map_err(|_| ())
@@ -1919,20 +1937,30 @@ impl SyncPlusApp {
                 continue;
             }
             let message = notification_for_scheduler_event(event);
-            let mut sink = DesktopNotificationSink;
-            let _ = self
-                .store
-                .deliver_scheduler_notification(event.event_id(), &mut sink);
+            if should_post_desktop_notification(
+                self.window_hidden_to_tray,
+                message.suppress_desktop,
+            ) {
+                let mut sink = DesktopNotificationSink;
+                let _ = self
+                    .store
+                    .deliver_scheduler_notification(event.event_id(), &mut sink);
+            }
             self.remember_notification(message);
         }
     }
 
     fn push_notification(&mut self, notification: UiNotification) {
-        let _ = deliver_desktop_notification(
-            &notification.title,
-            &notification.reason,
-            &notification.next_action,
-        );
+        if should_post_desktop_notification(
+            self.window_hidden_to_tray,
+            notification.suppress_desktop,
+        ) {
+            let _ = deliver_desktop_notification(
+                &notification.title,
+                &notification.reason,
+                &notification.next_action,
+            );
+        }
         self.remember_notification(notification);
     }
 
@@ -2111,6 +2139,7 @@ impl SyncPlusApp {
                 next_action: "Open Run Reports and inspect any available recovery evidence."
                     .to_owned(),
                 run_id: Some(completion.run_id),
+                suppress_desktop: false,
             });
         }
         if waiting_to_quit && durable_terminal_report {
@@ -7992,6 +8021,30 @@ mod tests {
             assert!(!message.reason.contains("password"));
             assert!(!message.next_action.contains("password"));
         }
+    }
+
+    #[test]
+    fn review_cleared_does_not_post_a_tray_balloon_from_the_open_window() {
+        assert!(suppress_desktop_for_report(RunReportStatus::ReviewCleared));
+        assert!(suppress_desktop_for_report(RunReportStatus::InProgress));
+        assert!(!suppress_desktop_for_report(RunReportStatus::Failed));
+        assert!(
+            !should_post_desktop_notification(false, false),
+            "visible windows must not post operating-system balloons"
+        );
+        assert!(
+            !should_post_desktop_notification(true, true),
+            "Review Cleared must not post a balloon even if the window is hidden"
+        );
+        assert!(should_post_desktop_notification(true, false));
+        let body = desktop_notification_body(
+            "The required review was explicitly completed after reconciliation.",
+            "Open the Run Report to review the final safety evidence.",
+        );
+        assert!(
+            !body.contains("Reason:") && !body.contains("Next action:"),
+            "desktop balloons must not look like a labeled diagnostic dump, got {body}"
+        );
     }
 
     fn report_store() -> (RunEvidenceStore, syncplus_core::RunId, syncplus_core::RunId) {
