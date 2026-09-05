@@ -2741,7 +2741,11 @@ impl SyncPlusApp {
             });
             self.status = short_precheck_block_status(&profile, &precheck);
             self.reconnect_prompt = ReconnectPrompt::from_profile_precheck(&profile, &precheck);
-            self.workspace_tab = WorkspaceTab::Plan;
+            self.workspace_tab = if self.reconnect_prompt.is_some() {
+                WorkspaceTab::Folders
+            } else {
+                WorkspaceTab::Plan
+            };
             self.review = Some(PlanReviewState {
                 profile,
                 precheck: Some(precheck),
@@ -4419,6 +4423,7 @@ impl SyncPlusApp {
         let mut request_validate = false;
         let mut request_save = false;
         let mut request_analyze = false;
+        let mut request_retry = false;
         let mut profile_to_select = None;
         let form_is_dirty = self.profile_form_is_dirty();
         let profile_options = self
@@ -4598,22 +4603,45 @@ impl SyncPlusApp {
                         );
                     });
                     ui.add_space(10.0);
+                    let retry_enabled = self.active_analysis.is_none();
+                    let source_error = self.reconnect_prompt.as_ref().and_then(|prompt| {
+                        prompt.inline_message_for_path(&self.form.peer_a.local_path)
+                    });
+                    let destination_error = self.reconnect_prompt.as_ref().and_then(|prompt| {
+                        prompt.inline_message_for_path(&self.form.peer_b.local_path)
+                    });
+                    let mut source_action = FolderPickerAction::None;
+                    let mut destination_action = FolderPickerAction::None;
                     ui.columns(2, |columns| {
-                        if draw_simple_folder_picker(
+                        source_action = draw_simple_folder_picker(
                             &mut columns[0],
                             "Source folder",
                             &mut self.form.peer_a,
-                        ) {
-                            self.pending_folder_pick = Some(PendingFolderPick::source(true));
-                        }
-                        if draw_simple_folder_picker(
+                            source_error,
+                            retry_enabled,
+                        );
+                        destination_action = draw_simple_folder_picker(
                             &mut columns[1],
                             "Destination folder",
                             &mut self.form.peer_b,
-                        ) {
+                            destination_error,
+                            retry_enabled,
+                        );
+                    });
+                    match source_action {
+                        FolderPickerAction::Browse => {
+                            self.pending_folder_pick = Some(PendingFolderPick::source(true));
+                        }
+                        FolderPickerAction::Retry => request_retry = true,
+                        FolderPickerAction::None => {}
+                    }
+                    match destination_action {
+                        FolderPickerAction::Browse => {
                             self.pending_folder_pick = Some(PendingFolderPick::destination(true));
                         }
-                    });
+                        FolderPickerAction::Retry => request_retry = true,
+                        FolderPickerAction::None => {}
+                    }
                     if self.form.mode == SyncMode::OneWay {
                         ui.add_space(8.0);
                         ui.horizontal_wrapped(|ui| {
@@ -4853,47 +4881,8 @@ impl SyncPlusApp {
         if request_analyze && let Err(error) = self.request_workspace_analysis(ui.ctx()) {
             self.status = format_form_validation_diagnostic(&self.form, &error);
         }
-    }
-
-    fn draw_reconnect_dialog(&mut self, ui: &mut egui::Ui) {
-        let Some(prompt) = self.reconnect_prompt.clone() else {
-            return;
-        };
-        let mut retry = false;
-        let mut close = false;
-        let retry_enabled = self.active_analysis.is_none();
-        let palette = ui_palette(ui);
-        egui::Frame::new()
-            .fill(palette.danger_soft)
-            .stroke(egui::Stroke::new(1.0, palette.danger))
-            .corner_radius(egui::CornerRadius::same(8))
-            .inner_margin(egui::Margin::symmetric(12, 10))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(prompt.window_title())
-                        .heading()
-                        .color(palette.on_danger_soft),
-                );
-                for line in prompt.lines() {
-                    ui.label(egui::RichText::new(line).color(palette.on_danger_soft));
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if primary_button_enabled(ui, "Retry", retry_enabled).clicked() {
-                        retry = true;
-                    }
-                    if secondary_button(ui, "Close").clicked() {
-                        close = true;
-                    }
-                });
-            });
-        ui.add_space(12.0);
-        if close {
-            self.reconnect_prompt = None;
-        } else if retry {
-            if let Err(error) = self.start_folder_check(ui.ctx()) {
-                self.status = format_form_validation_diagnostic(&self.form, &error);
-            }
+        if request_retry && let Err(error) = self.start_folder_check(ui.ctx()) {
+            self.status = format_form_validation_diagnostic(&self.form, &error);
         }
     }
 
@@ -5051,7 +5040,10 @@ impl SyncPlusApp {
         if self.active_analysis.is_some() {
             return;
         }
-        if self.reconnect_prompt.is_some() && self.view == AppView::Sync {
+        if self.reconnect_prompt.is_some()
+            && self.view == AppView::Sync
+            && self.workspace_tab == WorkspaceTab::Folders
+        {
             return;
         }
         let palette = ui_palette(ui);
@@ -6328,7 +6320,6 @@ impl SyncPlusApp {
                         self.draw_notifications(ui);
                         self.draw_missed_schedule_notices(ui);
                         self.draw_scheduler_events(ui);
-                        self.draw_reconnect_dialog(ui);
                         self.draw_fresh_analysis_banner(ui);
                         self.draw_profile_form(ui);
                         if self.workspace_tab == WorkspaceTab::Plan {
@@ -7217,16 +7208,50 @@ fn draw_method_card(ui: &mut egui::Ui, selected: bool, title: &str, caption: &st
     inner.response.interact(egui::Sense::click()).clicked()
 }
 
-fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FolderPickerAction {
+    None,
+    Browse,
+    Retry,
+}
+
+fn draw_simple_folder_picker(
+    ui: &mut egui::Ui,
+    title: &str,
+    endpoint: &mut EndpointForm,
+    error: Option<&str>,
+    retry_enabled: bool,
+) -> FolderPickerAction {
     let palette = ui_palette(ui);
-    let mut browsed = false;
+    let mut action = FolderPickerAction::None;
+    let errored = error.is_some();
     egui::Frame::new()
-        .fill(palette.elevated)
-        .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+        .fill(if errored {
+            palette.danger_soft
+        } else {
+            palette.elevated
+        })
+        .stroke(egui::Stroke::new(
+            if errored { 2.0 } else { 1.0 },
+            if errored {
+                palette.danger
+            } else {
+                palette.border_subtle
+            },
+        ))
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
-            ui.label(egui::RichText::new(title).size(14.0).strong());
+            ui.label(
+                egui::RichText::new(title)
+                    .size(14.0)
+                    .strong()
+                    .color(if errored {
+                        palette.on_danger_soft
+                    } else {
+                        palette.text
+                    }),
+            );
             ui.horizontal(|ui| {
                 ui.radio_value(&mut endpoint.kind, EndpointKind::Local, "This computer");
                 ui.radio_value(&mut endpoint.kind, EndpointKind::Ssh, "SSH peer");
@@ -7243,7 +7268,7 @@ fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut Endp
                             singleline_edit(&mut endpoint.local_path).hint_text("Select a folder"),
                         );
                         if compact_button(ui, "Browse").clicked() {
-                            browsed = true;
+                            action = FolderPickerAction::Browse;
                         }
                     });
                 }
@@ -7251,8 +7276,33 @@ fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut Endp
                     draw_compact_ssh_fields(ui, endpoint);
                 }
             }
+            if let Some(message) = error {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(message)
+                        .small()
+                        .color(palette.on_danger_soft),
+                );
+                let retry = ui
+                    .add_enabled(
+                        retry_enabled,
+                        egui::Button::new(egui::RichText::new("Retry").color(if retry_enabled {
+                            palette.on_danger_soft
+                        } else {
+                            palette.muted
+                        }))
+                        .fill(palette.surface)
+                        .stroke(egui::Stroke::new(1.0, palette.danger))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .min_size(egui::vec2(0.0, 32.0)),
+                    )
+                    .on_hover_text(workspace::RETRY_HINT);
+                if retry.clicked() {
+                    action = FolderPickerAction::Retry;
+                }
+            }
         });
-    browsed
+    action
 }
 
 fn draw_compact_ssh_fields(ui: &mut egui::Ui, endpoint: &mut EndpointForm) {
@@ -7887,6 +7937,20 @@ mod tests {
         assert!(!app.can_dry_run());
         assert!(!app.can_synchronise());
         assert!(app.reconnect_prompt.is_some());
+        app.show_sync_workspace();
+        let typical = Some(egui::vec2(1280.0, 720.0));
+        let (texts, colors) =
+            painted_shapes_for_size(&mut app, ThemePreference::Dark, false, typical);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("This folder is not connected"),
+            "blocked folders must show an inline error on the section, got {joined}"
+        );
+        assert!(
+            colors.contains(&BrandTheme::desktop().danger)
+                && colors.contains(&BrandTheme::desktop().danger_soft),
+            "blocked folder sections must glow red"
+        );
         fs::remove_dir_all(base).expect("test directory cleanup");
     }
 
@@ -7958,48 +8022,49 @@ mod tests {
 
         assert!(
             app.reconnect_prompt.is_some(),
-            "unavailable peers must open a reconnect prompt"
+            "unavailable peers must keep a reconnect prompt"
         );
-        assert_eq!(app.workspace_tab, WorkspaceTab::Plan);
+        assert_eq!(app.workspace_tab, WorkspaceTab::Folders);
 
         let typical = Some(egui::vec2(1280.0, 720.0));
         app.show_sync_workspace();
-        let (texts, _) = painted_shapes_for_size(&mut app, ThemePreference::Dark, false, typical);
+        let (texts, colors) =
+            painted_shapes_for_size(&mut app, ThemePreference::Dark, false, typical);
         let joined = texts.join("\n");
         assert!(
             texts
                 .iter()
-                .any(|text| text.contains("Folder not connected")
-                    || text.contains("Folders not connected")),
-            "Sync workspace must open a reconnect dialog, got {joined}"
+                .any(|text| text.contains("This folder is not connected")),
+            "unavailable folder must glow on its source or destination section, got {joined}"
         );
         assert!(
             joined.contains("Retry"),
-            "reconnect dialog must offer Retry, got {joined}"
-        );
-        assert!(
-            joined.contains("does not start a Sync Run"),
-            "Retry must not imply a Sync Run has started, got {joined}"
+            "folder section must offer Retry, got {joined}"
         );
         assert!(
             joined.contains("unplugged-source") || joined.contains("unplugged-destination"),
             "blocked dry run must name the missing peer path, got {joined}"
         );
         assert!(
-            joined.contains("Connect or mount") || joined.contains("removable drive"),
+            joined.contains("Connect or mount") || joined.contains("Plug the drive in"),
             "blocked dry run must say to connect or mount the folder, got {joined}"
+        );
+        assert!(
+            colors.contains(&BrandTheme::desktop().danger)
+                && colors.contains(&BrandTheme::desktop().danger_soft),
+            "unavailable folder section must glow red, got colors {colors:?}"
         );
         assert!(
             !joined.contains("os error") && !joined.contains("Account: not applicable"),
             "blocked dry run must not lead with a duplicated technical dump, got {joined}"
         );
 
-        app.reconnect_prompt = None;
+        app.workspace_tab = WorkspaceTab::Plan;
         let (texts, _) = painted_shapes_for_size(&mut app, ThemePreference::Dark, false, typical);
         let joined = texts.join("\n");
         assert!(
             texts.iter().any(|text| text.contains("Dry run blocked")),
-            "closing the reconnect dialog must leave the Dry run blocked banner, got {joined}"
+            "Plan must still explain the blocked Dry run, got {joined}"
         );
 
         app.show_welcome();

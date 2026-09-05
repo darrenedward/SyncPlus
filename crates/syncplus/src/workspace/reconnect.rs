@@ -10,17 +10,6 @@ pub enum FolderRole {
     PeerB,
 }
 
-impl FolderRole {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Source => "source",
-            Self::Destination => "destination",
-            Self::PeerA => "Peer A",
-            Self::PeerB => "Peer B",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnavailableFolder {
     pub role: FolderRole,
@@ -28,9 +17,15 @@ pub struct UnavailableFolder {
     pub looks_removable: bool,
 }
 
+pub const RETRY_HINT: &str = "Retry checks the same saved path. It does not start a Sync Run.";
+
 impl UnavailableFolder {
-    pub fn headline(&self) -> String {
-        format!("The {} folder is not connected.", self.role.label())
+    pub fn inline_message(&self) -> &'static str {
+        if self.looks_removable {
+            "This folder is not connected. Plug the drive in, then retry."
+        } else {
+            "This folder is not connected. Connect or mount it, then retry."
+        }
     }
 }
 
@@ -74,31 +69,14 @@ impl ReconnectPrompt {
         (!folders.is_empty()).then_some(Self { folders })
     }
 
-    pub fn window_title(&self) -> &'static str {
-        if self.folders.len() > 1 {
-            "Folders not connected"
-        } else {
-            "Folder not connected"
-        }
+    pub fn folder_matching_path(&self, path: &str) -> Option<&UnavailableFolder> {
+        let path = std::path::Path::new(path.trim());
+        self.folders.iter().find(|folder| folder.path == path)
     }
 
-    pub fn lines(&self) -> Vec<String> {
-        let mut lines = Vec::new();
-        for folder in &self.folders {
-            lines.push(folder.headline());
-            lines.push(folder.path.display().to_string());
-            if folder.looks_removable {
-                lines.push(
-                    "This looks like a removable drive. Plug it in, wait until the folder is available, then retry."
-                        .to_owned(),
-                );
-            } else {
-                lines.push("Connect or mount this folder, then retry.".to_owned());
-            }
-        }
-        lines.push("Retry checks the same saved path. It does not start a Sync Run.".to_owned());
-        lines.push("No files were changed.".to_owned());
-        lines
+    pub fn inline_message_for_path(&self, path: &str) -> Option<&'static str> {
+        self.folder_matching_path(path)
+            .map(UnavailableFolder::inline_message)
     }
 }
 
@@ -118,7 +96,9 @@ fn mapped_peers(profile: &SyncProfile) -> (&syncplus_core::Peer, &syncplus_core:
 
 #[cfg(test)]
 mod tests {
-    use super::{FolderRole, ReconnectPrompt, UnavailableFolder, looks_like_removable_mount};
+    use super::{
+        FolderRole, RETRY_HINT, ReconnectPrompt, UnavailableFolder, looks_like_removable_mount,
+    };
     use std::path::PathBuf;
 
     fn prompt(folders: Vec<UnavailableFolder>) -> ReconnectPrompt {
@@ -144,9 +124,12 @@ mod tests {
             path: PathBuf::from("/mnt/elements/Charts"),
             looks_removable: true,
         }])
-        .lines()
-        .join("\n");
-        assert!(copy.contains("removable drive"));
+        .inline_message_for_path("/mnt/elements/Charts")
+        .expect("source path");
+        assert_eq!(
+            copy,
+            "This folder is not connected. Plug the drive in, then retry."
+        );
         assert!(!copy.to_ascii_lowercase().contains("dvd"));
         assert!(!copy.to_ascii_lowercase().contains("cd-rom"));
         assert!(!copy.to_ascii_lowercase().contains("usb"));
@@ -160,16 +143,37 @@ mod tests {
             path: PathBuf::from("/mnt/elements/Charts"),
             looks_removable: true,
         }]);
-        assert_eq!(copy.window_title(), "Folder not connected");
-        let joined = copy.lines().join("\n");
-        assert!(joined.contains("The source folder is not connected."));
-        assert!(joined.contains("/mnt/elements/Charts"));
-        assert!(joined.contains("Retry checks the same saved path. It does not start a Sync Run."));
-        assert!(joined.contains("No files were changed."));
+        assert_eq!(
+            copy.inline_message_for_path("/mnt/elements/Charts"),
+            Some("This folder is not connected. Plug the drive in, then retry.")
+        );
+        assert_eq!(
+            copy.folder_matching_path("/mnt/elements/Charts")
+                .map(|folder| folder.role),
+            Some(FolderRole::Source)
+        );
+        assert_eq!(
+            RETRY_HINT,
+            "Retry checks the same saved path. It does not start a Sync Run."
+        );
     }
 
     #[test]
-    fn both_peers_use_the_plural_window_title() {
+    fn destination_error_stays_on_the_destination_path() {
+        let copy = prompt(vec![UnavailableFolder {
+            role: FolderRole::Destination,
+            path: PathBuf::from("/home/curryman/Charts"),
+            looks_removable: false,
+        }]);
+        assert_eq!(
+            copy.inline_message_for_path("/home/curryman/Charts"),
+            Some("This folder is not connected. Connect or mount it, then retry.")
+        );
+        assert_eq!(copy.inline_message_for_path("/mnt/elements/Charts"), None);
+    }
+
+    #[test]
+    fn both_peers_keep_independent_inline_messages() {
         let copy = prompt(vec![
             UnavailableFolder {
                 role: FolderRole::Source,
@@ -178,13 +182,17 @@ mod tests {
             },
             UnavailableFolder {
                 role: FolderRole::Destination,
-                path: PathBuf::from("/mnt/b"),
-                looks_removable: true,
+                path: PathBuf::from("/home/curryman/Charts"),
+                looks_removable: false,
             },
         ]);
-        assert_eq!(copy.window_title(), "Folders not connected");
-        let joined = copy.lines().join("\n");
-        assert!(joined.contains("The source folder is not connected."));
-        assert!(joined.contains("The destination folder is not connected."));
+        assert_eq!(
+            copy.inline_message_for_path("/mnt/a"),
+            Some("This folder is not connected. Plug the drive in, then retry.")
+        );
+        assert_eq!(
+            copy.inline_message_for_path("/home/curryman/Charts"),
+            Some("This folder is not connected. Connect or mount it, then retry.")
+        );
     }
 }
