@@ -1493,6 +1493,117 @@ fn format_precheck_diagnostic(
     )
 }
 
+fn peer_folder_role(profile: &SyncProfile, path: &std::path::Path) -> &'static str {
+    let (source, destination) = mapped_peers(profile);
+    if path == source.root() {
+        if profile.mode() == SyncMode::OneWay {
+            "source"
+        } else {
+            "Peer A"
+        }
+    } else if path == destination.root() {
+        if profile.mode() == SyncMode::OneWay {
+            "destination"
+        } else {
+            "Peer B"
+        }
+    } else {
+        "selected"
+    }
+}
+
+fn format_blocker_explanation(
+    profile: &SyncProfile,
+    blocker: &syncplus_core::PrecheckBlocker,
+) -> Vec<String> {
+    if blocker.kind() == PrecheckBlockerKind::PeerUnavailable {
+        return vec![
+            format!(
+                "The {} folder is not available.",
+                peer_folder_role(profile, blocker.path())
+            ),
+            blocker.path().display().to_string(),
+            "Connect or mount this folder, then run Dry run again.".to_owned(),
+        ];
+    }
+    vec![
+        blocker.reason().to_owned(),
+        blocker.path().display().to_string(),
+        blocker.remediation().to_owned(),
+    ]
+}
+
+fn short_precheck_block_status(profile: &SyncProfile, precheck: &PrecheckResult) -> String {
+    let unavailable = precheck
+        .blockers()
+        .iter()
+        .filter(|blocker| blocker.kind() == PrecheckBlockerKind::PeerUnavailable)
+        .collect::<Vec<_>>();
+    match unavailable.as_slice() {
+        [blocker] => format!(
+            "The {} folder is not available. Connect or mount {}, then run Dry run again.",
+            peer_folder_role(profile, blocker.path()),
+            blocker.path().display()
+        ),
+        [_, _, ..] => {
+            "The source and destination folders are not available. Connect or mount them, then run Dry run again.".to_owned()
+        }
+        [] => "Fresh precheck found blockers; execution is not available.".to_owned(),
+    }
+}
+
+fn looks_like_missing_device(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("no such device")
+        || lower.contains("os error 19")
+        || lower.contains("no medium found")
+        || lower.contains("stale file handle")
+        || lower.contains("peer path is unavailable")
+}
+
+fn short_precheck_failure_status(message: &str) -> String {
+    if looks_like_missing_device(message) {
+        "The selected folder is not available. Connect or mount the drive, then run Dry run again."
+            .to_owned()
+    } else {
+        "Fresh precheck could not complete. Nothing was changed.".to_owned()
+    }
+}
+
+fn format_review_error_explanation(error: &str) -> Vec<String> {
+    if looks_like_missing_device(error) {
+        if let Some(scope) = structured_diagnostic_field(error, "Scope") {
+            return vec![
+                "The selected folder is not available.".to_owned(),
+                scope,
+                "Connect or mount this folder, then run Dry run again.".to_owned(),
+            ];
+        }
+        return vec![
+            "The selected folder is not available.".to_owned(),
+            "Connect or mount the drive, then run Dry run again.".to_owned(),
+        ];
+    }
+    if let Some(reason) = structured_diagnostic_field(error, "Reason") {
+        let mut lines = vec![reason];
+        if let Some(scope) = structured_diagnostic_field(error, "Scope") {
+            lines.push(scope);
+        }
+        if let Some(next) = structured_diagnostic_field(error, "Next action") {
+            lines.push(next);
+        }
+        return lines;
+    }
+    vec![error.to_owned()]
+}
+
+fn structured_diagnostic_field(text: &str, field: &str) -> Option<String> {
+    let marker = format!("{field}: ");
+    let remainder = text.split(&marker).nth(1)?;
+    let value = remainder.split(" | ").next().unwrap_or(remainder).trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 fn format_precheck_error(profile: &SyncProfile, error: &PrecheckErrorKind) -> String {
     match error {
         PrecheckErrorKind::InvalidSpecification(error) => format_profile_diagnostic(
@@ -2584,8 +2695,8 @@ impl SyncPlusApp {
         let precheck = match precheck {
             Ok(precheck) => precheck,
             Err(message) => {
+                self.status = short_precheck_failure_status(&message);
                 self.store_review_failure(profile, None, message.clone());
-                self.status = format!("Fresh precheck could not complete: {message}");
                 return Err(UiValidationError::Core(message));
             }
         };
@@ -2596,6 +2707,7 @@ impl SyncPlusApp {
                 (profile.mode() == SyncMode::Mirror)
                     .then(|| ConflictReviewState::from_analysis(analysis))
             });
+            self.status = short_precheck_block_status(&profile, &precheck);
             self.review = Some(PlanReviewState {
                 profile,
                 precheck: Some(precheck),
@@ -2605,7 +2717,6 @@ impl SyncPlusApp {
                 stronger_confirmation_path: String::new(),
                 confirmed: false,
             });
-            self.status = "Fresh precheck found blockers; execution is not available.".to_owned();
             return Err(UiValidationError::PrecheckBlocked);
         }
 
@@ -4645,7 +4756,13 @@ impl SyncPlusApp {
                                 .strong()
                                 .color(palette.on_danger_soft),
                         );
-                        ui.label(egui::RichText::new(&self.status).color(palette.on_danger_soft));
+                        for line in format_review_error_explanation(&self.status) {
+                            ui.label(egui::RichText::new(line).color(palette.on_danger_soft));
+                        }
+                        ui.label(
+                            egui::RichText::new("No files were changed.")
+                                .color(palette.on_danger_soft),
+                        );
                     });
                 ui.add_space(12.0);
             }
@@ -4654,6 +4771,21 @@ impl SyncPlusApp {
         if !review.is_blocked() {
             return;
         }
+        let lines = if let Some(precheck) = review
+            .precheck
+            .as_ref()
+            .filter(|precheck| !precheck.can_execute())
+        {
+            precheck
+                .blockers()
+                .iter()
+                .flat_map(|blocker| format_blocker_explanation(&review.profile, blocker))
+                .collect::<Vec<_>>()
+        } else if let Some(error) = review.error.as_ref() {
+            format_review_error_explanation(error)
+        } else {
+            vec![self.status.clone()]
+        };
         egui::Frame::new()
             .fill(palette.danger_soft)
             .stroke(egui::Stroke::new(1.0, palette.danger))
@@ -4665,15 +4797,12 @@ impl SyncPlusApp {
                         .strong()
                         .color(palette.on_danger_soft),
                 );
-                ui.label(egui::RichText::new(&self.status).color(palette.on_danger_soft));
-                if let Some(precheck) = review.precheck.as_ref() {
-                    for blocker in precheck.blockers() {
-                        ui.label(format_precheck_diagnostic(&review.profile, blocker));
-                    }
+                for line in lines {
+                    ui.label(egui::RichText::new(line).color(palette.on_danger_soft));
                 }
-                if let Some(error) = &review.error {
-                    ui.label(error);
-                }
+                ui.label(
+                    egui::RichText::new("No files were changed.").color(palette.on_danger_soft),
+                );
             });
         ui.add_space(12.0);
     }
@@ -4745,12 +4874,19 @@ impl SyncPlusApp {
                         topic,
                         &mut self.help_topic,
                     );
-                    ui.label(format_profile_diagnostic(
-                        &review.profile,
-                        None,
-                        error,
-                        next_action_for_help_topic(topic),
-                    ));
+                    for line in format_review_error_explanation(error) {
+                        ui.label(line);
+                    }
+                    egui::CollapsingHeader::new("Technical diagnostic")
+                        .id_salt("review-error-diagnostic")
+                        .show(ui, |ui| {
+                            ui.label(format_profile_diagnostic(
+                                &review.profile,
+                                None,
+                                error,
+                                next_action_for_help_topic(topic),
+                            ));
+                        });
                 });
             }
 
@@ -4777,9 +4913,15 @@ impl SyncPlusApp {
                         "Fresh precheck: blocked"
                     });
                     for blocker in precheck.blockers() {
-                        ui.label(format!("BLOCKER [{:?}]", blocker.kind()));
-                        ui.label(format_precheck_diagnostic(&review.profile, blocker));
-                        ui.label(format!("Requirement: {}", blocker.requirement()));
+                        for line in format_blocker_explanation(&review.profile, blocker) {
+                            ui.label(line);
+                        }
+                        egui::CollapsingHeader::new("Technical diagnostic")
+                            .id_salt(blocker.path())
+                            .show(ui, |ui| {
+                                ui.label(format_precheck_diagnostic(&review.profile, blocker));
+                                ui.label(format!("Requirement: {}", blocker.requirement()));
+                            });
                     }
                     for warning in precheck.warnings() {
                         ui.label(format!(
@@ -7187,10 +7329,13 @@ mod tests {
                 .any(|blocker| blocker.kind() == PrecheckBlockerKind::PeerUnavailable)
         );
         assert!(
-            app.status().contains("blocker")
-                || app.status().contains("unavailable")
-                || app.status().contains("Fresh precheck"),
-            "status should explain the blocked dry run, got {}",
+            app.status().contains("not available"),
+            "status should explain the unavailable folder in plain language, got {}",
+            app.status()
+        );
+        assert!(
+            !app.status().contains("os error") && !app.status().contains("Account:"),
+            "status should not dump the technical diagnostic, got {}",
             app.status()
         );
 
@@ -7203,8 +7348,27 @@ mod tests {
             "Sync workspace must show a Dry run blocked banner at typical height, got {joined}"
         );
         assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("The source folder is not available.")
+                    || text.contains("The destination folder is not available.")),
+            "Sync workspace must explain the missing folder in plain language, got {joined}"
+        );
+        assert!(
             joined.contains("unplugged-source") || joined.contains("unplugged-destination"),
             "blocked dry run must name the missing peer path, got {joined}"
+        );
+        assert!(
+            joined.contains("Connect or mount"),
+            "blocked dry run must say to connect or mount the folder, got {joined}"
+        );
+        assert!(
+            joined.contains("No files were changed."),
+            "blocked dry run must say nothing was changed, got {joined}"
+        );
+        assert!(
+            !joined.contains("os error") && !joined.contains("Account: not applicable"),
+            "blocked dry run must not lead with a duplicated technical dump, got {joined}"
         );
 
         app.show_welcome();
@@ -7213,6 +7377,13 @@ mod tests {
         assert!(
             texts.iter().any(|text| text.contains("Dry run blocked")),
             "Overview must show a Dry run blocked banner at typical height, got {joined}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("The source folder is not available.")
+                    || text.contains("The destination folder is not available.")),
+            "Overview must explain the missing folder in plain language, got {joined}"
         );
 
         fs::remove_dir_all(base).expect("test directory cleanup");

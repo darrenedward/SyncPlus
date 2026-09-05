@@ -10,7 +10,7 @@ use unicode_normalization::UnicodeNormalization;
 use crate::{
     DeletionMethod, Peer, PeerScope, PeerScopeLock, PeerScopeLockRegistry, ProcessSpecError,
     ProcessSpecification, ScopeLockConflict, ScopeLockOwner, SyncMode, SyncProfile,
-    ValidatedSyncOptions, VolumeIdentity, VolumeIdentityError,
+    ValidatedSyncOptions, VolumeIdentity,
     ResolvedSshCredential, SshHost, SshHostTrustPermit, SshPeer,
 };
 
@@ -1835,11 +1835,21 @@ impl PrecheckProbe for LocalPrecheckProbe {
     }
 
     fn peer_available(&self, path: &Path, destination: bool) -> Result<bool, PrecheckError> {
-        Ok(if path.exists() {
-            path.is_dir()
-        } else {
-            destination && path.parent().is_some_and(Path::is_dir)
-        })
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if crate::volume::io_error_means_unavailable(&error) => {
+                if destination && error.kind() == io::ErrorKind::NotFound {
+                    Ok(path.parent().is_some_and(|parent| {
+                        fs::symlink_metadata(parent)
+                            .map(|metadata| metadata.is_dir())
+                            .unwrap_or(false)
+                    }))
+                } else {
+                    Ok(false)
+                }
+            }
+            Err(_) => Ok(false),
+        }
     }
 
     fn scopes_overlap(&self, source: &Path, destination: &Path) -> Result<bool, PrecheckError> {
@@ -1868,7 +1878,7 @@ impl PrecheckProbe for LocalPrecheckProbe {
     fn volume_identity(&self, path: &Path) -> Result<Option<VolumeIdentity>, PrecheckError> {
         match VolumeIdentity::capture(path) {
             Ok(identity) => Ok(Some(identity)),
-            Err(VolumeIdentityError::Unavailable(_)) => Ok(None),
+            Err(error) if error.indicates_unavailable_peer() => Ok(None),
             Err(error) => Err(PrecheckError::new(
                 path,
                 "inspect local volume identity",
