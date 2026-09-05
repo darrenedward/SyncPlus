@@ -303,6 +303,7 @@ SyncPlus/
 ├── Cargo.toml
 ├── README.md
 ├── rustfmt.toml
+├── docs/brand/           # Public Brand Kit: mark, wordmark, lockup, GitHub, Facebook
 ├── crates/
 │   ├── syncplus-core/
 │   │   └── src/
@@ -329,6 +330,7 @@ SyncPlus/
 │       └── src/
 │           ├── main.rs
 │           ├── brand_mark.rs     # Brand Mark catalog and window icon loader
+│           ├── brand_kit.rs      # Public Brand Kit file, size, and promise contracts
 │           ├── app.rs            # UI state machine and event handling
 │           ├── chrome.rs         # sidebar destinations and Overview identity
 │           ├── theme.rs
@@ -401,7 +403,7 @@ Each milestone must be independently testable and leave the workspace buildable.
 - **M8 — Scheduling v1:** per-user background scheduler, profile authorization wizard, missed-run/catch-up behavior, retry/backoff, tray/quit behavior, notifications.
 - **M9 — Release hardening:** real external filesystem matrix, crash/interrupt tests, permission fixtures, SQLite corruption/recovery, SSH failure matrix, packaging, documentation, and release gates.
 
-The release artifact includes a versioned Debian package (`.deb`) for the supported Linux architecture, a desktop entry, application icons, Help/docs assets, and the per-user Background Scheduler integration. Installation must not enable a root daemon or grant runtime privileges. The desktop menu icon and the window icon are the same Brand Mark: one SVG source plus hicolor rasters (16–512px), with light and monochrome variants so the mark remains legible on ink and paper.
+The release artifact includes a versioned Debian package (`.deb`) for the supported Linux architecture, a desktop entry, application icons, Help/docs assets, and the per-user Background Scheduler integration. Installation must not enable a root daemon or grant runtime privileges. The desktop menu icon and the window icon are the same Brand Mark: one SVG source plus hicolor rasters (16–512px), with light and monochrome variants so the mark remains legible on ink and paper. Public GitHub and Facebook identity lives in the Brand Kit at `docs/brand/`, rebuilt with `./packaging/brand/render-kit.sh`.
 
 ## Required tests and release gates
 
@@ -497,7 +499,7 @@ Examples of required messages:
 
 ## Follow-on visual identity
 
-Brand Theme tokens for Dark Appearance and Light Appearance live in `crates/syncplus/src/theme.rs`. Core still stores only the named preference System, Light, or Dark. Brand Mark catalog and window icon loading live in `crates/syncplus/src/brand_mark.rs`. Navigation chrome and Overview identity live in `crates/syncplus/src/chrome.rs`. Workspace type roles, Help grouping, and Execution Confirmation presentation live in the desktop GUI. The public Brand Kit remains follow-on work and must not weaken the v1 safety contract.
+Brand Theme tokens for Dark Appearance and Light Appearance live in `crates/syncplus/src/theme.rs`. Core still stores only the named preference System, Light, or Dark. Brand Mark catalog and window icon loading live in `crates/syncplus/src/brand_mark.rs`. Navigation chrome and Overview identity live in `crates/syncplus/src/chrome.rs`. Workspace type roles, Help grouping, and Execution Confirmation presentation live in the desktop GUI. The public Brand Kit lives under `docs/brand/` and must not weaken the v1 safety contract.
 
 ## Deferred design work
 

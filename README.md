@@ -1,6 +1,10 @@
 # SyncPlus
 
-SyncPlus is a safety-first Linux desktop application for reviewing and applying local and SSH file synchronization. It uses rsync for transfer while adding explicit planning, conflict review, SHA-256 verification, recovery, and durable reporting.
+![SyncPlus](docs/brand/lockup/lockup-dark.svg)
+
+Review the plan. Confirm what changes. Uncertainty preserves the source.
+
+SyncPlus is a safety-first Linux desktop application for reviewing and applying local and SSH file synchronization. It uses rsync for transfer while adding explicit planning, conflict review, SHA-256 verification, recovery, and durable reporting. Public identity assets live in the [Brand Kit](docs/brand/README.md).
 
 The project is currently specification-first. See [PLAN.md](PLAN.md) for the implementation plan and [CONTEXT.md](CONTEXT.md) for canonical terminology and safety invariants.
 

@@ -9,6 +9,8 @@
 )]
 
 mod app;
+#[cfg(test)]
+mod brand_kit;
 mod brand_mark;
 mod chrome;
 mod theme;
