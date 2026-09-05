@@ -55,6 +55,23 @@ impl TypeRole {
     }
 }
 
+/// Height of a single-line form field. egui has no Bootstrap sheet; this is
+/// the shared field size, and [`singleline_edit`] centers the inner text.
+pub const FIELD_HEIGHT: f32 = 36.0;
+
+pub fn singleline_edit(text: &mut String) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text)
+        .vertical_align(egui::Align::Center)
+        .min_size(egui::vec2(0.0, FIELD_HEIGHT))
+}
+
+pub fn add_singleline(ui: &mut egui::Ui, text: &mut String, width: f32) -> egui::Response {
+    ui.add_sized(
+        egui::vec2(width.max(0.0), FIELD_HEIGHT),
+        singleline_edit(text),
+    )
+}
+
 impl BrandTheme {
     /// Navy rail, white workspace, blue primary. Token names `copper` and
     /// `steel` remain the primary and companion accents.
@@ -168,6 +185,7 @@ impl BrandTheme {
         style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
         style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
         style.visuals.widgets.open.corner_radius = egui::CornerRadius::same(8);
+        style.spacing.interact_size.y = FIELD_HEIGHT;
     }
 }
 
@@ -312,6 +330,7 @@ mod tests {
         assert_eq!(style.visuals.warn_fg_color, theme.warning);
         assert_eq!(style.visuals.error_fg_color, theme.danger);
         assert_eq!(style.visuals.widgets.hovered.bg_stroke.color, theme.copper);
+        assert_eq!(style.spacing.interact_size.y, FIELD_HEIGHT);
     }
 
     #[test]

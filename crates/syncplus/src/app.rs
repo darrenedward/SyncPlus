@@ -28,7 +28,7 @@ use syncplus_core::{
 };
 
 use crate::chrome::{self, ChromeAccent, ChromeSurface, OverviewAction};
-use crate::theme::{BrandTheme, TypeRole};
+use crate::theme::{self, BrandTheme, TypeRole, add_singleline, singleline_edit};
 use crate::tray::{self, TrayCommand, TrayRuntime};
 use crate::workspace::{
     self, AnalysisKind, AnalysisPhase, FolderGate, ReconnectPrompt, WorkspaceTab,
@@ -4169,10 +4169,7 @@ impl SyncPlusApp {
                                 ui.label(egui::RichText::new("Profile name").strong());
                                 ui.label(egui::RichText::new("A short name such as “Home archive” or “Work files”.").small().color(palette.muted));
                                 ui.add_space(6.0);
-                                ui.add_sized(
-                                    egui::vec2(ui.available_width(), 42.0),
-                                    egui::TextEdit::singleline(&mut self.form.name),
-                                );
+                                add_singleline(ui, &mut self.form.name, ui.available_width());
                                 ui.add_space(18.0);
                                 ui.label(egui::RichText::new("Sync method").strong());
                                 ui.label(egui::RichText::new("Choose the direction model for this profile.").small().color(palette.muted));
@@ -4558,10 +4555,8 @@ impl SyncPlusApp {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Task name").strong());
                         ui.add_sized(
-                            egui::vec2(ui.available_width(), 32.0),
-                            egui::TextEdit::singleline(&mut self.form.name)
-                                .hint_text("Documents backup")
-                                .vertical_align(egui::Align::Center),
+                            egui::vec2(ui.available_width(), theme::FIELD_HEIGHT),
+                            singleline_edit(&mut self.form.name).hint_text("Documents backup"),
                         );
                     });
                     ui.add_space(10.0);
@@ -4724,9 +4719,11 @@ impl SyncPlusApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Retry attempts");
-                        ui.add(egui::TextEdit::singleline(&mut self.form.retry_attempts).desired_width(55.0));
+                        ui.add(singleline_edit(&mut self.form.retry_attempts).desired_width(55.0));
                         ui.label("Initial delay (ms)");
-                        ui.add(egui::TextEdit::singleline(&mut self.form.retry_delay_millis).desired_width(75.0));
+                        ui.add(
+                            singleline_edit(&mut self.form.retry_delay_millis).desired_width(75.0),
+                        );
                     });
                     ui.separator();
                     ui.label("Background Scheduler (Advanced Mode only)");
@@ -4737,13 +4734,12 @@ impl SyncPlusApp {
                     ui.horizontal(|ui| {
                         ui.label("Every (minutes)");
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.form.schedule_interval_minutes)
+                            singleline_edit(&mut self.form.schedule_interval_minutes)
                                 .desired_width(70.0),
                         );
                         ui.label("Timezone");
                         ui.add(
-                            egui::TextEdit::singleline(&mut self.form.schedule_timezone)
-                                .desired_width(150.0),
+                            singleline_edit(&mut self.form.schedule_timezone).desired_width(150.0),
                         );
                     });
                     ui.label("Scheduled launches run as this OS user through the same safety workflow; no root service or hidden credential prompt is used.");
@@ -7138,10 +7134,8 @@ fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut Endp
                             (ui.available_width() - browse_width - ui.spacing().item_spacing.x)
                                 .max(80.0);
                         ui.add_sized(
-                            egui::vec2(field_width, 32.0),
-                            egui::TextEdit::singleline(&mut endpoint.local_path)
-                                .hint_text("Select a folder")
-                                .vertical_align(egui::Align::Center),
+                            egui::vec2(field_width, theme::FIELD_HEIGHT),
+                            singleline_edit(&mut endpoint.local_path).hint_text("Select a folder"),
                         );
                         if compact_button(ui, "Browse").clicked()
                             && let Some(path) = FileDialog::new()
@@ -7167,28 +7161,19 @@ fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut Endp
 fn draw_compact_ssh_fields(ui: &mut egui::Ui, endpoint: &mut EndpointForm) {
     ui.horizontal(|ui| {
         ui.label("Server");
-        ui.add_sized(
-            egui::vec2((ui.available_width() * 0.55).max(80.0), 28.0),
-            egui::TextEdit::singleline(&mut endpoint.server).vertical_align(egui::Align::Center),
+        add_singleline(
+            ui,
+            &mut endpoint.server,
+            (ui.available_width() * 0.55).max(80.0),
         );
         ui.label("User");
-        ui.add_sized(
-            egui::vec2(ui.available_width(), 28.0),
-            egui::TextEdit::singleline(&mut endpoint.username).vertical_align(egui::Align::Center),
-        );
+        add_singleline(ui, &mut endpoint.username, ui.available_width());
     });
     ui.horizontal(|ui| {
         ui.label("Port");
-        ui.add_sized(
-            egui::vec2(56.0, 28.0),
-            egui::TextEdit::singleline(&mut endpoint.port).vertical_align(egui::Align::Center),
-        );
+        add_singleline(ui, &mut endpoint.port, 56.0);
         ui.label("Folder");
-        ui.add_sized(
-            egui::vec2(ui.available_width(), 28.0),
-            egui::TextEdit::singleline(&mut endpoint.remote_path)
-                .vertical_align(egui::Align::Center),
-        );
+        add_singleline(ui, &mut endpoint.remote_path, ui.available_width());
     });
     ui.horizontal_wrapped(|ui| {
         ui.radio_value(&mut endpoint.authentication, AuthenticationForm::Key, "Key");
@@ -7211,18 +7196,14 @@ fn draw_compact_ssh_fields(ui: &mut egui::Ui, endpoint: &mut EndpointForm) {
     match endpoint.authentication {
         AuthenticationForm::Key => {
             ui.add_sized(
-                egui::vec2(ui.available_width(), 28.0),
-                egui::TextEdit::singleline(&mut endpoint.identity)
-                    .hint_text("Identity file")
-                    .vertical_align(egui::Align::Center),
+                egui::vec2(ui.available_width(), theme::FIELD_HEIGHT),
+                singleline_edit(&mut endpoint.identity).hint_text("Identity file"),
             );
         }
         AuthenticationForm::SavedPassword => {
             ui.add_sized(
-                egui::vec2(ui.available_width(), 28.0),
-                egui::TextEdit::singleline(&mut endpoint.secret_reference)
-                    .hint_text("Keyring reference")
-                    .vertical_align(egui::Align::Center),
+                egui::vec2(ui.available_width(), theme::FIELD_HEIGHT),
+                singleline_edit(&mut endpoint.secret_reference).hint_text("Keyring reference"),
             );
         }
         AuthenticationForm::NeedsConfiguration => {
@@ -7252,10 +7233,7 @@ fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
         ui.horizontal(|ui| {
             endpoint_form_label(ui, "Display name");
             let width = ui.available_width();
-            ui.add_sized(
-                egui::vec2(width, 32.0),
-                egui::TextEdit::singleline(&mut endpoint.name).vertical_align(egui::Align::Center),
-            );
+            add_singleline(ui, &mut endpoint.name, width);
         });
         ui.horizontal(|ui| {
             endpoint_form_label(ui, "Endpoint type");
@@ -7271,11 +7249,7 @@ fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
                         - browse_width
                         - ui.spacing().item_spacing.x)
                         .max(180.0);
-                    ui.add_sized(
-                        egui::vec2(field_width, 32.0),
-                        egui::TextEdit::singleline(&mut endpoint.local_path)
-                            .vertical_align(egui::Align::Center),
-                    );
+                    add_singleline(ui, &mut endpoint.local_path, field_width);
                     if secondary_button(ui, "Browse…").clicked()
                         && let Some(path) = FileDialog::new()
                             .set_title(format!("Select {title} folder"))
@@ -7289,36 +7263,20 @@ fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
             EndpointKind::Ssh => {
                 ui.horizontal(|ui| {
                     endpoint_form_label(ui, "Server");
-                    ui.add_sized(
-                        egui::vec2(ui.available_width(), 32.0),
-                        egui::TextEdit::singleline(&mut endpoint.server)
-                            .vertical_align(egui::Align::Center),
-                    );
+                    add_singleline(ui, &mut endpoint.server, ui.available_width());
                 });
                 ui.horizontal(|ui| {
                     endpoint_form_label(ui, "Username");
-                    ui.add_sized(
-                        egui::vec2(ui.available_width(), 32.0),
-                        egui::TextEdit::singleline(&mut endpoint.username)
-                            .vertical_align(egui::Align::Center),
-                    );
+                    add_singleline(ui, &mut endpoint.username, ui.available_width());
                 });
                 ui.horizontal(|ui| {
                     endpoint_form_label(ui, "Port");
-                    ui.add_sized(
-                        egui::vec2(100.0, 32.0),
-                        egui::TextEdit::singleline(&mut endpoint.port)
-                            .vertical_align(egui::Align::Center),
-                    );
+                    add_singleline(ui, &mut endpoint.port, 100.0);
                 });
                 ui.horizontal(|ui| {
                     endpoint_form_label(ui, "Remote folder");
                     let width = ui.available_width();
-                    ui.add_sized(
-                        egui::vec2(width, 32.0),
-                        egui::TextEdit::singleline(&mut endpoint.remote_path)
-                            .vertical_align(egui::Align::Center),
-                    );
+                    add_singleline(ui, &mut endpoint.remote_path, width);
                 });
                 ui.label("SSH host identity is checked by the core preflight before any mutation.");
                 ui.horizontal(|ui| {
@@ -7340,20 +7298,16 @@ fn draw_endpoint(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) {
                     AuthenticationForm::Key => {
                         ui.horizontal(|ui| {
                             endpoint_form_label(ui, "Identity file");
-                            ui.add_sized(
-                                egui::vec2(ui.available_width(), 32.0),
-                                egui::TextEdit::singleline(&mut endpoint.identity)
-                                    .vertical_align(egui::Align::Center),
-                            );
+                            add_singleline(ui, &mut endpoint.identity, ui.available_width());
                         });
                     }
                     AuthenticationForm::SavedPassword => {
                         ui.horizontal(|ui| {
                             endpoint_form_label(ui, "Keyring reference");
-                            ui.add_sized(
-                                egui::vec2(ui.available_width(), 32.0),
-                                egui::TextEdit::singleline(&mut endpoint.secret_reference)
-                                    .vertical_align(egui::Align::Center),
+                            add_singleline(
+                                ui,
+                                &mut endpoint.secret_reference,
+                                ui.available_width(),
                             );
                         });
                         ui.label("Only the nonsecret reference is saved. Passwords and passphrases stay in the desktop keyring.");

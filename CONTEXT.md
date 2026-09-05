@@ -529,8 +529,8 @@ The single live desktop skin: a navy sidebar, a white workspace, and a blue prim
 _Avoid_: Dual skins, warm-paper cream, copper chrome, a theme picker that spends layout on unused modes
 
 **Brand Theme**:
-The desktop GUI token set that supplies canvas (navy rail), on-canvas text, surface (white workspace), elevated, field, text, muted, border, primary (`copper` token), companion (`steel` token), danger, warning, and their on/soft pairs. Core may still persist a named System, Light, or Dark preference; the desktop does not change colours from it.
-_Avoid_: Per-screen one-off colours, user-supplied chrome, colours in SQLite
+The desktop GUI token set that supplies canvas (navy rail), on-canvas text, surface (white workspace), elevated, field, text, muted, border, primary (`copper` token), companion (`steel` token), danger, warning, and their on/soft pairs. It also sets the shared single-line field height and centers field text. Core may still persist a named System, Light, or Dark preference; the desktop does not change colours from it.
+_Avoid_: Per-screen one-off colours, user-supplied chrome, colours in SQLite, or single-line fields with top-aligned text
 
 **Overview**:
 The home surface of the desktop app. It always shows the Brand Mark, a short welcome blurb, Create Sync Profile now, and the activity stats. When a Sync Profile is selected it also shows that profile, last Sync Run or review state, and the next safe action.
