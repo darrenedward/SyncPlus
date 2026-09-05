@@ -7,7 +7,7 @@ use std::{
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eframe::egui;
@@ -29,7 +29,7 @@ use syncplus_core::{
 
 use crate::chrome::{self, ChromeAccent, ChromeSurface, OverviewAction};
 use crate::theme::{BrandTheme, TypeRole};
-use crate::workspace::{self, ReconnectPrompt, WorkspaceTab};
+use crate::workspace::{self, AnalysisPhase, ReconnectPrompt, WorkspaceTab};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EndpointKind {
@@ -416,16 +416,23 @@ struct ProfileAnalysisResult {
     analysis: Option<Result<FreshAnalysis, String>>,
 }
 
-struct AnalysisCompletion {
-    result: ProfileAnalysisResult,
+enum AnalysisWorkerEvent {
+    Phase(AnalysisPhase),
+    Done(ProfileAnalysisResult),
 }
 
 struct ActiveAnalysis {
-    receiver: Receiver<AnalysisCompletion>,
+    receiver: Receiver<AnalysisWorkerEvent>,
+    started: Instant,
+    profile_name: String,
+    source: String,
+    destination: String,
+    phase: AnalysisPhase,
 }
 
 struct ActiveManualRun {
     run_id: RunId,
+    started: Instant,
     cancel: Arc<AtomicBool>,
     receiver: Receiver<ManualRunCompletion>,
 }
@@ -2057,6 +2064,7 @@ impl SyncPlusApp {
             })?;
         self.active_manual_run = Some(ActiveManualRun {
             run_id,
+            started: Instant::now(),
             cancel,
             receiver,
         });
@@ -2669,6 +2677,14 @@ impl SyncPlusApp {
     }
 
     fn analyze_profile_snapshot(profile: SyncProfile) -> ProfileAnalysisResult {
+        Self::analyze_profile_snapshot_with_progress(profile, |_| {})
+    }
+
+    fn analyze_profile_snapshot_with_progress(
+        profile: SyncProfile,
+        mut on_phase: impl FnMut(AnalysisPhase),
+    ) -> ProfileAnalysisResult {
+        on_phase(AnalysisPhase::CheckingFolders);
         let precheck = Self::fresh_local_precheck(&profile);
         let analysis = match &precheck {
             Ok(result)
@@ -2677,6 +2693,7 @@ impl SyncPlusApp {
                     .iter()
                     .any(|blocker| blocker.kind() == PrecheckBlockerKind::PeerUnavailable) =>
             {
+                on_phase(AnalysisPhase::ReadingFolders);
                 Some(FreshAnalysis::analyze(&profile).map_err(|error| error.to_string()))
             }
             _ => None,
@@ -2770,13 +2787,21 @@ impl SyncPlusApp {
         }
         let profile = self.validated_profile()?;
         let profile_name = profile.name().to_owned();
+        let (source_peer, destination_peer) = mapped_peers(&profile);
+        let source = source_peer.root().display().to_string();
+        let destination = destination_peer.root().display().to_string();
         let (sender, receiver) = mpsc::channel();
+        let progress_sender = sender.clone();
         let repaint_context = context.clone();
         thread::Builder::new()
             .name("syncplus-fresh-analysis".to_owned())
             .spawn(move || {
-                let result = SyncPlusApp::analyze_profile_snapshot(profile);
-                let _ = sender.send(AnalysisCompletion { result });
+                let result =
+                    SyncPlusApp::analyze_profile_snapshot_with_progress(profile, |phase| {
+                        let _ = progress_sender.send(AnalysisWorkerEvent::Phase(phase));
+                        repaint_context.request_repaint();
+                    });
+                let _ = sender.send(AnalysisWorkerEvent::Done(result));
                 repaint_context.request_repaint();
             })
             .map_err(|error| {
@@ -2784,37 +2809,56 @@ impl SyncPlusApp {
             })?;
         self.clear_review();
         self.reconnect_prompt = None;
-        self.active_analysis = Some(ActiveAnalysis { receiver });
+        self.active_analysis = Some(ActiveAnalysis {
+            receiver,
+            started: Instant::now(),
+            profile_name: profile_name.clone(),
+            source,
+            destination,
+            phase: AnalysisPhase::CheckingFolders,
+        });
         self.status =
             format!("Fresh Analysis is running for {profile_name}. No files are being changed.");
         Ok(())
     }
 
     fn poll_analysis(&mut self) {
-        let completion = {
-            let Some(active) = self.active_analysis.as_ref() else {
+        enum Poll {
+            Idle,
+            Disconnected,
+            Done(ProfileAnalysisResult),
+        }
+        let poll = {
+            let Some(active) = self.active_analysis.as_mut() else {
                 return;
             };
-            match active.receiver.try_recv() {
-                Ok(completion) => completion,
-                Err(TryRecvError::Empty) => return,
-                Err(TryRecvError::Disconnected) => {
-                    self.active_analysis = None;
-                    self.status = "Fresh Analysis stopped before returning a result. Run it again."
-                        .to_owned();
-                    return;
+            loop {
+                match active.receiver.try_recv() {
+                    Ok(AnalysisWorkerEvent::Phase(phase)) => active.phase = phase,
+                    Ok(AnalysisWorkerEvent::Done(result)) => break Poll::Done(result),
+                    Err(TryRecvError::Empty) => break Poll::Idle,
+                    Err(TryRecvError::Disconnected) => break Poll::Disconnected,
                 }
             }
         };
-        self.active_analysis = None;
-
-        if let Ok(current_profile) = self.form.build()
-            && current_profile != completion.result.profile
-        {
-            self.status = "Fresh Analysis finished for an older profile state; run it again to review the current fields.".to_owned();
-            return;
+        match poll {
+            Poll::Idle => {}
+            Poll::Disconnected => {
+                self.active_analysis = None;
+                self.status =
+                    "Fresh Analysis stopped before returning a result. Run it again.".to_owned();
+            }
+            Poll::Done(result) => {
+                self.active_analysis = None;
+                if let Ok(current_profile) = self.form.build()
+                    && current_profile != result.profile
+                {
+                    self.status = "Fresh Analysis finished for an older profile state; run it again to review the current fields.".to_owned();
+                    return;
+                }
+                let _ = self.apply_analysis_result(result);
+            }
         }
-        let _ = self.apply_analysis_result(completion.result);
     }
 
     pub fn analyze_profile(&mut self) -> Result<(), UiValidationError> {
@@ -4793,29 +4837,138 @@ impl SyncPlusApp {
         }
     }
 
-    fn draw_fresh_analysis_banner(&self, ui: &mut egui::Ui) {
-        if self.reconnect_prompt.is_some() && self.view == AppView::Sync {
-            return;
-        }
+    fn draw_activity_dialog(&self, ui: &mut egui::Ui) {
         let palette = ui_palette(ui);
-        if self.active_analysis.is_some() {
+        if let Some(active) = self.active_analysis.as_ref() {
+            let elapsed = workspace::format_elapsed(active.started.elapsed().as_secs());
             egui::Frame::new()
                 .fill(palette.warning_soft)
                 .stroke(egui::Stroke::new(1.0, palette.warning))
                 .corner_radius(egui::CornerRadius::same(8))
-                .inner_margin(egui::Margin::symmetric(12, 10))
+                .inner_margin(egui::Margin::symmetric(16, 14))
                 .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(active.phase.heading())
+                                .heading()
+                                .color(palette.on_warning_soft),
+                        );
+                    });
                     ui.label(
-                        egui::RichText::new("Fresh Analysis is running")
+                        egui::RichText::new(active.phase.detail()).color(palette.on_warning_soft),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Sync Profile: {}", active.profile_name))
+                            .color(palette.on_warning_soft),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Source: {}", active.source))
+                            .color(palette.on_warning_soft),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Destination: {}", active.destination))
+                            .color(palette.on_warning_soft),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("Elapsed: {elapsed}"))
+                            .color(palette.on_warning_soft),
+                    );
+                    ui.label(
+                        egui::RichText::new("No files are being changed.")
                             .strong()
                             .color(palette.on_warning_soft),
                     );
-                    ui.label(egui::RichText::new(&self.status).color(palette.on_warning_soft));
-                    ui.label("No files are being changed.");
                 });
             ui.add_space(12.0);
             return;
         }
+        let Some(active) = self.active_manual_run.as_ref() else {
+            return;
+        };
+        let elapsed = workspace::format_elapsed(active.started.elapsed().as_secs());
+        let report = self
+            .run_reports
+            .iter()
+            .find(|report| report.run_id() == active.run_id);
+        let current = report.and_then(|report| {
+            report
+                .items()
+                .iter()
+                .rev()
+                .find(|item| matches!(item.outcome(), ActionOutcome::InProgress))
+        });
+        egui::Frame::new()
+            .fill(palette.warning_soft)
+            .stroke(egui::Stroke::new(1.0, palette.warning))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("Sync Run in progress")
+                            .heading()
+                            .color(palette.on_warning_soft),
+                    );
+                });
+                if let Some(item) = current {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} — {}",
+                            item.relative_path().display(),
+                            plan_action_label(item.operation())
+                        ))
+                        .color(palette.on_warning_soft),
+                    );
+                    let planned = item.journal().plan().planned_bytes();
+                    let progress = item.progress_bytes();
+                    let progress_text = planned.map_or_else(
+                        || format_bytes(progress),
+                        |planned| {
+                            format!("{} of {}", format_bytes(progress), format_bytes(planned))
+                        },
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Phase: {} | Progress: {}",
+                            item.journal().last_phase(),
+                            progress_text
+                        ))
+                        .color(palette.on_warning_soft),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("Waiting for the first durable action boundary.")
+                            .color(palette.on_warning_soft),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Sync Run {} · Elapsed: {elapsed}",
+                        active.run_id.value()
+                    ))
+                    .color(palette.on_warning_soft),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "The source remains protected until each action is verified.",
+                    )
+                    .strong()
+                    .color(palette.on_warning_soft),
+                );
+            });
+        ui.add_space(12.0);
+    }
+
+    fn draw_fresh_analysis_banner(&self, ui: &mut egui::Ui) {
+        if self.active_analysis.is_some() {
+            return;
+        }
+        if self.reconnect_prompt.is_some() && self.view == AppView::Sync {
+            return;
+        }
+        let palette = ui_palette(ui);
         let Some(review) = self.review.as_ref() else {
             if self.status.contains("could not")
                 || self.status.contains("blocked")
@@ -6027,6 +6180,7 @@ impl eframe::App for SyncPlusApp {
 
 impl SyncPlusApp {
     fn draw_central_content(&mut self, ui: &mut egui::Ui) {
+        self.draw_activity_dialog(ui);
         match self.view {
             AppView::Welcome => self.draw_welcome(ui),
             AppView::Profiles => self.draw_profiles_page(ui),
@@ -7371,6 +7525,40 @@ mod tests {
         }
         assert!(syncplus.active_analysis.is_none());
         fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn dry_run_in_progress_dialog_is_visible_outside_the_sync_workspace() {
+        let mut app = app();
+        let (sender, receiver) = mpsc::channel();
+        app.active_analysis = Some(ActiveAnalysis {
+            receiver,
+            started: Instant::now(),
+            profile_name: "Test profile".to_owned(),
+            source: "/mnt/elements/Charts".to_owned(),
+            destination: "/home/curryman/Charts".to_owned(),
+            phase: AnalysisPhase::CheckingFolders,
+        });
+        app.show_profiles();
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("Dry run in progress"),
+            "progress dialog missing on Profiles, got {joined}"
+        );
+        assert!(
+            joined.contains("folders are available"),
+            "progress dialog missing the current phase, got {joined}"
+        );
+        assert!(
+            joined.contains("/mnt/elements/Charts"),
+            "progress dialog missing the source path, got {joined}"
+        );
+        assert!(
+            joined.contains("No files are being changed."),
+            "progress dialog must say nothing is being changed, got {joined}"
+        );
+        drop(sender);
     }
 
     #[test]
