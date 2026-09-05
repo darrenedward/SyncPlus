@@ -29,6 +29,7 @@ use syncplus_core::{
 
 use crate::chrome::{self, ChromeAccent, ChromeSurface, OverviewAction};
 use crate::theme::{BrandTheme, TypeRole};
+use crate::workspace::{self, ReconnectPrompt, WorkspaceTab};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EndpointKind {
@@ -1704,6 +1705,8 @@ pub struct SyncPlusApp {
     active_manual_run: Option<ActiveManualRun>,
     notifications: Vec<UiNotification>,
     known_scheduler_event_ids: BTreeSet<u64>,
+    workspace_tab: WorkspaceTab,
+    reconnect_prompt: Option<ReconnectPrompt>,
 }
 
 impl SyncPlusApp {
@@ -1767,6 +1770,8 @@ impl SyncPlusApp {
             active_manual_run: None,
             notifications: Vec::new(),
             known_scheduler_event_ids,
+            workspace_tab: WorkspaceTab::Folders,
+            reconnect_prompt: None,
         })
     }
 
@@ -2696,6 +2701,8 @@ impl SyncPlusApp {
             Ok(precheck) => precheck,
             Err(message) => {
                 self.status = short_precheck_failure_status(&message);
+                self.workspace_tab = WorkspaceTab::Plan;
+                self.reconnect_prompt = None;
                 self.store_review_failure(profile, None, message.clone());
                 return Err(UiValidationError::Core(message));
             }
@@ -2708,6 +2715,8 @@ impl SyncPlusApp {
                     .then(|| ConflictReviewState::from_analysis(analysis))
             });
             self.status = short_precheck_block_status(&profile, &precheck);
+            self.reconnect_prompt = ReconnectPrompt::from_profile_precheck(&profile, &precheck);
+            self.workspace_tab = WorkspaceTab::Plan;
             self.review = Some(PlanReviewState {
                 profile,
                 precheck: Some(precheck),
@@ -2737,6 +2746,8 @@ impl SyncPlusApp {
         let conflicts = (profile.mode() == SyncMode::Mirror)
             .then(|| ConflictReviewState::from_analysis(&analysis));
 
+        self.reconnect_prompt = None;
+        self.workspace_tab = WorkspaceTab::Plan;
         self.review = Some(PlanReviewState {
             profile,
             precheck: Some(precheck),
@@ -2772,6 +2783,7 @@ impl SyncPlusApp {
                 UiValidationError::Core(format!("could not start Fresh Analysis: {error}"))
             })?;
         self.clear_review();
+        self.reconnect_prompt = None;
         self.active_analysis = Some(ActiveAnalysis { receiver });
         self.status =
             format!("Fresh Analysis is running for {profile_name}. No files are being changed.");
@@ -3222,6 +3234,8 @@ impl SyncPlusApp {
         if let Some(profile) = self.profiles.iter().find(|profile| profile.id() == id) {
             self.form = ProfileForm::from_persisted(profile);
             self.review = None;
+            self.reconnect_prompt = None;
+            self.workspace_tab = WorkspaceTab::Folders;
             let name = profile.profile().name().to_owned();
             self.show_sync_workspace();
             self.status = format!("Editing {name}. Changes apply to future runs.");
@@ -4420,9 +4434,14 @@ impl SyncPlusApp {
                 &mut self.help_topic,
             );
         });
-        if let Some(source_id) = self.form.clone_source {
-            let clone_authorization_choice_before = self.form.clone_authorization_choice;
-            card_frame(ui).show(ui, |ui| {
+        ui.add_space(8.0);
+        workspace::draw_tab_bar(ui, &mut self.workspace_tab);
+        ui.add_space(8.0);
+        match self.workspace_tab {
+            WorkspaceTab::Folders => {
+                if let Some(source_id) = self.form.clone_source {
+                    let clone_authorization_choice_before = self.form.clone_authorization_choice;
+                    card_frame(ui).show(ui, |ui| {
                 section_intro(
                     ui,
                     "Clone review",
@@ -4469,22 +4488,22 @@ impl SyncPlusApp {
                     );
                 }
             });
-            if self.form.clone_authorization_choice != clone_authorization_choice_before {
-                self.form.clone_authorization_confirmed = false;
-                self.form.profile_authorizations = AuthorizationSnapshot::new(
-                    self.form.clone_authorization_choice
-                        == CloneAuthorizationChoice::CopyUnattendedDestructive
-                        && self
-                            .form
-                            .clone_source_authorizations
-                            .allow_unattended_destructive(),
-                    self.form
-                        .profile_authorizations
-                        .allow_unattended_permanent_removal(),
-                );
-            }
-        }
-        card_frame(ui).show(ui, |ui| {
+                    if self.form.clone_authorization_choice != clone_authorization_choice_before {
+                        self.form.clone_authorization_confirmed = false;
+                        self.form.profile_authorizations = AuthorizationSnapshot::new(
+                            self.form.clone_authorization_choice
+                                == CloneAuthorizationChoice::CopyUnattendedDestructive
+                                && self
+                                    .form
+                                    .clone_source_authorizations
+                                    .allow_unattended_destructive(),
+                            self.form
+                                .profile_authorizations
+                                .allow_unattended_permanent_removal(),
+                        );
+                    }
+                }
+                card_frame(ui).show(ui, |ui| {
             ui.label(egui::RichText::new("PROFILE IDENTITY").small().strong().color(palette.copper));
             ui.heading("Name this Sync Profile");
             ui.label(egui::RichText::new("A clear name makes schedules, Run Reports, and recovery decisions easier to identify.").color(palette.muted));
@@ -4496,7 +4515,7 @@ impl SyncPlusApp {
                     .vertical_align(egui::Align::Center),
             );
         });
-        card_frame(ui).show(ui, |ui| {
+                card_frame(ui).show(ui, |ui| {
             ui.label(egui::RichText::new("SYNC POLICY").small().strong().color(palette.steel));
             ui.heading("Choose how files move");
             ui.label(egui::RichText::new("One-Way Sync has an explicit authority. Mirror Sync never assumes a winner and requires Conflict Review.").color(palette.muted));
@@ -4532,7 +4551,7 @@ impl SyncPlusApp {
                 });
             }
         });
-        card_frame(ui).show(ui, |ui| {
+                card_frame(ui).show(ui, |ui| {
             section_intro(
                 ui,
                 "Connections",
@@ -4544,15 +4563,25 @@ impl SyncPlusApp {
             ui.add_space(12.0);
             draw_endpoint(ui, "Destination endpoint", &mut self.form.peer_b);
         });
-        card_frame(ui).show(ui, |ui| {
-            ui.collapsing("Exclusion Rules", |ui| {
-                ui.label(egui::RichText::new("One pattern per line. Excluded items are neither synchronized nor deleted.").color(ui_palette(ui).muted));
-                ui.add(egui::TextEdit::multiline(&mut self.form.exclusions).desired_rows(3));
-            });
+            }
+            WorkspaceTab::Options => {
+                card_frame(ui).show(ui, |ui| {
+            section_intro(
+                ui,
+                "Scope",
+                "Exclusion Rules",
+                "One pattern per line. Excluded items are neither synchronized nor deleted.",
+            );
+            ui.add(egui::TextEdit::multiline(&mut self.form.exclusions).desired_rows(6));
         });
-        if self.settings.mode() == ApplicationMode::Advanced {
-            card_frame(ui).show(ui, |ui| {
-                ui.collapsing("Advanced safety options", |ui| {
+                if self.settings.mode() == ApplicationMode::Advanced {
+                    card_frame(ui).show(ui, |ui| {
+                section_intro(
+                    ui,
+                    "Advanced Mode",
+                    "Safety options",
+                    "These named options stay subject to Fresh Analysis, verification, and Execution Confirmation.",
+                );
                     let safe_delete_changed = ui
                         .checkbox(&mut self.form.safe_delete, "One-Way Safe-Delete Sync")
                         .changed();
@@ -4684,15 +4713,14 @@ impl SyncPlusApp {
                     ui.label("The next run is persisted by the Background Scheduler. Editing or disabling this schedule never changes an active Run's frozen Profile Snapshot.");
                     ui.label("Transport is selected through the typed Local or SSH endpoint fields. Command editing is not available.");
                     ui.label("These options remain subject to Fresh Analysis, verification, and explicit Execution Confirmation.");
-                });
             });
-        } else {
-            full_width_inset_frame(ui, |ui| {
-                ui.label(egui::RichText::new("Simple Mode").strong());
-                ui.label("Destructive options stay hidden. Switch to Advanced Mode only when you need to review them.");
-            });
-        }
-        card_frame(ui).show(ui, |ui| {
+                } else {
+                    full_width_inset_frame(ui, |ui| {
+                        ui.label(egui::RichText::new("Simple Mode").strong());
+                        ui.label("Destructive options stay hidden. Switch to Advanced Mode only when you need to review them.");
+                    });
+                }
+                card_frame(ui).show(ui, |ui| {
             ui.collapsing("Help & safety", |ui| {
                 ui.label("What: Simple Mode provides a calm, non-destructive One-Way Sync profile editor.");
                 ui.label("Why: new profiles start with source-authoritative copying and no deletion, cleanup, schedules, or unattended destructive authorization.");
@@ -4701,6 +4729,9 @@ impl SyncPlusApp {
                 ui.label("Limits: Mirror Sync has no implicit winner; excluded, unavailable, changed, or ambiguous items remain visible for review. Passwords stay in the desktop keyring and only an opaque reference is kept in the profile.");
             });
         });
+            }
+            WorkspaceTab::Plan => {}
+        }
         if self.form != form_before_draw {
             self.clear_review();
             self.status =
@@ -4720,7 +4751,52 @@ impl SyncPlusApp {
         }
     }
 
+    fn draw_reconnect_dialog(&mut self, ui: &mut egui::Ui) {
+        let Some(prompt) = self.reconnect_prompt.clone() else {
+            return;
+        };
+        let mut retry = false;
+        let mut close = false;
+        let retry_enabled = self.active_analysis.is_none();
+        let palette = ui_palette(ui);
+        egui::Frame::new()
+            .fill(palette.danger_soft)
+            .stroke(egui::Stroke::new(1.0, palette.danger))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(prompt.window_title())
+                        .heading()
+                        .color(palette.on_danger_soft),
+                );
+                for line in prompt.lines() {
+                    ui.label(egui::RichText::new(line).color(palette.on_danger_soft));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if primary_button_enabled(ui, "Retry", retry_enabled).clicked() {
+                        retry = true;
+                    }
+                    if secondary_button(ui, "Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        ui.add_space(12.0);
+        if close {
+            self.reconnect_prompt = None;
+        } else if retry {
+            if let Err(error) = self.start_analysis(ui.ctx()) {
+                self.status = format_form_validation_diagnostic(&self.form, &error);
+            }
+        }
+    }
+
     fn draw_fresh_analysis_banner(&self, ui: &mut egui::Ui) {
+        if self.reconnect_prompt.is_some() && self.view == AppView::Sync {
+            return;
+        }
         let palette = ui_palette(ui);
         if self.active_analysis.is_some() {
             egui::Frame::new()
@@ -5969,9 +6045,12 @@ impl SyncPlusApp {
                         self.draw_notifications(ui);
                         self.draw_missed_schedule_notices(ui);
                         self.draw_scheduler_events(ui);
+                        self.draw_reconnect_dialog(ui);
                         self.draw_fresh_analysis_banner(ui);
                         self.draw_profile_form(ui);
-                        self.draw_review(ui);
+                        if self.workspace_tab == WorkspaceTab::Plan {
+                            self.draw_review(ui);
+                        }
                     });
             }
         }
@@ -7339,36 +7418,50 @@ mod tests {
             app.status()
         );
 
+        assert!(
+            app.reconnect_prompt.is_some(),
+            "unavailable peers must open a reconnect prompt"
+        );
+        assert_eq!(app.workspace_tab, WorkspaceTab::Plan);
+
         let typical = Some(egui::vec2(1280.0, 720.0));
         app.show_sync_workspace();
         let (texts, _) = painted_shapes_for_size(&mut app, ThemePreference::Dark, false, typical);
         let joined = texts.join("\n");
         assert!(
-            texts.iter().any(|text| text.contains("Dry run blocked")),
-            "Sync workspace must show a Dry run blocked banner at typical height, got {joined}"
-        );
-        assert!(
             texts
                 .iter()
-                .any(|text| text.contains("The source folder is not available.")
-                    || text.contains("The destination folder is not available.")),
-            "Sync workspace must explain the missing folder in plain language, got {joined}"
+                .any(|text| text.contains("Folder not connected")
+                    || text.contains("Folders not connected")),
+            "Sync workspace must open a reconnect dialog, got {joined}"
+        );
+        assert!(
+            joined.contains("Retry"),
+            "reconnect dialog must offer Retry, got {joined}"
+        );
+        assert!(
+            joined.contains("does not start a Sync Run"),
+            "Retry must not imply a Sync Run has started, got {joined}"
         );
         assert!(
             joined.contains("unplugged-source") || joined.contains("unplugged-destination"),
             "blocked dry run must name the missing peer path, got {joined}"
         );
         assert!(
-            joined.contains("Connect or mount"),
+            joined.contains("Connect or mount") || joined.contains("removable drive"),
             "blocked dry run must say to connect or mount the folder, got {joined}"
-        );
-        assert!(
-            joined.contains("No files were changed."),
-            "blocked dry run must say nothing was changed, got {joined}"
         );
         assert!(
             !joined.contains("os error") && !joined.contains("Account: not applicable"),
             "blocked dry run must not lead with a duplicated technical dump, got {joined}"
+        );
+
+        app.reconnect_prompt = None;
+        let (texts, _) = painted_shapes_for_size(&mut app, ThemePreference::Dark, false, typical);
+        let joined = texts.join("\n");
+        assert!(
+            texts.iter().any(|text| text.contains("Dry run blocked")),
+            "closing the reconnect dialog must leave the Dry run blocked banner, got {joined}"
         );
 
         app.show_welcome();
@@ -8417,7 +8510,7 @@ mod tests {
             (
                 "Sync workspace",
                 |app| app.show_sync_workspace(),
-                &["Execution Confirmation"],
+                &["Folders", "Options", "Plan"],
             ),
             (
                 "Run Reports",
@@ -8565,8 +8658,12 @@ mod tests {
         let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
         let joined = texts.join("\n");
         assert!(
-            joined.contains("Execution Confirmation"),
-            "Sync workspace missing Execution Confirmation in {joined}"
+            joined.contains("Folders") && joined.contains("Options") && joined.contains("Plan"),
+            "Sync workspace missing Folders, Options, and Plan tabs in {joined}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.trim() == "Advance"),
+            "Sync workspace must not use an Advance tab in {joined}"
         );
         assert!(
             joined.contains("Dry run · Analyze"),
@@ -8575,6 +8672,13 @@ mod tests {
         assert!(
             joined.contains("Save profile"),
             "Sync workspace missing profile save in {joined}"
+        );
+        app.workspace_tab = WorkspaceTab::Plan;
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("Execution Confirmation"),
+            "Plan tab missing Execution Confirmation in {joined}"
         );
         assert!(
             joined.contains("Documents backup"),

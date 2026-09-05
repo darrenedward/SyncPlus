@@ -15,6 +15,7 @@ mod brand_mark;
 mod chrome;
 mod fonts;
 mod theme;
+mod workspace;
 
 pub use app::{EndpointKind, SyncPlusApp, UiValidationError, run_background_scheduler_once};
 pub use brand_mark::window_icon;

@@ -113,7 +113,7 @@ Before Analyze and before execution, the non-mutating Run Precheck checks:
 - remote SSH host identity, credentials, remote rsync capability, remote hash capability, and remote recovery capability where relevant;
 - SQLite integrity and the required pre-run database backup.
 
-Required permission, capability, naming, recovery, or database failures block all file-changing execution. Read-only analysis may explain the issue and its remediation. An unavailable or unmounted local peer blocks before Source Inventory, including a leftover mount whose device is gone. The desktop Dry run must show those blockers immediately in plain language rather than an empty plan or a duplicated operating-system error dump. SyncPlus never invokes `sudo`, changes ownership/permissions, or recommends broad permissions such as `chmod 777`.
+Required permission, capability, naming, recovery, or database failures block all file-changing execution. Read-only analysis may explain the issue and its remediation. An unavailable or unmounted local peer blocks before Source Inventory, including a leftover mount whose device is gone. The desktop Dry run must show those blockers immediately in plain language rather than an empty plan or a duplicated operating-system error dump. For a missing local folder, Sync workspace opens a reconnect dialog with Retry on the same saved path; Retry does not start a Sync Run. SyncPlus never invokes `sudo`, changes ownership/permissions, or recommends broad permissions such as `chmod 777`.
 
 ### Fresh Analysis and Source Inventory
 

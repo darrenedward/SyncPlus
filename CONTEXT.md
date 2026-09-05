@@ -253,6 +253,14 @@ When a configured SSH peer reaches a desktop boundary without a remote probe
 result, the diagnostic says that the required host, credential, account,
 capability, and recovery evidence is not proven and keeps execution blocked.
 
+**Sync workspace**:
+The desktop surface for the active Sync Profile. The profile selector, Save, and Dry run stay visible. The rest is grouped into Folders, Options, and Plan. Folders always shows source and destination together. Options holds Exclusion Rules and, when Advanced Mode is on, Advanced safety options. Plan holds Fresh Analysis, Run Precheck, and Execution Confirmation.
+_Avoid_: An Advance tab, hiding one endpoint, or moving confirmation into Options
+
+**Reconnect prompt**:
+When Dry run finds a missing, unmounted, or unplugged local peer, SyncPlus opens a dialog that names the source and/or destination folder, asks the user to connect or mount it, and offers Retry. Retry repeats Run Precheck on the same saved path and does not start a Sync Run. Closing the dialog leaves the Dry run blocked banner visible. A path under a common removable-mount prefix may be described as a removable drive; SyncPlus does not name USB, DVD, or memory-card hardware unless that identity is actually known.
+_Avoid_: Auto-starting a run when a drive reappears, guessing a different path, or naming a device type that has not been identified
+
 **Simple Mode**:
 The default SyncPlus experience showing the common source, destination, mode, exclusions, safety options, and run actions without exposing specialist filesystem or transport controls.
 _Avoid_: Beginner mode, limited mode
