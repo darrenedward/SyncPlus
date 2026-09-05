@@ -516,16 +516,12 @@ _Avoid_: Recolour to pink or teal, neon glow, slogans that imply silent deletion
 
 ## Appearance
 
-**Dark Appearance**:
-The first-class dark theme: warm ink surfaces, copper primary accent, and steel companion accent. It is not pure black and not a neon-on-black HUD.
-_Avoid_: OLED black, cyberpunk, treating dark as the only real product
-
-**Light Appearance**:
-The first-class light theme: warm paper, cream, and stone surfaces. The canvas is not white and is not a brightness-inverted Dark Appearance.
-_Avoid_: White sheet, bright fallback, leftover dark-mode chrome
+**Desktop Appearance**:
+The single live desktop skin: a navy sidebar, a white workspace, and a blue primary accent. There is no Dark Appearance / Light Appearance switch in Settings.
+_Avoid_: Dual skins, warm-paper cream, copper chrome, a theme picker that spends layout on unused modes
 
 **Brand Theme**:
-The desktop GUI token set that supplies canvas, surface, elevated, field, text, muted, border, copper, steel, danger, warning, and their on/soft pairs for both appearances. Core stores only the named preference System, Light, or Dark; it does not store colours.
+The desktop GUI token set that supplies canvas (navy rail), on-canvas text, surface (white workspace), elevated, field, text, muted, border, primary (`copper` token), companion (`steel` token), danger, warning, and their on/soft pairs. Core may still persist a named System, Light, or Dark preference; the desktop does not change colours from it.
 _Avoid_: Per-screen one-off colours, user-supplied chrome, colours in SQLite
 
 **Overview**:

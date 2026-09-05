@@ -499,7 +499,7 @@ Examples of required messages:
 
 ## Follow-on visual identity
 
-Brand Theme tokens for Dark Appearance and Light Appearance live in `crates/syncplus/src/theme.rs`. Core still stores only the named preference System, Light, or Dark. Brand Mark catalog and window icon loading live in `crates/syncplus/src/brand_mark.rs`. Navigation chrome and Overview identity live in `crates/syncplus/src/chrome.rs`. Workspace type roles, Help grouping, and Execution Confirmation presentation live in the desktop GUI. The public Brand Kit lives under `docs/brand/` and must not weaken the v1 safety contract.
+Brand Theme tokens for the single blue-and-white Desktop Appearance live in `crates/syncplus/src/theme.rs`. Core may still persist a named System, Light, or Dark preference; the desktop chrome does not switch skins from it and Settings does not offer an appearance picker. Brand Mark catalog and window icon loading live in `crates/syncplus/src/brand_mark.rs`. Navigation chrome and Overview identity live in `crates/syncplus/src/chrome.rs`. Workspace type roles, Help grouping, and Execution Confirmation presentation live in the desktop GUI. The public Brand Kit lives under `docs/brand/` and must not weaken the v1 safety contract.
 
 ## Deferred design work
 

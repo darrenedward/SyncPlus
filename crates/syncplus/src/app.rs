@@ -3287,20 +3287,10 @@ impl SyncPlusApp {
     }
 
     fn apply_theme(&self, context: &egui::Context) {
-        let preference = match self.settings.theme() {
-            ThemePreference::System => egui::ThemePreference::System,
-            ThemePreference::Light => egui::ThemePreference::Light,
-            ThemePreference::Dark => egui::ThemePreference::Dark,
-        };
-        context.set_theme(preference);
+        context.set_theme(egui::ThemePreference::Light);
         crate::fonts::install_regular_sans(context);
         context.all_styles_mut(|style| {
-            match self.settings.theme() {
-                ThemePreference::Light => style.visuals.dark_mode = false,
-                ThemePreference::Dark => style.visuals.dark_mode = true,
-                ThemePreference::System => {}
-            }
-            BrandTheme::for_dark_mode(style.visuals.dark_mode).apply_to_style(style);
+            BrandTheme::desktop().apply_to_style(style);
             style.spacing.item_spacing = egui::vec2(10.0, 8.0);
             style.spacing.button_padding = egui::vec2(14.0, 8.0);
             style.spacing.interact_size = egui::vec2(44.0, 36.0);
@@ -3334,11 +3324,16 @@ impl SyncPlusApp {
         ui.horizontal(|ui| {
             Self::draw_brand_mark_sized(ui, 34.0);
             ui.vertical(|ui| {
-                ui.label(egui::RichText::new("SyncPlus").strong().size(17.0));
+                ui.label(
+                    egui::RichText::new("SyncPlus")
+                        .strong()
+                        .size(17.0)
+                        .color(palette.on_canvas),
+                );
                 ui.label(
                     egui::RichText::new("SAFETY-FIRST FILE SYNC")
                         .small()
-                        .color(palette.muted),
+                        .color(palette.on_canvas_muted),
                 );
             });
         });
@@ -3357,8 +3352,8 @@ impl SyncPlusApp {
                 ChromeSurface::Help => SidebarIcon::Help,
             };
             let icon_color = match item.accent {
-                ChromeAccent::Copper => palette.copper,
-                ChromeAccent::Muted => palette.muted,
+                ChromeAccent::Copper => palette.on_copper,
+                ChromeAccent::Muted => palette.on_canvas_muted,
             };
             let label = if item.surface == ChromeSurface::Reports {
                 match chrome::reports_badge(review_pending) {
@@ -3580,7 +3575,6 @@ impl SyncPlusApp {
 
     fn draw_settings_page(&mut self, ui: &mut egui::Ui) {
         let mut mode_change = None;
-        let mut theme_change = None;
         let mut tray_change = None;
         let palette = ui_palette(ui);
 
@@ -3704,66 +3698,6 @@ impl SyncPlusApp {
 
                         ui.add_space(12.0);
                         card_frame(ui).show(ui, |ui| {
-                            ui.heading("Appearance");
-                            ui.label(
-                                egui::RichText::new(
-                                    "Choose the canvas treatment that best suits your environment. Changes apply immediately and are remembered.",
-                                )
-                                .color(palette.muted),
-                            );
-                            ui.add_space(12.0);
-                            ui.columns(3, |columns| {
-                                for (column, theme, title, description) in [
-                                    (0, ThemePreference::System, "System", "Follow the desktop Dark Appearance or Light Appearance."),
-                                    (1, ThemePreference::Light, "Light", "Use the warm paper Light Appearance."),
-                                    (2, ThemePreference::Dark, "Dark", "Use the warm ink Dark Appearance."),
-                                ] {
-                                    let selected = self.settings.theme() == theme;
-                                    let width = columns[column].available_width();
-                                    columns[column].vertical(|ui| {
-                                        if ui
-                                            .add(
-                                                egui::Button::new(
-                                                    egui::RichText::new(title)
-                                                        .strong()
-                                                        .color(if selected {
-                                                            palette.text
-                                                        } else {
-                                                            palette.muted
-                                                        }),
-                                                )
-                                                .fill(if selected {
-                                                    palette.copper_soft
-                                                } else {
-                                                    palette.elevated
-                                                })
-                                                .stroke(egui::Stroke::new(
-                                                    1.0,
-                                                    if selected {
-                                                        palette.copper
-                                                    } else {
-                                                        palette.border_subtle
-                                                    },
-                                                ))
-                                                .corner_radius(egui::CornerRadius::same(9))
-                                                .min_size(egui::vec2(width, 44.0)),
-                                            )
-                                            .clicked()
-                                        {
-                                            theme_change = Some(theme);
-                                        }
-                                        ui.label(
-                                            egui::RichText::new(description)
-                                                .small()
-                                                .color(palette.muted),
-                                        );
-                                    });
-                                }
-                            });
-                        });
-
-                        ui.add_space(12.0);
-                        card_frame(ui).show(ui, |ui| {
                             ui.heading("Safety guarantees");
                             ui.label(
                                 egui::RichText::new(
@@ -3816,9 +3750,6 @@ impl SyncPlusApp {
         if let Some(mode) = mode_change {
             self.set_mode(mode);
         }
-        if let Some(theme) = theme_change {
-            self.set_theme(theme);
-        }
         if let Some(enabled) = tray_change {
             self.set_hide_to_tray_on_window_close(enabled);
         }
@@ -3829,7 +3760,7 @@ impl SyncPlusApp {
         let painter = ui.painter();
         let palette = ui_palette(ui);
         let radius = (size * 0.22).round().clamp(6.0, 20.0) as u8;
-        painter.rect_filled(rect, egui::CornerRadius::same(radius), palette.canvas);
+        painter.rect_filled(rect, egui::CornerRadius::same(radius), palette.surface);
         let margin = size * 0.2;
         let left = rect.left() + margin;
         let right = rect.right() - margin;
@@ -6633,13 +6564,13 @@ fn sidebar_nav_button(
     let response = ui.add(
         egui::Button::new(
             egui::RichText::new(format!("        {label}")).color(if selected {
-                palette.text
+                palette.on_copper
             } else {
-                palette.muted
+                palette.on_canvas_muted
             }),
         )
         .fill(if selected {
-            palette.copper_soft
+            palette.copper
         } else {
             egui::Color32::TRANSPARENT
         })
@@ -6796,9 +6727,9 @@ fn sidebar_exit_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let palette = ui_palette(ui);
     let width = ui.available_width();
     let response = ui.add(
-        egui::Button::new(egui::RichText::new(label).color(palette.muted))
+        egui::Button::new(egui::RichText::new(label).color(palette.on_canvas_muted))
             .fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+            .stroke(egui::Stroke::new(1.0, palette.on_canvas_muted))
             .corner_radius(egui::CornerRadius::same(8))
             .min_size(egui::vec2(width, 32.0)),
     );
@@ -8776,20 +8707,18 @@ mod tests {
     fn switching_appearance_restyles_window_tokens_immediately() {
         let mut app = app();
         let context = egui::Context::default();
+        let expected = BrandTheme::desktop();
 
         app.set_theme(ThemePreference::Dark);
         app.apply_theme(&context);
         context.all_styles_mut(|style| {
-            assert_eq!(style.visuals.panel_fill, BrandTheme::dark().canvas);
-            assert_eq!(style.visuals.window_fill, BrandTheme::dark().surface);
-            assert_eq!(
-                style.visuals.selection.stroke.color,
-                BrandTheme::dark().copper
-            );
-            assert_eq!(style.visuals.hyperlink_color, BrandTheme::dark().steel);
-            assert_eq!(style.visuals.error_fg_color, BrandTheme::dark().danger);
-            assert_eq!(style.visuals.warn_fg_color, BrandTheme::dark().warning);
-            assert_ne!(style.visuals.panel_fill, egui::Color32::BLACK);
+            assert!(!style.visuals.dark_mode);
+            assert_eq!(style.visuals.panel_fill, expected.surface);
+            assert_eq!(style.visuals.window_fill, expected.surface);
+            assert_eq!(style.visuals.selection.stroke.color, expected.copper);
+            assert_eq!(style.visuals.hyperlink_color, expected.steel);
+            assert_eq!(style.visuals.error_fg_color, expected.danger);
+            assert_eq!(style.visuals.warn_fg_color, expected.warning);
             assert_ne!(
                 style.visuals.widgets.hovered.bg_stroke.color,
                 FORBIDDEN_MAGENTA
@@ -8799,14 +8728,9 @@ mod tests {
         app.set_theme(ThemePreference::Light);
         app.apply_theme(&context);
         context.all_styles_mut(|style| {
-            assert_eq!(style.visuals.panel_fill, BrandTheme::light().canvas);
-            assert_eq!(style.visuals.window_fill, BrandTheme::light().surface);
-            assert_eq!(
-                style.visuals.selection.stroke.color,
-                BrandTheme::light().copper
-            );
-            assert_ne!(style.visuals.panel_fill, egui::Color32::WHITE);
-            assert_ne!(style.visuals.window_fill, egui::Color32::WHITE);
+            assert_eq!(style.visuals.panel_fill, expected.surface);
+            assert_eq!(style.visuals.window_fill, expected.surface);
+            assert_eq!(style.visuals.selection.stroke.color, expected.copper);
         });
     }
 
@@ -8825,7 +8749,7 @@ mod tests {
             (
                 "Settings",
                 |app| app.show_settings(),
-                &["Appearance", "System", "Light", "Dark"],
+                &["Workflow mode", "Simple", "Advanced"],
             ),
             ("wizard", |app| app.start_new_profile(), &["Sync method"]),
             (
@@ -9105,15 +9029,14 @@ mod tests {
         assert!(QUIT_STOPPING_COPY.contains("Recovery Review"));
         let mut app = app();
         let context = egui::Context::default();
-        for (theme, expected) in [
-            (ThemePreference::Dark, BrandTheme::dark()),
-            (ThemePreference::Light, BrandTheme::light()),
-        ] {
+        let expected = BrandTheme::desktop();
+        for theme in [ThemePreference::Dark, ThemePreference::Light] {
             app.set_theme(theme);
             app.apply_theme(&context);
             context.all_styles_mut(|style| {
                 assert_eq!(style.visuals.window_fill, expected.surface);
-                assert_eq!(style.visuals.panel_fill, expected.canvas);
+                assert_eq!(style.visuals.panel_fill, expected.surface);
+                assert!(!style.visuals.dark_mode);
             });
         }
     }

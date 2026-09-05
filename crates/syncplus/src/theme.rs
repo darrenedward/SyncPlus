@@ -1,11 +1,14 @@
 use eframe::egui;
 
-/// Desktop Brand Theme tokens for Dark Appearance and Light Appearance.
+/// Desktop Brand Theme tokens. SyncPlus uses one blue-and-white appearance.
 ///
-/// Colours live only in the GUI. Core persists `ThemePreference` names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Colours live only in the GUI. Core may still persist a named preference;
+/// the desktop chrome does not switch skins from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BrandTheme {
     pub canvas: egui::Color32,
+    pub on_canvas: egui::Color32,
+    pub on_canvas_muted: egui::Color32,
     pub surface: egui::Color32,
     pub elevated: egui::Color32,
     pub field: egui::Color32,
@@ -34,7 +37,7 @@ const fn rgb(red: u8, green: u8, blue: u8) -> egui::Color32 {
 }
 
 /// Type roles for the desktop instrument. Titles stay in a tool range.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeRole {
     Eyebrow,
     Title,
@@ -53,80 +56,58 @@ impl TypeRole {
 }
 
 impl BrandTheme {
-    /// Warm-ink Dark Appearance. Canvas is not pure black.
+    /// Navy rail, white workspace, blue primary. Token names `copper` and
+    /// `steel` remain the primary and companion accents.
+    pub const fn desktop() -> Self {
+        Self {
+            canvas: rgb(0x0F, 0x3A, 0x6B),
+            on_canvas: rgb(0xF4, 0xF8, 0xFC),
+            on_canvas_muted: rgb(0xA9, 0xC4, 0xE0),
+            surface: rgb(0xFF, 0xFF, 0xFF),
+            elevated: rgb(0xF4, 0xF8, 0xFC),
+            field: rgb(0xFF, 0xFF, 0xFF),
+            text: rgb(0x1A, 0x24, 0x33),
+            muted: rgb(0x4E, 0x62, 0x78),
+            border: rgb(0xC5, 0xD4, 0xE4),
+            border_subtle: rgb(0xE2, 0xEA, 0xF2),
+            copper: rgb(0x15, 0x65, 0xC0),
+            on_copper: rgb(0xFF, 0xFF, 0xFF),
+            copper_soft: rgb(0xE3, 0xF0, 0xFC),
+            steel: rgb(0x1E, 0x4E, 0x8C),
+            on_steel: rgb(0xFF, 0xFF, 0xFF),
+            steel_soft: rgb(0xD6, 0xE6, 0xF8),
+            danger: rgb(0xC6, 0x28, 0x28),
+            on_danger: rgb(0xFF, 0xFF, 0xFF),
+            danger_soft: rgb(0xFC, 0xE8, 0xE8),
+            on_danger_soft: rgb(0xB7, 0x1C, 0x1C),
+            warning: rgb(0xB2, 0x6A, 0x00),
+            on_warning: rgb(0xFF, 0xFF, 0xFF),
+            warning_soft: rgb(0xFF, 0xF3, 0xD6),
+            on_warning_soft: rgb(0x8A, 0x5A, 0x00),
+        }
+    }
+
     pub const fn dark() -> Self {
-        Self {
-            canvas: rgb(0x14, 0x12, 0x10),
-            surface: rgb(0x1C, 0x19, 0x16),
-            elevated: rgb(0x26, 0x22, 0x1D),
-            field: rgb(0x12, 0x10, 0x0E),
-            text: rgb(0xF3, 0xED, 0xE4),
-            muted: rgb(0xB5, 0xA9, 0x9A),
-            border: rgb(0x6F, 0x64, 0x58),
-            border_subtle: rgb(0x4F, 0x46, 0x3E),
-            copper: rgb(0xE0, 0x8A, 0x3C),
-            on_copper: rgb(0x1A, 0x12, 0x08),
-            copper_soft: rgb(0x3A, 0x24, 0x14),
-            steel: rgb(0x8A, 0xA0, 0xB8),
-            on_steel: rgb(0x1A, 0x12, 0x08),
-            steel_soft: rgb(0x24, 0x30, 0x40),
-            danger: rgb(0xD3, 0x5A, 0x5A),
-            on_danger: rgb(0x1A, 0x12, 0x08),
-            danger_soft: rgb(0x3A, 0x1C, 0x1C),
-            // Spec danger on danger-soft is below 4.5:1; body ink on the soft
-            // fill is the danger-on-soft text role.
-            on_danger_soft: rgb(0xF3, 0xED, 0xE4),
-            warning: rgb(0xE0, 0xB2, 0x4A),
-            on_warning: rgb(0x1A, 0x12, 0x08),
-            warning_soft: rgb(0x3A, 0x30, 0x14),
-            on_warning_soft: rgb(0xF3, 0xED, 0xE4),
-        }
+        Self::desktop()
     }
 
-    /// Warm-paper Light Appearance. Canvas is not white.
     pub const fn light() -> Self {
-        Self {
-            canvas: rgb(0xEF, 0xE6, 0xD8),
-            surface: rgb(0xF7, 0xF0, 0xE4),
-            elevated: rgb(0xE7, 0xDC, 0xCB),
-            field: rgb(0xFF, 0xF8, 0xEE),
-            text: rgb(0x1C, 0x17, 0x12),
-            muted: rgb(0x6B, 0x5E, 0x50),
-            border: rgb(0xC4, 0xB6, 0xA4),
-            border_subtle: rgb(0xD8, 0xCB, 0xB8),
-            // Spec copper #B65E1C is 4.32:1 on #FFF8EE; darkened to hold 4.5:1.
-            copper: rgb(0xB0, 0x56, 0x18),
-            on_copper: rgb(0xFF, 0xF8, 0xEE),
-            copper_soft: rgb(0xF3, 0xD7, 0xBE),
-            steel: rgb(0x3E, 0x58, 0x74),
-            on_steel: rgb(0xFF, 0xF8, 0xEE),
-            steel_soft: rgb(0xD5, 0xDE, 0xE8),
-            danger: rgb(0xB4, 0x23, 0x32),
-            on_danger: rgb(0xFF, 0xF8, 0xEE),
-            danger_soft: rgb(0xF7, 0xD7, 0xDA),
-            on_danger_soft: rgb(0xB4, 0x23, 0x32),
-            warning: rgb(0x8A, 0x5A, 0x12),
-            on_warning: rgb(0xFF, 0xF8, 0xEE),
-            warning_soft: rgb(0xF3, 0xE6, 0xC4),
-            on_warning_soft: rgb(0x8A, 0x5A, 0x12),
-        }
+        Self::desktop()
     }
 
-    pub const fn for_dark_mode(dark_mode: bool) -> Self {
-        if dark_mode {
-            Self::dark()
-        } else {
-            Self::light()
-        }
+    pub const fn for_dark_mode(_dark_mode: bool) -> Self {
+        Self::desktop()
     }
 
-    pub fn from_ui(ui: &egui::Ui) -> Self {
-        Self::for_dark_mode(ui.visuals().dark_mode)
+    pub fn from_ui(_ui: &egui::Ui) -> Self {
+        Self::desktop()
     }
 
-    pub const fn roles(self) -> [(&'static str, egui::Color32); 22] {
+    pub const fn roles(self) -> [(&'static str, egui::Color32); 24] {
         [
             ("canvas", self.canvas),
+            ("on_canvas", self.on_canvas),
+            ("on_canvas_muted", self.on_canvas_muted),
             ("surface", self.surface),
             ("elevated", self.elevated),
             ("field", self.field),
@@ -152,6 +133,7 @@ impl BrandTheme {
     }
 
     pub fn apply_to_style(self, style: &mut egui::Style) {
+        style.visuals.dark_mode = false;
         style.visuals.button_frame = true;
         style.visuals.override_text_color = Some(self.text);
         style.visuals.weak_text_color = Some(self.muted);
@@ -161,7 +143,7 @@ impl BrandTheme {
         style.visuals.warn_fg_color = self.warning;
         style.visuals.error_fg_color = self.danger;
         style.visuals.faint_bg_color = self.elevated;
-        style.visuals.panel_fill = self.canvas;
+        style.visuals.panel_fill = self.surface;
         style.visuals.window_fill = self.surface;
         style.visuals.extreme_bg_color = self.field;
         style.visuals.text_edit_bg_color = Some(self.field);
@@ -214,77 +196,68 @@ mod tests {
         (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
     }
 
-    fn appearances() -> [(&'static str, BrandTheme); 2] {
-        [("dark", BrandTheme::dark()), ("light", BrandTheme::light())]
+    #[test]
+    fn desktop_appearance_is_navy_rail_white_workspace_and_blue_accent() {
+        let theme = BrandTheme::desktop();
+        assert_eq!(theme.canvas, rgb(0x0F, 0x3A, 0x6B));
+        assert_eq!(theme.surface, rgb(0xFF, 0xFF, 0xFF));
+        assert_eq!(theme.field, rgb(0xFF, 0xFF, 0xFF));
+        assert_eq!(theme.copper, rgb(0x15, 0x65, 0xC0));
+        assert_eq!(theme.steel, rgb(0x1E, 0x4E, 0x8C));
+        assert_eq!(BrandTheme::dark(), theme);
+        assert_eq!(BrandTheme::light(), theme);
+        assert_eq!(BrandTheme::for_dark_mode(true), theme);
+        assert_eq!(BrandTheme::for_dark_mode(false), theme);
     }
 
     #[test]
-    fn both_appearances_expose_the_full_token_role_set() {
-        for (name, theme) in appearances() {
-            let roles: Vec<&str> = theme.roles().into_iter().map(|(role, _)| role).collect();
-            for required in [
-                "canvas",
-                "surface",
-                "elevated",
-                "field",
-                "text",
-                "muted",
-                "border",
-                "copper",
-                "on_copper",
-                "copper_soft",
-                "steel",
-                "on_steel",
-                "steel_soft",
-                "danger",
-                "on_danger",
-                "danger_soft",
-                "on_danger_soft",
-                "warning",
-                "on_warning",
-                "warning_soft",
-            ] {
-                assert!(
-                    roles.contains(&required),
-                    "{name} appearance is missing token role {required}"
-                );
-            }
+    fn desktop_exposes_the_full_token_role_set() {
+        let roles: Vec<&str> = BrandTheme::desktop()
+            .roles()
+            .into_iter()
+            .map(|(role, _)| role)
+            .collect();
+        for required in [
+            "canvas",
+            "on_canvas",
+            "on_canvas_muted",
+            "surface",
+            "elevated",
+            "field",
+            "text",
+            "muted",
+            "border",
+            "copper",
+            "on_copper",
+            "copper_soft",
+            "steel",
+            "on_steel",
+            "steel_soft",
+            "danger",
+            "on_danger",
+            "danger_soft",
+            "on_danger_soft",
+            "warning",
+            "on_warning",
+            "warning_soft",
+        ] {
+            assert!(
+                roles.contains(&required),
+                "desktop appearance is missing token role {required}"
+            );
         }
     }
 
     #[test]
-    fn dark_appearance_uses_warm_ink_not_black() {
-        let dark = BrandTheme::dark();
-        assert_ne!(dark.canvas, egui::Color32::BLACK);
-        assert_eq!(dark.canvas, rgb(0x14, 0x12, 0x10));
-        assert_eq!(dark.surface, rgb(0x1C, 0x19, 0x16));
-        assert_eq!(dark.elevated, rgb(0x26, 0x22, 0x1D));
-        assert_eq!(dark.field, rgb(0x12, 0x10, 0x0E));
-        assert!(relative_luminance(dark.canvas) > relative_luminance(egui::Color32::BLACK));
-    }
-
-    #[test]
-    fn light_appearance_uses_warm_paper_not_white() {
-        let light = BrandTheme::light();
-        assert_ne!(light.canvas, egui::Color32::WHITE);
-        assert_ne!(light.surface, egui::Color32::WHITE);
-        assert_eq!(light.canvas, rgb(0xEF, 0xE6, 0xD8));
-        assert_eq!(light.surface, rgb(0xF7, 0xF0, 0xE4));
-        assert_eq!(light.elevated, rgb(0xE7, 0xDC, 0xCB));
-        assert_ne!(light.field, egui::Color32::WHITE);
-    }
-
-    #[test]
-    fn copper_steel_danger_and_warning_are_distinct_in_both_appearances() {
-        for (name, theme) in appearances() {
-            let accents = [theme.copper, theme.steel, theme.danger, theme.warning];
-            for (index, color) in accents.iter().enumerate() {
-                for other in accents.iter().skip(index + 1) {
-                    assert_ne!(
-                        color, other,
-                        "{name} copper, steel, danger, and warning must stay distinct"
-                    );
-                }
+    fn copper_steel_danger_and_warning_are_distinct() {
+        let theme = BrandTheme::desktop();
+        let accents = [theme.copper, theme.steel, theme.danger, theme.warning];
+        for (index, color) in accents.iter().enumerate() {
+            for other in accents.iter().skip(index + 1) {
+                assert_ne!(
+                    color, other,
+                    "primary, companion, danger, and warning must stay distinct"
+                );
             }
         }
     }
@@ -294,49 +267,51 @@ mod tests {
         let magenta = rgb(0xFF, 0x00, 0x99);
         let neon_mint = rgb(0x00, 0xFF, 0x85);
         let teal = rgb(0x79, 0xD2, 0xC3);
-        for (name, theme) in appearances() {
-            for (role, color) in theme.roles() {
-                assert_ne!(color, magenta, "{name} {role} must not be magenta");
-                assert_ne!(color, neon_mint, "{name} {role} must not be neon mint");
-                assert_ne!(color, teal, "{name} {role} must not be teal");
-            }
+        for (role, color) in BrandTheme::desktop().roles() {
+            assert_ne!(color, magenta, "{role} must not be magenta");
+            assert_ne!(color, neon_mint, "{role} must not be neon mint");
+            assert_ne!(color, teal, "{role} must not be teal");
         }
     }
 
     #[test]
-    fn body_muted_on_accent_and_danger_on_soft_meet_contrast_in_both_appearances() {
-        for (name, theme) in appearances() {
-            for (label, foreground, background) in [
-                ("body on canvas", theme.text, theme.canvas),
-                ("body on surface", theme.text, theme.surface),
-                ("muted on surface", theme.muted, theme.surface),
-                ("on-accent on copper", theme.on_copper, theme.copper),
-                ("danger-on-soft", theme.on_danger_soft, theme.danger_soft),
-            ] {
-                assert!(
-                    contrast_ratio(foreground, background) >= 4.5,
-                    "{name} {label} must meet 4.5:1, got {:.2}",
-                    contrast_ratio(foreground, background)
-                );
-            }
+    fn body_muted_on_accent_and_rail_text_meet_contrast() {
+        let theme = BrandTheme::desktop();
+        for (label, foreground, background) in [
+            ("body on surface", theme.text, theme.surface),
+            ("muted on surface", theme.muted, theme.surface),
+            ("on-accent on copper", theme.on_copper, theme.copper),
+            ("danger-on-soft", theme.on_danger_soft, theme.danger_soft),
+            ("on-canvas on rail", theme.on_canvas, theme.canvas),
+            (
+                "on-canvas-muted on rail",
+                theme.on_canvas_muted,
+                theme.canvas,
+            ),
+        ] {
+            assert!(
+                contrast_ratio(foreground, background) >= 4.5,
+                "{label} must meet 4.5:1, got {:.2}",
+                contrast_ratio(foreground, background)
+            );
         }
     }
 
     #[test]
-    fn applying_a_theme_paints_window_chrome_from_tokens() {
-        for theme in [BrandTheme::dark(), BrandTheme::light()] {
-            let mut style = egui::Style::default();
-            theme.apply_to_style(&mut style);
-            assert_eq!(style.visuals.panel_fill, theme.canvas);
-            assert_eq!(style.visuals.window_fill, theme.surface);
-            assert_eq!(style.visuals.extreme_bg_color, theme.field);
-            assert_eq!(style.visuals.selection.bg_fill, theme.copper_soft);
-            assert_eq!(style.visuals.selection.stroke.color, theme.copper);
-            assert_eq!(style.visuals.hyperlink_color, theme.steel);
-            assert_eq!(style.visuals.warn_fg_color, theme.warning);
-            assert_eq!(style.visuals.error_fg_color, theme.danger);
-            assert_eq!(style.visuals.widgets.hovered.bg_stroke.color, theme.copper);
-        }
+    fn applying_the_theme_paints_window_chrome_from_tokens() {
+        let theme = BrandTheme::desktop();
+        let mut style = egui::Style::default();
+        theme.apply_to_style(&mut style);
+        assert!(!style.visuals.dark_mode);
+        assert_eq!(style.visuals.panel_fill, theme.surface);
+        assert_eq!(style.visuals.window_fill, theme.surface);
+        assert_eq!(style.visuals.extreme_bg_color, theme.field);
+        assert_eq!(style.visuals.selection.bg_fill, theme.copper_soft);
+        assert_eq!(style.visuals.selection.stroke.color, theme.copper);
+        assert_eq!(style.visuals.hyperlink_color, theme.steel);
+        assert_eq!(style.visuals.warn_fg_color, theme.warning);
+        assert_eq!(style.visuals.error_fg_color, theme.danger);
+        assert_eq!(style.visuals.widgets.hovered.bg_stroke.color, theme.copper);
     }
 
     #[test]
@@ -348,15 +323,5 @@ mod tests {
         assert!(TypeRole::Title.size() <= 24.0);
         assert!(TypeRole::Title.size() < 38.0);
         assert!(TypeRole::Title.size() < 46.0);
-    }
-
-    #[test]
-    fn dark_and_light_token_sets_are_not_the_same_skin() {
-        let dark = BrandTheme::dark();
-        let light = BrandTheme::light();
-        assert_ne!(dark.canvas, light.canvas);
-        assert_ne!(dark.copper, light.copper);
-        assert_ne!(dark.steel, light.steel);
-        assert!(relative_luminance(light.canvas) > relative_luminance(dark.canvas));
     }
 }
