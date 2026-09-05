@@ -4628,22 +4628,54 @@ impl SyncPlusApp {
             }
             WorkspaceTab::Options => {
                 card_frame(ui).show(ui, |ui| {
-            section_intro(
-                ui,
-                "Scope",
-                "Exclusion Rules",
-                "One pattern per line. Excluded items are neither synchronized nor deleted.",
-            );
-            ui.add(egui::TextEdit::multiline(&mut self.form.exclusions).desired_rows(6));
-        });
+                    ui.label(egui::RichText::new("Exclusions").size(16.0).strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "One list, one pattern per line. File patterns such as *.tmp and folder patterns such as node_modules/ both belong here. Excluded items are not copied and not deleted.",
+                        )
+                        .color(palette.muted),
+                    );
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.form.exclusions)
+                            .desired_rows(6)
+                            .hint_text("*.tmp\n*.exe\nnode_modules/\n.cache/"),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Add a common pattern")
+                            .small()
+                            .color(palette.muted),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for (pattern, caption) in workspace::COMMON_PATTERNS {
+                            if compact_button(ui, pattern)
+                                .on_hover_text(caption)
+                                .clicked()
+                            {
+                                workspace::append_pattern(&mut self.form.exclusions, pattern);
+                            }
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Hidden files are included unless you add a pattern such as .cache/ or .git/.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
+                });
                 if self.settings.mode() == ApplicationMode::Advanced {
                     card_frame(ui).show(ui, |ui| {
-                section_intro(
-                    ui,
-                    "Advanced Mode",
-                    "Safety options",
-                    "These named options stay subject to Fresh Analysis, verification, and Execution Confirmation.",
+                ui.label(egui::RichText::new("Advanced safety options").size(16.0).strong());
+                ui.label(
+                    egui::RichText::new(
+                        "Named options only. Fresh Analysis, verification, and Execution Confirmation still apply.",
+                    )
+                    .color(palette.muted),
                 );
+                ui.add_space(8.0);
                     let safe_delete_changed = ui
                         .checkbox(&mut self.form.safe_delete, "One-Way Safe-Delete Sync")
                         .changed();
@@ -4778,20 +4810,16 @@ impl SyncPlusApp {
                     ui.label("These options remain subject to Fresh Analysis, verification, and explicit Execution Confirmation.");
             });
                 } else {
-                    full_width_inset_frame(ui, |ui| {
+                    card_frame(ui).show(ui, |ui| {
                         ui.label(egui::RichText::new("Simple Mode").strong());
-                        ui.label("Destructive options stay hidden. Switch to Advanced Mode only when you need to review them.");
+                        ui.label(
+                            egui::RichText::new(
+                                "Deletion, Destination Cleanup, schedules, and unattended authorization stay off. Switch to Advanced Mode in Settings only when you need those named options.",
+                            )
+                            .color(palette.muted),
+                        );
                     });
                 }
-                card_frame(ui).show(ui, |ui| {
-            ui.collapsing("Help & safety", |ui| {
-                ui.label("What: Simple Mode provides a calm, non-destructive One-Way Sync profile editor.");
-                ui.label("Why: new profiles start with source-authoritative copying and no deletion, cleanup, schedules, or unattended destructive authorization.");
-                ui.label("How: choose named local folders or one SSH peer, validate the fields, then save. The core creates the same typed Process Specification used later for execution.");
-                ui.label("When: Fresh Analysis, precheck, and one final Execution Confirmation are required before a file-changing run.");
-                ui.label("Limits: Mirror Sync has no implicit winner; excluded, unavailable, changed, or ambiguous items remain visible for review. Passwords stay in the desktop keyring and only an opaque reference is kept in the profile.");
-            });
-        });
             }
             WorkspaceTab::Plan => {}
         }
@@ -5091,62 +5119,61 @@ impl SyncPlusApp {
         let mut request_start = false;
         let mut request_resolution_start = false;
         let mut request_resolution_confirmation = false;
-        section_intro(
-            ui,
-            "Safety gate",
-            "Plan review and Execution Confirmation",
-            "Read the exact scope, resolve every blocker, then confirm this plan before any file-changing action.",
-        );
-        ui.add_space(8.0);
-        if primary_button_enabled(
-            ui,
-            if self.folder_gate.check_folders_enabled() {
-                "Check folders"
-            } else if self.review.is_some() {
-                "Run dry run again"
-            } else {
-                "Dry run · Analyze"
-            },
-            if self.folder_gate.check_folders_enabled() {
-                self.active_analysis.is_none()
-            } else {
-                self.can_dry_run()
-            },
-        )
-        .clicked()
-        {
-            request_analyze = true;
-        }
-        draw_contextual_help_link(
-            ui,
-            "Plan and confirmation",
-            help_topic_for_surface(HelpSurface::Plan),
-            &mut self.help_topic,
-        );
+        let palette = ui_palette(ui);
+        let dry_run_label = if self.folder_gate.check_folders_enabled() {
+            "Check folders"
+        } else if self.review.is_some() {
+            "Run dry run again"
+        } else {
+            "Dry run · Analyze"
+        };
+        let dry_run_enabled = if self.folder_gate.check_folders_enabled() {
+            self.active_analysis.is_none()
+        } else {
+            self.can_dry_run()
+        };
 
         let synchronise_enabled = self.can_synchronise();
         if let Some(review) = self.review.as_mut() {
-            ui.label(egui::RichText::new("This is a read-only review of the current profile. No filesystem mutation starts from this view.").color(ui_palette(ui).muted));
+            let (source_peer, destination_peer) = mapped_peers(&review.profile);
+            let source = source_peer.root().display().to_string();
+            let destination = destination_peer.root().display().to_string();
             card_frame(ui).show(ui, |ui| {
-                section_intro(
-                    ui,
-                    "Scope",
-                    "Folder mapping",
-                    "These exact roots define the reviewed action. A trailing separator does not widen the scope.",
-                );
-                let (source_peer, destination_peer) = mapped_peers(&review.profile);
-                let source = source_peer.root().display().to_string();
-                let destination = destination_peer.root().display().to_string();
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Plan").size(16.0).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if primary_button_enabled(ui, dry_run_label, dry_run_enabled).clicked() {
+                            request_analyze = true;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
                 if review.profile.mode() == SyncMode::OneWay {
-                    ui.label(format!("Selected source folder: {source}"));
-                    ui.label(format!("Selected destination folder: {destination}"));
-                    ui.label("One-Way Sync copies the selected source folder's contents into the selected destination folder.");
+                    ui.label(egui::RichText::new(format!("{source}  →  {destination}")).strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "One-Way Sync. Nothing is changed until Execution Confirmation.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
                 } else {
-                    ui.label(format!("Peer A folder: {}", review.profile.peer_a().root().display()));
-                    ui.label(format!("Peer B folder: {}", review.profile.peer_b().root().display()));
-                    ui.label("Mirror Sync reviews both folder directions independently; neither folder is an implicit winner.");
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{}  ↔  {}",
+                            review.profile.peer_a().root().display(),
+                            review.profile.peer_b().root().display()
+                        ))
+                        .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Mirror Sync. Neither side wins until you confirm each conflict.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
                 }
-                ui.label("The reviewed typed Process Specification below is authoritative for execution.");
             });
 
             if let Some(error) = &review.error {
@@ -5260,12 +5287,14 @@ impl SyncPlusApp {
                     .corner_radius(egui::CornerRadius::same(12))
                     .inner_margin(egui::Margin::symmetric(16, 14))
                     .show(ui, |ui| {
-                    section_intro(
-                        ui,
-                        "Final gate",
-                        "Execution Confirmation",
-                        "Confirm only after the plan, precheck, and any high-risk scope requirements are understood.",
+                    ui.label(egui::RichText::new("Execution Confirmation").size(16.0).strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "Confirm this plan only after the counts and mapping above look right. Nothing is changed until you confirm.",
+                        )
+                        .color(palette.muted),
                     );
+                    ui.add_space(6.0);
                     if review.confirmed {
                         status_badge(ui, "Confirmation recorded", true);
                     }
@@ -5303,11 +5332,26 @@ impl SyncPlusApp {
                 });
             } else {
                 ui.label(
-                    "No explainable plan is available until the precheck and Fresh Analysis pass.",
+                    egui::RichText::new(
+                        "No explainable plan yet. Fix the blocker above, then run a Dry run. Nothing is changed until Execution Confirmation.",
+                    )
+                    .color(palette.muted),
                 );
             }
         } else {
-            ui.label("No plan has been analyzed. Select Analyze current state to review the intended work.");
+            card_frame(ui).show(ui, |ui| {
+                ui.label(egui::RichText::new("No plan yet").size(16.0).strong());
+                ui.label(
+                    egui::RichText::new(
+                        "Dry run reads the two folders and lists copies, skips, and anything that needs review. Nothing is changed until Execution Confirmation.",
+                    )
+                    .color(palette.muted),
+                );
+                ui.add_space(10.0);
+                if primary_button_enabled(ui, dry_run_label, dry_run_enabled).clicked() {
+                    request_analyze = true;
+                }
+            });
         }
 
         if request_analyze && let Err(error) = self.request_workspace_analysis(ui.ctx()) {
@@ -5880,7 +5924,7 @@ fn draw_analysis_review(
     ui: &mut egui::Ui,
     review: &PlanReviewState,
     analysis: &FreshAnalysis,
-    help_topic: &mut HelpTopic,
+    _help_topic: &mut HelpTopic,
 ) {
     let summary = analysis.plan().summary();
     let unsupported_count = analysis
@@ -5894,43 +5938,64 @@ fn draw_analysis_review(
         + analysis.destination_inventory().excluded_items().count();
 
     card_frame(ui).show(ui, |ui| {
-        section_intro(
-            ui,
-            "Fresh Analysis",
-            "Explainable Actions",
-            "A read-only plan generated from the current profile and endpoint inventories.",
+        ui.label(
+            egui::RichText::new("What this Dry run found")
+                .size(16.0)
+                .strong(),
         );
-        draw_contextual_help_link(
-            ui,
-            "Plan guidance",
-            help_topic_for_surface(HelpSurface::Plan),
-            help_topic,
+        ui.label(
+            egui::RichText::new("Read-only. No files are changed until Execution Confirmation.")
+                .small()
+                .color(ui_palette(ui).muted),
         );
+        ui.add_space(8.0);
+        ui.columns(4, |columns| {
+            draw_progress_chip(
+                &mut columns[0],
+                "Copies",
+                &format!(
+                    "{} ({})",
+                    summary.copy_count(),
+                    format_bytes(summary.copy_bytes())
+                ),
+            );
+            draw_progress_chip(
+                &mut columns[1],
+                "Overwrites",
+                &format!(
+                    "{} ({})",
+                    summary.overwrite_count(),
+                    format_bytes(summary.overwrite_bytes())
+                ),
+            );
+            draw_progress_chip(&mut columns[2], "Excluded", &format!("{excluded_count}"));
+            draw_progress_chip(
+                &mut columns[3],
+                "Unresolved",
+                &format!("{unsupported_count}"),
+            );
+        });
+        ui.add_space(6.0);
         ui.label(format!(
-            "Considered: {} | Included: {} | Excluded: {} | Unresolved or unsupported: {}",
+            "Considered {} items. Transfer size {}.",
             summary.considered_count(),
-            summary.included_count(),
-            summary.excluded_count(),
-            unsupported_count
+            format_bytes(summary.total_bytes())
         ));
-        ui.label(format!(
-            "Copies: {} ({}) | Overwrites: {} ({}) | Destination removals: {} ({}) | Source removals: {} ({})",
-            summary.copy_count(),
-            format_bytes(summary.copy_bytes()),
-            summary.overwrite_count(),
-            format_bytes(summary.overwrite_bytes()),
-            summary.destination_removal_count(),
-            format_bytes(summary.destination_removal_bytes()),
-            summary.source_removal_count(),
-            format_bytes(summary.source_removal_bytes())
-        ));
-        ui.label(format!("Transfer data: {}", format_bytes(summary.total_bytes())));
+        if summary.destination_removal_count() > 0 || summary.source_removal_count() > 0 {
+            ui.label(format!(
+                "Removals: {} at destination ({}), {} at source ({}).",
+                summary.destination_removal_count(),
+                format_bytes(summary.destination_removal_bytes()),
+                summary.source_removal_count(),
+                format_bytes(summary.source_removal_bytes())
+            ));
+        }
         status_badge(
             ui,
             if unsupported_count == 0 {
-                "Scope ready for confirmation"
+                "Ready for confirmation"
             } else {
-                "Scope has unresolved items"
+                "Unresolved items remain"
             },
             unsupported_count == 0,
         );
@@ -9172,12 +9237,23 @@ mod tests {
                 && joined.contains("Task name"),
             "typical window must keep the two-folder setup on Folders, got {joined}"
         );
+        app.workspace_tab = WorkspaceTab::Options;
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("Exclusions") && joined.contains("*.tmp"),
+            "Options missing the single exclusion list in {joined}"
+        );
+        assert!(
+            !joined.contains("Help & safety"),
+            "Options still dumped Help & safety in {joined}"
+        );
         app.workspace_tab = WorkspaceTab::Plan;
         let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
         let joined = texts.join("\n");
         assert!(
-            joined.contains("Execution Confirmation"),
-            "Plan tab missing Execution Confirmation in {joined}"
+            joined.contains("No plan yet") && joined.contains("Execution Confirmation"),
+            "Plan tab missing a useful empty state in {joined}"
         );
         assert!(
             joined.contains("Documents backup"),
