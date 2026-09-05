@@ -2,9 +2,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        mpsc::{self, Receiver, TryRecvError},
     },
     thread,
     time::{Duration, Instant},
@@ -29,6 +29,7 @@ use syncplus_core::{
 
 use crate::chrome::{self, ChromeAccent, ChromeSurface, OverviewAction};
 use crate::theme::{BrandTheme, TypeRole};
+use crate::tray::{self, TrayCommand, TrayRuntime};
 use crate::workspace::{
     self, AnalysisKind, AnalysisPhase, FolderGate, ReconnectPrompt, WorkspaceTab,
 };
@@ -307,97 +308,6 @@ fn deliver_desktop_notification(title: &str, reason: &str, next_action: &str) ->
         .show()
         .map(|_| ())
         .map_err(|_| ())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrayCommand {
-    ShowWindow,
-    Quit,
-}
-
-struct SyncPlusTray {
-    commands: Sender<TrayCommand>,
-    repaint_context: Arc<Mutex<Option<egui::Context>>>,
-}
-
-impl SyncPlusTray {
-    fn dispatch(&self, command: TrayCommand) {
-        let _ = self.commands.send(command);
-        if let Ok(context) = self.repaint_context.lock()
-            && let Some(context) = context.as_ref()
-        {
-            context.request_repaint();
-        }
-    }
-}
-
-impl ksni::Tray for SyncPlusTray {
-    const MENU_ON_ACTIVATE: bool = true;
-
-    fn id(&self) -> String {
-        "syncplus".to_owned()
-    }
-
-    fn title(&self) -> String {
-        "SyncPlus".to_owned()
-    }
-
-    fn icon_name(&self) -> String {
-        "folder".to_owned()
-    }
-
-    fn status(&self) -> ksni::Status {
-        ksni::Status::Active
-    }
-
-    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        use ksni::menu::{MenuItem, StandardItem};
-
-        vec![
-            StandardItem {
-                label: "_Show SyncPlus".to_owned(),
-                shortcut: vec![vec!["Control".to_owned(), "S".to_owned()]],
-                activate: Box::new(|tray: &mut SyncPlusTray| {
-                    tray.dispatch(TrayCommand::ShowWindow)
-                }),
-                ..Default::default()
-            }
-            .into(),
-            MenuItem::Separator,
-            StandardItem {
-                label: "_Quit SyncPlus".to_owned(),
-                shortcut: vec![vec!["Control".to_owned(), "Q".to_owned()]],
-                activate: Box::new(|tray: &mut SyncPlusTray| tray.dispatch(TrayCommand::Quit)),
-                ..Default::default()
-            }
-            .into(),
-        ]
-    }
-}
-
-struct TrayRuntime {
-    _handle: ksni::blocking::Handle<SyncPlusTray>,
-    receiver: Receiver<TrayCommand>,
-    repaint_context: Arc<Mutex<Option<egui::Context>>>,
-}
-
-impl TrayRuntime {
-    fn start() -> Result<Self, String> {
-        use ksni::blocking::TrayMethods;
-
-        let (commands, receiver) = mpsc::channel();
-        let repaint_context = Arc::new(Mutex::new(None));
-        let tray = SyncPlusTray {
-            commands,
-            repaint_context: repaint_context.clone(),
-        };
-        let handle = tray.spawn().map_err(|error| error.to_string())?;
-        Ok(Self {
-            _handle: handle,
-            receiver,
-            repaint_context,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1708,7 +1618,7 @@ pub struct SyncPlusApp {
     pending_report_action: Option<PendingReportAction>,
     help_topic: HelpTopic,
     tray: Option<TrayRuntime>,
-    tray_attempted: bool,
+    tray_retry_at: Option<Instant>,
     window_hidden_to_tray: bool,
     quit_flow: QuitFlow,
     exit_requested: bool,
@@ -1775,7 +1685,7 @@ impl SyncPlusApp {
             pending_report_action: None,
             help_topic: HelpTopic::GettingStarted,
             tray: None,
-            tray_attempted: false,
+            tray_retry_at: None,
             window_hidden_to_tray: false,
             quit_flow: QuitFlow::None,
             exit_requested: false,
@@ -2216,28 +2126,50 @@ impl SyncPlusApp {
         }
     }
 
+    fn tick_while_running(&mut self, context: &egui::Context) {
+        self.ensure_tray(context);
+        self.process_tray_commands(context);
+        self.poll_analysis();
+        self.poll_manual_run(context);
+        if !self.exit_requested && tray::viewport_close_requested(context) {
+            self.handle_close_request(context);
+        }
+        if self.exit_requested {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        context.request_repaint_after(Duration::from_millis(
+            if self.active_manual_run.is_some() || self.active_analysis.is_some() {
+                200
+            } else {
+                1_000
+            },
+        ));
+    }
+
     fn ensure_tray(&mut self, context: &egui::Context) {
         if let Some(tray) = self.tray.as_ref() {
-            if let Ok(mut repaint_context) = tray.repaint_context.lock() {
-                *repaint_context = Some(context.clone());
-            }
+            tray.bind_repaint_context(context);
             return;
         }
-        if self.tray_attempted {
+        if !tray::should_retry_tray(self.tray_retry_at, Instant::now()) {
             return;
         }
-        self.tray_attempted = true;
         match TrayRuntime::start() {
             Ok(tray) => {
-                if let Ok(mut repaint_context) = tray.repaint_context.lock() {
-                    *repaint_context = Some(context.clone());
-                }
+                tray.bind_repaint_context(context);
                 self.tray = Some(tray);
+                self.tray_retry_at = None;
+                if self.status == tray::TRAY_UNAVAILABLE_COPY {
+                    self.status = "SyncPlus is available in the system tray.".to_owned();
+                }
             }
-            Err(error) => {
-                self.status = format!(
-                    "System tray is unavailable ({error}); the window will remain visible so SyncPlus stays reachable."
-                );
+            Err(_) => {
+                let first_failure = self.tray_retry_at.is_none();
+                self.tray_retry_at = Some(tray::next_tray_retry(Instant::now()));
+                if first_failure {
+                    self.status = tray::TRAY_UNAVAILABLE_COPY.to_owned();
+                }
             }
         }
     }
@@ -2246,7 +2178,7 @@ impl SyncPlusApp {
         let commands = self
             .tray
             .as_ref()
-            .map(|tray| tray.receiver.try_iter().collect::<Vec<_>>())
+            .map(TrayRuntime::take_commands)
             .unwrap_or_default();
         for command in commands {
             match command {
@@ -2263,21 +2195,23 @@ impl SyncPlusApp {
     }
 
     fn hide_to_tray(&mut self, context: &egui::Context) {
+        self.tray_retry_at = None;
+        self.ensure_tray(context);
+        context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         if window_close_decision(self.tray.is_some()) == WindowCloseDecision::KeepVisible {
-            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.status = "The system tray is unavailable, so SyncPlus remains visible and the run was not stopped.".to_owned();
+            self.status = tray::TRAY_UNAVAILABLE_COPY.to_owned();
             return;
         }
         self.window_hidden_to_tray = true;
-        context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         self.status = if let Some(active) = self.active_manual_run.as_ref() {
             format!(
-                "SyncPlus is hidden in the system tray. Manual Sync Run {} continues; use the tray menu to show the window.",
+                "SyncPlus is hidden in the system tray. Manual Sync Run {} continues; left-click the tray icon to show the window.",
                 active.run_id.value()
             )
         } else {
-            "SyncPlus is hidden in the system tray. Scheduled work remains owned by the per-user background scheduler.".to_owned()
+            "SyncPlus is hidden in the system tray. Left-click the tray icon to show the window."
+                .to_owned()
         };
     }
 
@@ -6192,11 +6126,15 @@ fn execute_manual_run(
 }
 
 impl eframe::App for SyncPlusApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.tick_while_running(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
-        self.ensure_tray(&context);
-        self.process_tray_commands(&context);
-        self.poll_analysis();
+        if self.exit_requested {
+            return;
+        }
         if self.pending_folder_check && self.active_analysis.is_none() {
             self.pending_folder_check = false;
             if let Err(error) = self.start_folder_check(&context) {
@@ -6204,21 +6142,6 @@ impl eframe::App for SyncPlusApp {
                 self.status = format_form_validation_diagnostic(&self.form, &error);
             }
         }
-        self.poll_manual_run(&context);
-        if !self.exit_requested && context.input(|input| input.viewport().close_requested()) {
-            self.handle_close_request(&context);
-        }
-        if self.exit_requested {
-            context.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-        context.request_repaint_after(Duration::from_millis(
-            if self.active_manual_run.is_some() || self.active_analysis.is_some() {
-                200
-            } else {
-                1_000
-            },
-        ));
         self.apply_theme(ui.ctx());
         if let Err(error) = self.refresh_run_reports() {
             self.status = format!("Run Reports are unavailable: {error}");
@@ -8037,6 +7960,10 @@ mod tests {
         assert_eq!(
             window_close_decision(false),
             WindowCloseDecision::KeepVisible
+        );
+        assert_eq!(
+            crate::tray::TRAY_UNAVAILABLE_COPY,
+            "The system tray is not available, so the window stays open. Use Exit when you want to quit."
         );
     }
 

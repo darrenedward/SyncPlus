@@ -357,7 +357,7 @@ _Avoid_: Hidden schedules, Simple Mode scheduling, or unattended execution that 
 The per-OS-user scheduling component that can start authorized Scheduled Runs while the SyncPlus window is closed. It runs without root/administrator privileges, uses the profile's normal permissions and credentials, cannot bypass SyncPlus safety invariants, and persists reports and notifications for later review.
 _Avoid_: Root daemons, hidden privileged services, or schedules that work only while the window is open
 
-Closing the SyncPlus window hides it to the system tray and does not interrupt an active run. **Quit** is a separate action; when a manual run is active, it asks whether to stop and recover it. A crash or forced termination creates an Interrupted Run and follows the cleanup and resume policy.
+Closing the SyncPlus window hides it to the system tray and does not interrupt an active run. The tray uses the Brand Mark; left-click shows the window and right-click offers Show or Quit. Hide-to-tray stays active after the window is hidden so a follow-up close event cannot quit the process. If the tray cannot be registered, the window stays open and SyncPlus says so in plain language. **Quit** is a separate action; when a manual run is active, it asks whether to stop and recover it. A crash or forced termination creates an Interrupted Run and follows the cleanup and resume policy.
 
 If the user selects **No**, the active run continues. If the user selects **Yes**, SyncPlus stops the run safely, records the interrupted state, preserves the source, and applies the partial-transfer cleanup policy. When schedules are enabled, quitting the foreground UI does not disable the separate Background Scheduler; disabling schedules is a separate explicit action.
 

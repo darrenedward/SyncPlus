@@ -9,10 +9,13 @@ Closing the SyncPlus window will hide it to the system tray and leave an active 
 Unexpected crashes or forced termination are treated as Interrupted Runs: child processes are stopped where possible, partial data follows the configured cleanup policy, the source remains preserved, and recovery state remains available for Fresh Analysis.
 
 The desktop implementation uses the Linux StatusNotifierItem tray service and
-egui viewport close interception. A window close request is cancelled and the
-window is hidden only after a tray is available; if tray registration fails the
-window remains visible. Manual runs execute on a worker through the shared core
-workflow, compare the freshly confirmed plan with the reviewed plan, and expose
-only a cancellation request to the Quit dialog. Quit closes only after the
-worker reports its durable cancellation boundary. Scheduled work remains in the
-separate per-user scheduler process.
+egui viewport close interception. Close interception and tray commands run in
+the eframe logic tick so they continue after the window is hidden. A window
+close request is cancelled and the window is hidden only after a tray is
+available; if tray registration fails the window remains visible and the
+diagnostic is plain language, not a D-Bus or GPU error dump. The tray carries
+the Brand Mark pixmap rather than a generic named icon. Manual runs execute on
+a worker through the shared core workflow, compare the freshly confirmed plan
+with the reviewed plan, and expose only a cancellation request to the Quit
+dialog. Quit closes only after the worker reports its durable cancellation
+boundary. Scheduled work remains in the separate per-user scheduler process.
