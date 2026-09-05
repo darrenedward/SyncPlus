@@ -64,6 +64,28 @@ fn application_settings_survive_restart() {
 }
 
 #[test]
+fn named_theme_preferences_survive_restart_without_stored_colours() {
+    for theme in [
+        ThemePreference::System,
+        ThemePreference::Light,
+        ThemePreference::Dark,
+    ] {
+        let database = database();
+        {
+            let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+            store
+                .save_settings(&ApplicationSettings::new(ApplicationMode::Simple, theme))
+                .expect("save settings");
+        }
+        let reopened = RunEvidenceStore::open(database.path()).expect("reopen database");
+        assert_eq!(
+            reopened.load_settings().expect("load settings").theme(),
+            theme
+        );
+    }
+}
+
+#[test]
 fn profiles_round_trip_with_validated_endpoints_and_safe_defaults() {
     let database = database();
     let original = profile();

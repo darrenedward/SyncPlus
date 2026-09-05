@@ -497,3 +497,17 @@ Before restoring, SyncPlus quarantines the corrupt live database under a timesta
 **Brand Mark**:
 The SyncPlus identity mark: a rounded square with a copper outbound arrow and a steel inbound arrow in a protected loop. The packaged desktop icon and the window icon are this mark. The dark mark sits on warm ink; a light mark on warm paper and a monochrome mark exist so it stays legible without a white box.
 _Avoid_: Seafoam, neon mint, magenta, teal, a procedural window glyph, a menu icon that differs from the window icon
+
+## Appearance
+
+**Dark Appearance**:
+The first-class dark theme: warm ink surfaces, copper primary accent, and steel companion accent. It is not pure black and not a neon-on-black HUD.
+_Avoid_: OLED black, cyberpunk, treating dark as the only real product
+
+**Light Appearance**:
+The first-class light theme: warm paper, cream, and stone surfaces. The canvas is not white and is not a brightness-inverted Dark Appearance.
+_Avoid_: White sheet, bright fallback, leftover dark-mode chrome
+
+**Brand Theme**:
+The desktop GUI token set that supplies canvas, surface, elevated, field, text, muted, border, copper, steel, danger, warning, and their on/soft pairs for both appearances. Core stores only the named preference System, Light, or Dark; it does not store colours.
+_Avoid_: Per-screen one-off colours, user-supplied chrome, colours in SQLite

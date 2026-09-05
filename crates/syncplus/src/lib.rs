@@ -10,6 +10,8 @@
 
 mod app;
 mod brand_mark;
+mod theme;
 
 pub use app::{EndpointKind, SyncPlusApp, UiValidationError, run_background_scheduler_once};
 pub use brand_mark::window_icon;
+pub use theme::BrandTheme;
