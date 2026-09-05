@@ -1287,6 +1287,7 @@ pub fn help_entry(topic: HelpTopic) -> HelpEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HelpSurface {
+    #[allow(dead_code)]
     Profile,
     Plan,
     ConflictReview,
@@ -4444,109 +4445,65 @@ impl SyncPlusApp {
         let palette = ui_palette(ui);
         card_frame(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    section_intro(
-                        ui,
-                        "Sync",
-                        "Sync workspace",
-                        "Choose how files move, pick two folders, then run a Dry run.",
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    status_badge(ui, "Configuration", true);
-                });
-            });
-            ui.add_space(12.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("Active profile").strong());
+                ui.label(egui::RichText::new("Sync workspace").size(16.0).strong());
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("Profile").color(palette.muted));
                 egui::ComboBox::from_id_salt("workspace-profile-selector")
                     .selected_text(selected_profile_name)
-                    .width(280.0)
+                    .width(220.0)
                     .show_ui(ui, |ui| {
                         for (id, name) in &profile_options {
-                            ui.selectable_value(
-                                &mut profile_to_select,
-                                Some(*id),
-                                name,
-                            );
+                            ui.selectable_value(&mut profile_to_select, Some(*id), name);
                         }
                     });
-                ui.label(egui::RichText::new("Changes apply to a later Sync Run.").color(palette.muted));
-            });
-            ui.add_space(12.0);
-            ui.horizontal_wrapped(|ui| {
-                if secondary_button(ui, "Validate profile").clicked() {
-                    request_validate = true;
-                }
-                if primary_button_enabled(ui, "Save profile", form_is_dirty).clicked() {
-                    request_save = true;
-                }
-                if primary_button_enabled(
-                    ui,
-                    if self.folder_gate.check_folders_enabled() {
-                        "Check folders"
-                    } else if self.review.is_some() {
-                        "Run dry run again"
-                    } else {
-                        "Dry run · Analyze"
-                    },
-                    if self.folder_gate.check_folders_enabled() {
-                        self.active_analysis.is_none()
-                    } else {
-                        self.can_dry_run()
-                    },
-                )
-                .clicked()
-                {
-                    request_analyze = true;
-                }
                 if form_is_dirty {
                     ui.label(
-                        egui::RichText::new("Unsaved changes")
+                        egui::RichText::new("Unsaved")
                             .small()
                             .color(palette.warning),
                     );
                 }
-            });
-            ui.add_space(10.0);
-            egui::Frame::new()
-                .fill(palette.field)
-                .stroke(egui::Stroke::new(1.0, palette.border_subtle))
-                .corner_radius(egui::CornerRadius::same(9))
-                .inner_margin(egui::Margin::symmetric(12, 9))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        status_dot(ui, palette.steel);
-                        ui.label(egui::RichText::new("No arbitrary commands").strong());
-                        ui.label(egui::RichText::new("SyncPlus uses validated profile fields and the same reviewed process specification for analysis and execution.").color(palette.muted));
-                    });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if primary_button_enabled(
+                        ui,
+                        if self.folder_gate.check_folders_enabled() {
+                            "Check folders"
+                        } else if self.review.is_some() {
+                            "Run dry run again"
+                        } else {
+                            "Dry run · Analyze"
+                        },
+                        if self.folder_gate.check_folders_enabled() {
+                            self.active_analysis.is_none()
+                        } else {
+                            self.can_dry_run()
+                        },
+                    )
+                    .clicked()
+                    {
+                        request_analyze = true;
+                    }
+                    if primary_button_enabled(ui, "Save profile", form_is_dirty).clicked() {
+                        request_save = true;
+                    }
+                    if secondary_button(ui, "Validate profile").clicked() {
+                        request_validate = true;
+                    }
                 });
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                status_dot(
-                    ui,
-                    if review_blocked {
+            });
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(&self.status)
+                    .small()
+                    .color(if review_blocked {
                         palette.danger
                     } else {
                         palette.muted
-                    },
-                );
-                ui.label(egui::RichText::new("Latest status").strong());
-                ui.label(egui::RichText::new(&self.status).color(if review_blocked {
-                    palette.danger
-                } else {
-                    palette.muted
-                }));
-            });
-            draw_contextual_help_link(
-                ui,
-                "Profile guidance",
-                help_topic_for_surface(HelpSurface::Profile),
-                &mut self.help_topic,
+                    }),
             );
         });
-        ui.add_space(8.0);
-        workspace::draw_tab_bar(ui, &mut self.workspace_tab);
+        ui.add_space(10.0);
+        workspace::draw_tab_bar(ui, &mut self.workspace_tab, palette);
         ui.add_space(8.0);
         match self.workspace_tab {
             WorkspaceTab::Folders => {
@@ -4633,27 +4590,38 @@ impl SyncPlusApp {
                         self.form.mode = SyncMode::Mirror;
                     }
                 });
-                ui.add_space(16.0);
+                ui.add_space(10.0);
                 card_frame(ui).show(ui, |ui| {
-                    ui.label(egui::RichText::new("Task name").strong());
-                    ui.add_sized(
-                        egui::vec2(ui.available_width(), 40.0),
-                        egui::TextEdit::singleline(&mut self.form.name)
-                            .hint_text("Documents backup")
-                            .vertical_align(egui::Align::Center),
-                    );
-                    ui.add_space(16.0);
-                    if draw_simple_folder_picker(ui, "Source folder", &mut self.form.peer_a) {
-                        self.folder_gate = FolderGate::Unknown;
-                        self.pending_folder_check = true;
-                    }
-                    ui.add_space(14.0);
-                    if draw_simple_folder_picker(ui, "Destination folder", &mut self.form.peer_b) {
-                        self.folder_gate = FolderGate::Unknown;
-                        self.pending_folder_check = true;
-                    }
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Task name").strong());
+                        ui.add_sized(
+                            egui::vec2(ui.available_width(), 32.0),
+                            egui::TextEdit::singleline(&mut self.form.name)
+                                .hint_text("Documents backup")
+                                .vertical_align(egui::Align::Center),
+                        );
+                    });
+                    ui.add_space(10.0);
+                    ui.columns(2, |columns| {
+                        if draw_simple_folder_picker(
+                            &mut columns[0],
+                            "Source folder",
+                            &mut self.form.peer_a,
+                        ) {
+                            self.folder_gate = FolderGate::Unknown;
+                            self.pending_folder_check = true;
+                        }
+                        if draw_simple_folder_picker(
+                            &mut columns[1],
+                            "Destination folder",
+                            &mut self.form.peer_b,
+                        ) {
+                            self.folder_gate = FolderGate::Unknown;
+                            self.pending_folder_check = true;
+                        }
+                    });
                     if self.form.mode == SyncMode::OneWay {
-                        ui.add_space(10.0);
+                        ui.add_space(8.0);
                         ui.horizontal_wrapped(|ui| {
                             ui.label(egui::RichText::new("Authoritative source").strong());
                             ui.radio_value(
@@ -6715,6 +6683,17 @@ fn secondary_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     response
 }
 
+fn compact_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let palette = ui_palette(ui);
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).color(palette.text))
+            .fill(palette.surface)
+            .stroke(egui::Stroke::new(1.0, palette.border))
+            .corner_radius(egui::CornerRadius::same(6))
+            .min_size(egui::vec2(0.0, 32.0)),
+    )
+}
+
 fn sidebar_nav_button(
     ui: &mut egui::Ui,
     label: &str,
@@ -7134,108 +7113,171 @@ fn draw_method_card(ui: &mut egui::Ui, selected: bool, title: &str, caption: &st
     let fill = if selected {
         palette.copper_soft
     } else {
-        palette.field
+        palette.surface
     };
     let stroke = if selected {
         palette.copper
     } else {
         palette.border
     };
-    let inner = egui::Frame::new()
-        .fill(fill)
-        .stroke(egui::Stroke::new(if selected { 2.0 } else { 1.0 }, stroke))
-        .corner_radius(egui::CornerRadius::same(14))
-        .inner_margin(egui::Margin::symmetric(16, 18))
-        .show(ui, |ui| {
-            ui.set_min_height(168.0);
-            ui.set_width(ui.available_width());
-            ui.vertical_centered(|ui| {
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
-                ui.painter().circle_filled(
-                    rect.center(),
-                    28.0,
-                    if selected {
-                        palette.copper
-                    } else {
-                        palette.elevated
-                    },
-                );
-                ui.painter().circle_stroke(
-                    rect.center(),
-                    28.0,
-                    egui::Stroke::new(
-                        1.5,
-                        if selected {
-                            palette.on_copper
-                        } else {
-                            palette.steel
-                        },
-                    ),
-                );
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new(title).size(18.0).strong());
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(caption).color(palette.muted));
-                if selected {
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Selected")
-                            .small()
-                            .strong()
-                            .color(palette.copper),
+    let inner =
+        egui::Frame::new()
+            .fill(fill)
+            .stroke(egui::Stroke::new(if selected { 1.5 } else { 1.0 }, stroke))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.set_min_height(64.0);
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                    ui.painter().circle_stroke(
+                        rect.center(),
+                        8.0,
+                        egui::Stroke::new(
+                            1.5,
+                            if selected {
+                                palette.copper
+                            } else {
+                                palette.border
+                            },
+                        ),
                     );
-                }
+                    if selected {
+                        ui.painter()
+                            .circle_filled(rect.center(), 4.5, palette.copper);
+                    }
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(title).size(15.0).strong().color(
+                            if selected {
+                                palette.copper
+                            } else {
+                                palette.text
+                            },
+                        ));
+                        ui.label(egui::RichText::new(caption).small().color(palette.muted));
+                    });
+                });
             });
-        });
     inner.response.interact(egui::Sense::click()).clicked()
 }
 
 fn draw_simple_folder_picker(ui: &mut egui::Ui, title: &str, endpoint: &mut EndpointForm) -> bool {
     let palette = ui_palette(ui);
     let mut browsed = false;
-    ui.label(egui::RichText::new(title).size(15.0).strong());
-    ui.add_space(6.0);
-    ui.horizontal(|ui| {
-        ui.radio_value(&mut endpoint.kind, EndpointKind::Local, "This computer");
-        ui.radio_value(&mut endpoint.kind, EndpointKind::Ssh, "SSH peer");
-    });
-    ui.add_space(6.0);
-    match endpoint.kind {
-        EndpointKind::Local => {
+    egui::Frame::new()
+        .fill(palette.elevated)
+        .stroke(egui::Stroke::new(1.0, palette.border_subtle))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(title).size(14.0).strong());
             ui.horizontal(|ui| {
-                let browse_width = 110.0;
-                let field_width =
-                    (ui.available_width() - browse_width - ui.spacing().item_spacing.x).max(200.0);
-                ui.add_sized(
-                    egui::vec2(field_width, 40.0),
-                    egui::TextEdit::singleline(&mut endpoint.local_path)
-                        .hint_text("Select a folder")
-                        .vertical_align(egui::Align::Center),
-                );
-                if secondary_button(ui, "Browse").clicked()
-                    && let Some(path) = FileDialog::new()
-                        .set_title(format!("Select {title}"))
-                        .pick_folder()
-                {
-                    endpoint.local_path = path.to_string_lossy().into_owned();
-                    if endpoint.name.trim().is_empty() {
-                        endpoint.name = title.to_owned();
-                    }
-                    browsed = true;
-                }
+                ui.radio_value(&mut endpoint.kind, EndpointKind::Local, "This computer");
+                ui.radio_value(&mut endpoint.kind, EndpointKind::Ssh, "SSH peer");
             });
-        }
-        EndpointKind::Ssh => {
-            draw_endpoint(ui, title, endpoint);
-        }
-    }
-    ui.label(
-        egui::RichText::new("The folder is a validated path. No shell command is accepted.")
-            .small()
-            .color(palette.muted),
-    );
+            match endpoint.kind {
+                EndpointKind::Local => {
+                    ui.horizontal(|ui| {
+                        let browse_width = 84.0;
+                        let field_width =
+                            (ui.available_width() - browse_width - ui.spacing().item_spacing.x)
+                                .max(80.0);
+                        ui.add_sized(
+                            egui::vec2(field_width, 32.0),
+                            egui::TextEdit::singleline(&mut endpoint.local_path)
+                                .hint_text("Select a folder")
+                                .vertical_align(egui::Align::Center),
+                        );
+                        if compact_button(ui, "Browse").clicked()
+                            && let Some(path) = FileDialog::new()
+                                .set_title(format!("Select {title}"))
+                                .pick_folder()
+                        {
+                            endpoint.local_path = path.to_string_lossy().into_owned();
+                            if endpoint.name.trim().is_empty() {
+                                endpoint.name = title.to_owned();
+                            }
+                            browsed = true;
+                        }
+                    });
+                }
+                EndpointKind::Ssh => {
+                    draw_compact_ssh_fields(ui, endpoint);
+                }
+            }
+        });
     browsed
+}
+
+fn draw_compact_ssh_fields(ui: &mut egui::Ui, endpoint: &mut EndpointForm) {
+    ui.horizontal(|ui| {
+        ui.label("Server");
+        ui.add_sized(
+            egui::vec2((ui.available_width() * 0.55).max(80.0), 28.0),
+            egui::TextEdit::singleline(&mut endpoint.server).vertical_align(egui::Align::Center),
+        );
+        ui.label("User");
+        ui.add_sized(
+            egui::vec2(ui.available_width(), 28.0),
+            egui::TextEdit::singleline(&mut endpoint.username).vertical_align(egui::Align::Center),
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label("Port");
+        ui.add_sized(
+            egui::vec2(56.0, 28.0),
+            egui::TextEdit::singleline(&mut endpoint.port).vertical_align(egui::Align::Center),
+        );
+        ui.label("Folder");
+        ui.add_sized(
+            egui::vec2(ui.available_width(), 28.0),
+            egui::TextEdit::singleline(&mut endpoint.remote_path)
+                .vertical_align(egui::Align::Center),
+        );
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.radio_value(&mut endpoint.authentication, AuthenticationForm::Key, "Key");
+        ui.radio_value(
+            &mut endpoint.authentication,
+            AuthenticationForm::Agent,
+            "Agent",
+        );
+        ui.radio_value(
+            &mut endpoint.authentication,
+            AuthenticationForm::InteractivePassword,
+            "Password",
+        );
+        ui.radio_value(
+            &mut endpoint.authentication,
+            AuthenticationForm::SavedPassword,
+            "Keyring",
+        );
+    });
+    match endpoint.authentication {
+        AuthenticationForm::Key => {
+            ui.add_sized(
+                egui::vec2(ui.available_width(), 28.0),
+                egui::TextEdit::singleline(&mut endpoint.identity)
+                    .hint_text("Identity file")
+                    .vertical_align(egui::Align::Center),
+            );
+        }
+        AuthenticationForm::SavedPassword => {
+            ui.add_sized(
+                egui::vec2(ui.available_width(), 28.0),
+                egui::TextEdit::singleline(&mut endpoint.secret_reference)
+                    .hint_text("Keyring reference")
+                    .vertical_align(egui::Align::Center),
+            );
+        }
+        AuthenticationForm::NeedsConfiguration => {
+            ui.label("Choose an approved authentication method before saving.");
+        }
+        AuthenticationForm::Agent | AuthenticationForm::InteractivePassword => {}
+    }
 }
 
 fn draw_progress_chip(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -9157,6 +9199,23 @@ mod tests {
         assert!(
             joined.contains("Save profile"),
             "Sync workspace missing profile save in {joined}"
+        );
+        assert!(
+            joined.contains("This computer"),
+            "Sync workspace missing compact folder location choice in {joined}"
+        );
+        assert!(
+            !joined.contains("No arbitrary commands") && !joined.contains("Help: Profile guidance"),
+            "Sync workspace kept the verbose header dump in {joined}"
+        );
+        let typical = Some(egui::vec2(1280.0, 720.0));
+        let (texts, _) = painted_shapes_for_size(&mut app, ThemePreference::Dark, false, typical);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("Source folder")
+                && joined.contains("Destination folder")
+                && joined.contains("Task name"),
+            "typical window must keep the two-folder setup on Folders, got {joined}"
         );
         app.workspace_tab = WorkspaceTab::Plan;
         let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
