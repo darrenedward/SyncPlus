@@ -24,10 +24,6 @@ pub enum AnalysisPhase {
 }
 
 impl AnalysisPhase {
-    pub const fn heading(self) -> &'static str {
-        AnalysisKind::DryRun.heading()
-    }
-
     pub const fn detail(self) -> &'static str {
         match self {
             Self::CheckingFolders => {
@@ -61,14 +57,12 @@ pub fn format_elapsed(seconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnalysisPhase, format_clock, format_elapsed};
+    use super::{AnalysisKind, AnalysisPhase, format_clock, format_elapsed};
 
     #[test]
     fn dry_run_phases_explain_the_current_work_without_implying_mutation() {
-        assert_eq!(
-            AnalysisPhase::CheckingFolders.heading(),
-            "Dry run in progress"
-        );
+        assert_eq!(AnalysisKind::DryRun.heading(), "Dry run in progress");
+        assert_eq!(AnalysisKind::FolderCheck.heading(), "Checking folders");
         assert!(
             AnalysisPhase::CheckingFolders
                 .detail()
