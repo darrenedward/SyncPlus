@@ -45,9 +45,10 @@ fn draw_icon_segment(
 fn syncplus_icon() -> egui::IconData {
     let size = 64;
     let mut rgba = vec![0; size * size * 4];
-    let background = [13, 13, 13, 255];
-    let neon_green = [0, 255, 133, 255];
-    let hot_pink = [255, 0, 153, 255];
+    let dark = syncplus::BrandTheme::dark();
+    let background = [dark.canvas.r(), dark.canvas.g(), dark.canvas.b(), 255];
+    let copper = [dark.copper.r(), dark.copper.g(), dark.copper.b(), 255];
+    let steel = [dark.steel.r(), dark.steel.g(), dark.steel.b(), 255];
 
     for y in 0..size {
         for x in 0..size {
@@ -69,10 +70,10 @@ fn syncplus_icon() -> egui::IconData {
         top_arc.push((32.0 + 16.0 * angle.cos(), 32.0 + 16.0 * angle.sin()));
     }
     for points in top_arc.windows(2) {
-        draw_icon_segment(&mut rgba, size, points[0], points[1], 6.0, neon_green);
+        draw_icon_segment(&mut rgba, size, points[0], points[1], 6.0, copper);
     }
-    draw_icon_segment(&mut rgba, size, (45.0, 13.0), (49.0, 23.0), 6.0, neon_green);
-    draw_icon_segment(&mut rgba, size, (49.0, 23.0), (38.0, 24.0), 6.0, neon_green);
+    draw_icon_segment(&mut rgba, size, (45.0, 13.0), (49.0, 23.0), 6.0, copper);
+    draw_icon_segment(&mut rgba, size, (49.0, 23.0), (38.0, 24.0), 6.0, copper);
 
     let mut bottom_arc = Vec::new();
     for step in 0..=16 {
@@ -80,10 +81,10 @@ fn syncplus_icon() -> egui::IconData {
         bottom_arc.push((32.0 + 16.0 * angle.cos(), 32.0 + 16.0 * angle.sin()));
     }
     for points in bottom_arc.windows(2) {
-        draw_icon_segment(&mut rgba, size, points[0], points[1], 6.0, hot_pink);
+        draw_icon_segment(&mut rgba, size, points[0], points[1], 6.0, steel);
     }
-    draw_icon_segment(&mut rgba, size, (19.0, 51.0), (15.0, 41.0), 6.0, hot_pink);
-    draw_icon_segment(&mut rgba, size, (15.0, 41.0), (26.0, 40.0), 6.0, hot_pink);
+    draw_icon_segment(&mut rgba, size, (19.0, 51.0), (15.0, 41.0), 6.0, steel);
+    draw_icon_segment(&mut rgba, size, (15.0, 41.0), (26.0, 40.0), 6.0, steel);
 
     egui::IconData {
         rgba,
