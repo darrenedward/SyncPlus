@@ -511,3 +511,7 @@ _Avoid_: White sheet, bright fallback, leftover dark-mode chrome
 **Brand Theme**:
 The desktop GUI token set that supplies canvas, surface, elevated, field, text, muted, border, copper, steel, danger, warning, and their on/soft pairs for both appearances. Core stores only the named preference System, Light, or Dark; it does not store colours.
 _Avoid_: Per-screen one-off colours, user-supplied chrome, colours in SQLite
+
+**Overview**:
+The home surface of the desktop app. Empty Overview explains first-run calmly and offers one action to create a Sync Profile. Populated Overview shows the active Sync Profile, last Sync Run or review state, and the next safe action.
+_Avoid_: Marketing landing page, neon hero, fake metrics

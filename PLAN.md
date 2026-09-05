@@ -330,6 +330,7 @@ SyncPlus/
 │           ├── main.rs
 │           ├── brand_mark.rs     # Brand Mark catalog and window icon loader
 │           ├── app.rs            # UI state machine and event handling
+│           ├── chrome.rs         # sidebar destinations and Overview identity
 │           ├── theme.rs
 │           ├── help.rs
 │           └── panels/
@@ -496,7 +497,7 @@ Examples of required messages:
 
 ## Follow-on visual identity
 
-Brand Theme tokens for Dark Appearance and Light Appearance live in `crates/syncplus/src/theme.rs`. Core still stores only the named preference System, Light, or Dark. Brand Mark catalog and window icon loading live in `crates/syncplus/src/brand_mark.rs`. Navigation chrome, workspace type, and the public Brand Kit remain follow-on work and must not weaken the v1 safety contract.
+Brand Theme tokens for Dark Appearance and Light Appearance live in `crates/syncplus/src/theme.rs`. Core still stores only the named preference System, Light, or Dark. Brand Mark catalog and window icon loading live in `crates/syncplus/src/brand_mark.rs`. Navigation chrome and Overview identity live in `crates/syncplus/src/chrome.rs`. Workspace type and the public Brand Kit remain follow-on work and must not weaken the v1 safety contract.
 
 ## Deferred design work
 
