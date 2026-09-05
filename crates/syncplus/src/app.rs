@@ -28,7 +28,7 @@ use syncplus_core::{
 };
 
 use crate::chrome::{self, ChromeAccent, ChromeSurface, OverviewAction};
-use crate::theme::BrandTheme;
+use crate::theme::{BrandTheme, TypeRole};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EndpointKind {
@@ -3052,7 +3052,7 @@ impl SyncPlusApp {
             self.form = ProfileForm::from_persisted(profile);
             self.review = None;
             let name = profile.profile().name().to_owned();
-            self.show_sync_workspace();
+            self.show_profiles();
             self.status = format!("Editing {name}. Changes apply to future runs.");
         }
     }
@@ -3077,12 +3077,22 @@ impl SyncPlusApp {
             style
                 .text_styles
                 .insert(egui::TextStyle::Body, egui::FontId::proportional(14.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Button, egui::FontId::proportional(14.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Heading, egui::FontId::proportional(20.0));
+            style.text_styles.insert(
+                egui::TextStyle::Button,
+                egui::FontId::proportional(TypeRole::Body.size()),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Body,
+                egui::FontId::proportional(TypeRole::Body.size()),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Small,
+                egui::FontId::proportional(TypeRole::Caption.size()),
+            );
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                egui::FontId::proportional(TypeRole::Title.size()),
+            );
         });
     }
 
@@ -3237,7 +3247,7 @@ impl SyncPlusApp {
                                     .color(palette.copper),
                                 );
                                 ui.label(
-                                    egui::RichText::new("Select one to open its Sync workspace.")
+                                    egui::RichText::new("Select one to edit the Sync Profile.")
                                         .small()
                                         .color(palette.muted),
                                 );
@@ -3298,7 +3308,7 @@ impl SyncPlusApp {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if secondary_button(ui, "Open workspace").clicked() {
+                                                if secondary_button(ui, "Edit profile").clicked() {
                                                     open_profile = Some(id);
                                                 }
                                             },
@@ -3306,6 +3316,11 @@ impl SyncPlusApp {
                                     });
                                 });
                             }
+                        }
+
+                        if self.form.id.is_some() {
+                            ui.add_space(16.0);
+                            self.draw_profile_form(ui);
                         }
 
                         ui.add_space(16.0);
@@ -3742,7 +3757,7 @@ impl SyncPlusApp {
                 ui.add_space(16.0);
             });
         if open_sync {
-            self.show_sync_workspace();
+            self.show_profiles();
         } else if open_recovery {
             self.open_recovery_review();
         } else if request_sync {
@@ -3803,13 +3818,9 @@ impl SyncPlusApp {
                             ui.vertical(|ui| {
                                 ui.label(egui::RichText::new(step.title()).strong().color(color));
                                 ui.label(
-                                    egui::RichText::new(if selected {
-                                        "Current step"
-                                    } else if completed {
-                                        "Complete"
-                                    } else {
-                                        "Required"
-                                    })
+                                    egui::RichText::new(chrome::wizard_step_caption(
+                                        selected, completed,
+                                    ))
                                     .small()
                                     .color(palette.muted),
                                 );
@@ -4090,10 +4101,9 @@ impl SyncPlusApp {
 
     fn draw_profile_form(&mut self, ui: &mut egui::Ui) {
         let form_before_draw = self.form.clone();
-        let mut request_analyze = false;
         let mut request_validate = false;
         let mut request_save = false;
-        let mut request_synchronise = false;
+        let mut open_sync = false;
         let mut profile_to_select = None;
         let profile_options = self
             .profiles
@@ -4110,52 +4120,10 @@ impl SyncPlusApp {
                     .map(|(_, name)| name.as_str())
             })
             .unwrap_or("Unsaved profile draft");
-        let review_confirmed = self.review.as_ref().is_some_and(|review| review.confirmed);
-        let review_exists = self.review.is_some();
         let review_blocked = self
             .review
             .as_ref()
             .is_some_and(|review| review.error.is_some());
-        let analysis_active = self.active_analysis.is_some();
-        let synchronise_enabled =
-            review_confirmed && self.active_manual_run.is_none() && !analysis_active;
-        let (phase_label, phase_description, phase_positive) = if analysis_active {
-            (
-                "Analysis in progress",
-                "Fresh Analysis is hashing the selected scope in the background. The workspace remains available.",
-                false,
-            )
-        } else if self.active_manual_run.is_some() {
-            (
-                "Sync Run active",
-                "The reviewed Sync Run is executing. Progress and durable evidence are shown below.",
-                true,
-            )
-        } else if review_confirmed {
-            (
-                "Ready to synchronise",
-                "Execution Confirmation is recorded for this exact reviewed scope.",
-                true,
-            )
-        } else if review_blocked {
-            (
-                "Review blocked",
-                "Correct the named profile or endpoint problem, then run the dry run again.",
-                false,
-            )
-        } else if review_exists {
-            (
-                "Review required",
-                "The read-only plan is ready. Inspect it, resolve any blockers, and confirm the exact scope.",
-                false,
-            )
-        } else {
-            (
-                "Ready for dry run",
-                "Dry run performs Fresh Analysis and Run Precheck. It does not change files.",
-                false,
-            )
-        };
         let palette = ui_palette(ui);
         card_frame(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -4163,12 +4131,12 @@ impl SyncPlusApp {
                     section_intro(
                         ui,
                         "Active Sync Profile",
-                        "Sync workspace",
-                        "Run a read-only dry run, review the exact plan, then confirm before anything changes.",
+                        "Profile",
+                        "Edit the named Sync Profile. Fresh Analysis, plan review, and Execution Confirmation stay in the Sync workspace.",
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    status_badge(ui, phase_label, phase_positive);
+                    status_badge(ui, "Configuration", true);
                 });
             });
             ui.add_space(12.0);
@@ -4186,27 +4154,18 @@ impl SyncPlusApp {
                             );
                         }
                     });
-                ui.label(egui::RichText::new(phase_description).color(palette.muted));
+                ui.label(egui::RichText::new("Changes apply to a later Sync Run.").color(palette.muted));
             });
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
-                if primary_button_enabled(
-                    ui,
-                    if review_exists { "Run dry run again" } else { "Dry run · Analyze" },
-                    !analysis_active,
-                )
-                .clicked()
-                {
-                    request_analyze = true;
-                }
                 if secondary_button(ui, "Validate profile").clicked() {
                     request_validate = true;
                 }
                 if secondary_button(ui, "Save profile").clicked() {
                     request_save = true;
                 }
-                if primary_button_enabled(ui, "Synchronise", synchronise_enabled).clicked() {
-                    request_synchronise = true;
+                if primary_button(ui, "Open Sync workspace").clicked() {
+                    open_sync = true;
                 }
             });
             ui.add_space(10.0);
@@ -4228,10 +4187,8 @@ impl SyncPlusApp {
                     ui,
                     if review_blocked {
                         palette.danger
-                    } else if review_confirmed {
-                        palette.copper
                     } else {
-                        palette.warning
+                        palette.muted
                     },
                 );
                 ui.label(egui::RichText::new("Latest status").strong());
@@ -4533,21 +4490,19 @@ impl SyncPlusApp {
         if let Some(id) = profile_to_select {
             self.select_profile(id);
         }
-        if request_analyze && let Err(error) = self.start_analysis(ui.ctx()) {
-            self.status = format_form_validation_diagnostic(&self.form, &error);
-        }
         if request_validate && let Err(error) = self.validate_profile() {
             self.status = format_form_validation_diagnostic(&self.form, &error);
         }
         if request_save && let Err(error) = self.save_profile() {
             self.status = format_form_validation_diagnostic(&self.form, &error);
         }
-        if request_synchronise {
-            self.request_synchronise_async(ui.ctx());
+        if open_sync {
+            self.show_sync_workspace();
         }
     }
 
     fn draw_review(&mut self, ui: &mut egui::Ui) {
+        let mut request_analyze = false;
         let mut request_confirmation = false;
         let mut request_start = false;
         let mut request_resolution_start = false;
@@ -4558,6 +4513,20 @@ impl SyncPlusApp {
             "Plan review and Execution Confirmation",
             "Read the exact scope, resolve every blocker, then confirm this plan before any file-changing action.",
         );
+        ui.add_space(8.0);
+        if primary_button_enabled(
+            ui,
+            if self.review.is_some() {
+                "Run dry run again"
+            } else {
+                "Dry run · Analyze"
+            },
+            self.active_analysis.is_none(),
+        )
+        .clicked()
+        {
+            request_analyze = true;
+        }
         draw_contextual_help_link(
             ui,
             "Plan and confirmation",
@@ -4680,7 +4649,13 @@ impl SyncPlusApp {
                     && !unresolved
                     && !conflicts_pending
                     && (!stronger_required || stronger_confirmation);
-                card_frame(ui).show(ui, |ui| {
+                let palette = ui_palette(ui);
+                egui::Frame::new()
+                    .fill(palette.surface)
+                    .stroke(egui::Stroke::new(2.0, palette.copper))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(16, 14))
+                    .show(ui, |ui| {
                     section_intro(
                         ui,
                         "Final gate",
@@ -4729,6 +4704,9 @@ impl SyncPlusApp {
             ui.label("No plan has been analyzed. Select Analyze current state to review the intended work.");
         }
 
+        if request_analyze && let Err(error) = self.start_analysis(ui.ctx()) {
+            self.status = format_form_validation_diagnostic(&self.form, &error);
+        }
         if request_resolution_start && let Err(error) = self.start_resolution_run() {
             self.status = format!("Resolution Run was not started: {error}");
         }
@@ -5162,7 +5140,17 @@ fn draw_conflict_review(
 }
 
 fn draw_conflict_evidence(ui: &mut egui::Ui, evidence: &syncplus_core::ConflictEvidence) {
-    ui.group(|ui| {
+    let palette = ui_palette(ui);
+    let (fill, stroke) = match evidence.side() {
+        syncplus_core::PeerSide::PeerA => (palette.copper_soft, palette.copper),
+        syncplus_core::PeerSide::PeerB => (palette.steel_soft, palette.steel),
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, stroke))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
         ui.label(format!("{} evidence", peer_side_label(evidence.side())));
         ui.label(format!("Path: {}", evidence.relative_path().display()));
         ui.label(format!("Type: {:?} | Size: {} bytes", evidence.item_type(), evidence.size()));
@@ -5185,7 +5173,7 @@ fn draw_conflict_evidence(ui: &mut egui::Ui, evidence: &syncplus_core::ConflictE
             ui.label("SHA-256 evidence: unavailable; do not assume the contents match.");
         }
         ui.label("File contents are not shown. Conflict Review uses safe classification, metadata, and hash evidence only.");
-    });
+        });
 }
 
 fn draw_compatibility_review(ui: &mut egui::Ui, profile: &SyncProfile, precheck: &PrecheckResult) {
@@ -5660,9 +5648,7 @@ impl SyncPlusApp {
                         self.draw_notifications(ui);
                         self.draw_missed_schedule_notices(ui);
                         self.draw_scheduler_events(ui);
-                        self.draw_profile_form(ui);
                         self.draw_review(ui);
-                        self.draw_run_reports(ui);
                     });
             }
         }
@@ -6274,19 +6260,13 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 3.5, color);
 }
 
-fn paint_focus_ring(ui: &egui::Ui, response: &egui::Response, inner_color: egui::Color32) {
+fn paint_focus_ring(ui: &egui::Ui, response: &egui::Response, _inner_color: egui::Color32) {
     if response.has_focus() {
         let palette = ui_palette(ui);
         ui.painter().rect_stroke(
-            response.rect.expand(3.0),
-            egui::CornerRadius::same(11),
+            response.rect.expand(2.0),
+            egui::CornerRadius::same(10),
             egui::Stroke::new(2.0, palette.copper),
-            egui::StrokeKind::Outside,
-        );
-        ui.painter().rect_stroke(
-            response.rect.expand(1.0),
-            egui::CornerRadius::same(9),
-            egui::Stroke::new(2.0, inner_color),
             egui::StrokeKind::Outside,
         );
     }
@@ -6300,21 +6280,6 @@ fn card_frame(ui: &egui::Ui) -> egui::Frame {
         .corner_radius(egui::CornerRadius::same(12))
         .inner_margin(egui::Margin::symmetric(16, 14))
         .outer_margin(egui::Margin::symmetric(0, 6))
-        .shadow(if ui.visuals().dark_mode {
-            egui::Shadow {
-                offset: [0, 3],
-                blur: 12,
-                spread: 1,
-                color: egui::Color32::from_black_alpha(80),
-            }
-        } else {
-            egui::Shadow {
-                offset: [0, 2],
-                blur: 8,
-                spread: 0,
-                color: egui::Color32::from_black_alpha(24),
-            }
-        })
 }
 
 fn inset_frame(ui: &egui::Ui) -> egui::Frame {
@@ -6339,12 +6304,20 @@ fn section_intro(ui: &mut egui::Ui, eyebrow: &str, title: &str, description: &st
     let palette = ui_palette(ui);
     ui.label(
         egui::RichText::new(eyebrow.to_uppercase())
-            .small()
+            .size(TypeRole::Eyebrow.size())
             .strong()
             .color(palette.copper),
     );
-    ui.heading(title);
-    ui.label(egui::RichText::new(description).color(palette.muted));
+    ui.label(
+        egui::RichText::new(title)
+            .size(TypeRole::Title.size())
+            .strong(),
+    );
+    ui.label(
+        egui::RichText::new(description)
+            .size(TypeRole::Body.size())
+            .color(palette.muted),
+    );
 }
 
 fn status_badge(ui: &mut egui::Ui, label: &str, positive: bool) {
@@ -6671,22 +6644,8 @@ fn help_topic_button(ui: &mut egui::Ui, topic: HelpTopic, selected: bool) -> egu
     response
 }
 
-fn help_topic_color(topic: HelpTopic, palette: BrandTheme) -> egui::Color32 {
-    match topic {
-        HelpTopic::GettingStarted | HelpTopic::Modes | HelpTopic::OneWaySync => palette.copper,
-        HelpTopic::SafeDelete
-        | HelpTopic::Recovery
-        | HelpTopic::DestructiveActions
-        | HelpTopic::ExecutionFailures => palette.danger,
-        HelpTopic::MirrorSync
-        | HelpTopic::SshAuthentication
-        | HelpTopic::ProgressAndCancellation
-        | HelpTopic::Diagnostics => palette.steel,
-        HelpTopic::ConflictReview | HelpTopic::CloneProfile => palette.steel,
-        HelpTopic::PrecheckBlockers => palette.warning,
-        HelpTopic::Exclusions | HelpTopic::RunReports => palette.muted,
-        HelpTopic::PlanAndConfirmation => palette.copper,
-    }
+fn help_topic_color(_topic: HelpTopic, palette: BrandTheme) -> egui::Color32 {
+    palette.muted
 }
 
 fn draw_help_article(ui: &mut egui::Ui, topic: HelpTopic) {
@@ -6873,7 +6832,7 @@ mod tests {
     }
 
     #[test]
-    fn selecting_a_saved_profile_loads_it_into_the_sync_workspace() {
+    fn selecting_a_saved_profile_loads_it_into_the_profiles_editor() {
         let mut syncplus = app();
         let profile = SyncProfile::new(
             "Documents backup",
@@ -6885,7 +6844,7 @@ mod tests {
 
         syncplus.select_profile(persisted.id());
 
-        assert_eq!(syncplus.view, AppView::Sync);
+        assert_eq!(syncplus.view, AppView::Profiles);
         assert_eq!(syncplus.form.id, Some(persisted.id()));
         assert_eq!(syncplus.form.name, "Documents backup");
         assert!(syncplus.status().contains("Editing Documents backup"));
@@ -7842,9 +7801,22 @@ mod tests {
         theme: ThemePreference,
         include_sidebar: bool,
     ) -> (Vec<String>, Vec<egui::Color32>) {
+        painted_shapes_for_size(app, theme, include_sidebar, None)
+    }
+
+    fn painted_shapes_for_size(
+        app: &mut SyncPlusApp,
+        theme: ThemePreference,
+        include_sidebar: bool,
+        screen: Option<egui::Vec2>,
+    ) -> (Vec<String>, Vec<egui::Color32>) {
         app.set_theme(theme);
         let context = egui::Context::default();
-        let output = context.run_ui(Default::default(), |context| {
+        let mut input = egui::RawInput::default();
+        if let Some(size) = screen {
+            input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size));
+        }
+        let output = context.run_ui(input, |context| {
             app.apply_theme(context);
             if include_sidebar {
                 let ctx = context.clone();
@@ -8075,6 +8047,95 @@ mod tests {
                 "{appearance} populated Overview kept marketing display type"
             );
             assert_no_forbidden_hues(&colors, "populated Overview", appearance);
+        }
+    }
+
+    #[test]
+    fn sync_workspace_is_analyze_plan_and_confirmation_not_editor_and_reports() {
+        let mut app = app_with_saved_profile();
+        app.show_sync_workspace();
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("Execution Confirmation"),
+            "Sync workspace missing Execution Confirmation in {joined}"
+        );
+        assert!(
+            joined.contains("Dry run · Analyze"),
+            "Sync workspace missing Fresh Analysis in {joined}"
+        );
+        assert!(
+            !joined.contains("Sync Runs and Recovery Review"),
+            "Sync workspace still dumped historical Run Reports in {joined}"
+        );
+        assert!(
+            !joined.contains("Save profile"),
+            "Sync workspace still dumped the profile editor in {joined}"
+        );
+        app.show_profiles();
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("Documents backup"),
+            "Profiles missing Sync Profile editor in {joined}"
+        );
+        assert!(
+            joined.contains("Save profile"),
+            "Profiles missing profile save in {joined}"
+        );
+        assert!(
+            !joined.contains("Dry run · Analyze"),
+            "Profiles still hosted Fresh Analysis in {joined}"
+        );
+        app.show_reports();
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("Sync Runs and Recovery Review"),
+            "Reports missing Run Reports in {joined}"
+        );
+    }
+
+    #[test]
+    fn workspace_help_and_confirmation_render_at_minimum_and_typical_widths() {
+        let screens: [(&str, fn(&mut SyncPlusApp), &[&str]); 3] = [
+            (
+                "wizard",
+                |app| app.start_new_profile(),
+                &["Upcoming", "Current step"],
+            ),
+            (
+                "Sync workspace",
+                |app| app.show_sync_workspace(),
+                &["Execution Confirmation"],
+            ),
+            (
+                "Help",
+                |app| app.show_help(HelpTopic::GettingStarted),
+                &["Help & Support"],
+            ),
+        ];
+        for width in [960.0_f32, 1280.0_f32] {
+            for theme in [ThemePreference::Light, ThemePreference::Dark] {
+                for (screen, setup, required) in screens {
+                    let mut app = app();
+                    setup(&mut app);
+                    let (texts, colors) = painted_shapes_for_size(
+                        &mut app,
+                        theme,
+                        false,
+                        Some(egui::vec2(width, 600.0)),
+                    );
+                    let joined = texts.join("\n");
+                    for needle in required {
+                        assert!(
+                            texts.iter().any(|text| text.contains(needle)),
+                            "{width} {screen} missing {needle:?} in {joined}"
+                        );
+                    }
+                    assert_no_forbidden_hues(&colors, screen, "appearance");
+                }
+            }
         }
     }
 
