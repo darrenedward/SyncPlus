@@ -1779,6 +1779,18 @@ impl SyncPlusApp {
         }))
     }
 
+    fn profile_form_is_dirty(&self) -> bool {
+        match self.form.id.and_then(|id| {
+            self.profiles
+                .iter()
+                .find(|profile| profile.id() == id)
+                .map(ProfileForm::from_persisted)
+        }) {
+            Some(saved) => saved != self.form,
+            None => true,
+        }
+    }
+
     fn open_recovery_review(&mut self) {
         self.show_reports();
         self.help_topic = HelpTopic::Recovery;
@@ -3052,7 +3064,7 @@ impl SyncPlusApp {
             self.form = ProfileForm::from_persisted(profile);
             self.review = None;
             let name = profile.profile().name().to_owned();
-            self.show_profiles();
+            self.show_sync_workspace();
             self.status = format!("Editing {name}. Changes apply to future runs.");
         }
     }
@@ -3064,6 +3076,7 @@ impl SyncPlusApp {
             ThemePreference::Dark => egui::ThemePreference::Dark,
         };
         context.set_theme(preference);
+        crate::fonts::install_regular_sans(context);
         context.all_styles_mut(|style| {
             match self.settings.theme() {
                 ThemePreference::Light => style.visuals.dark_mode = false,
@@ -3185,11 +3198,8 @@ impl SyncPlusApp {
         egui::ScrollArea::vertical()
             .id_salt("profiles-content")
             .show(ui, |ui| {
-                let available_width = ui.available_width();
-                let content_width = available_width.min(1040.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(((available_width - content_width) / 2.0).max(0.0));
-                    ui.vertical(|ui| {
+                let content_width = ui.available_width();
+                ui.vertical(|ui| {
                         ui.set_width(content_width);
                         ui.add_space(28.0);
                         ui.horizontal(|ui| {
@@ -3198,7 +3208,7 @@ impl SyncPlusApp {
                                     ui,
                                     "Workspace",
                                     "Profiles",
-                                    "Choose a saved Sync Profile to continue where you left off.",
+                                    "Choose a saved Sync Profile, then open it in Sync workspace.",
                                 );
                             });
                             ui.with_layout(
@@ -3247,7 +3257,9 @@ impl SyncPlusApp {
                                     .color(palette.copper),
                                 );
                                 ui.label(
-                                    egui::RichText::new("Select one to edit the Sync Profile.")
+                                    egui::RichText::new(
+                                        "Select one to open it in Sync workspace.",
+                                    )
                                         .small()
                                         .color(palette.muted),
                                 );
@@ -3308,7 +3320,9 @@ impl SyncPlusApp {
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {
-                                                if secondary_button(ui, "Edit profile").clicked() {
+                                                if primary_button(ui, "Open Sync workspace")
+                                                    .clicked()
+                                                {
                                                     open_profile = Some(id);
                                                 }
                                             },
@@ -3316,11 +3330,6 @@ impl SyncPlusApp {
                                     });
                                 });
                             }
-                        }
-
-                        if self.form.id.is_some() {
-                            ui.add_space(16.0);
-                            self.draw_profile_form(ui);
                         }
 
                         ui.add_space(16.0);
@@ -3335,7 +3344,7 @@ impl SyncPlusApp {
                                     ui.label(egui::RichText::new("Safe by default").strong());
                                     ui.label(
                                         egui::RichText::new(
-                                            "Selecting a profile only opens its configuration; every run still requires Fresh Analysis, precheck, and explicit confirmation.",
+                                            "Opening a profile loads it in Sync workspace. Every run still requires Fresh Analysis, precheck, and explicit confirmation.",
                                         )
                                         .color(palette.muted),
                                     );
@@ -3343,7 +3352,6 @@ impl SyncPlusApp {
                             });
                         ui.add_space(20.0);
                     });
-                });
             });
 
         if create_profile {
@@ -3661,24 +3669,22 @@ impl SyncPlusApp {
         egui::ScrollArea::vertical()
             .id_salt("empty-welcome-content")
             .show(ui, |ui| {
-                let available_width = ui.available_width();
-                let content_width = available_width.min(720.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(((available_width - content_width) / 2.0).max(0.0));
-                    ui.vertical(|ui| {
-                        ui.set_width(content_width);
-                        ui.add_space(28.0);
-                        card_frame(ui).show(ui, |ui| {
-                            section_intro(ui, overview.eyebrow, &overview.title, &overview.body);
-                            ui.add_space(8.0);
-                            active_mode_badge(ui, self.settings.mode());
-                            ui.add_space(16.0);
-                            if primary_button(ui, overview.primary_action.label()).clicked() {
-                                open_wizard = true;
-                            }
-                        });
-                        ui.add_space(20.0);
+                let content_width = ui.available_width();
+                ui.vertical(|ui| {
+                    ui.set_width(content_width);
+                    ui.add_space(28.0);
+                    card_frame(ui).show(ui, |ui| {
+                        section_intro(ui, overview.eyebrow, &overview.title, &overview.body);
+                        ui.add_space(8.0);
+                        active_mode_badge(ui, self.settings.mode());
+                        ui.add_space(16.0);
+                        draw_endpoint_pair(ui, "Not selected", "Not selected");
+                        ui.add_space(16.0);
+                        if primary_button(ui, overview.primary_action.label()).clicked() {
+                            open_wizard = true;
+                        }
                     });
+                    ui.add_space(20.0);
                 });
             });
         if open_wizard {
@@ -3711,9 +3717,8 @@ impl SyncPlusApp {
                     section_intro(ui, overview.eyebrow, &overview.title, &overview.body);
                     ui.add_space(8.0);
                     active_mode_badge(ui, self.settings.mode());
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new(&source).monospace());
-                    ui.label(egui::RichText::new(&destination).monospace());
+                    ui.add_space(16.0);
+                    draw_endpoint_pair(ui, &source, &destination);
                     ui.add_space(12.0);
                     ui.label(egui::RichText::new(&overview.last_run).color(ui_palette(ui).text));
                     ui.label(
@@ -3749,7 +3754,7 @@ impl SyncPlusApp {
                                 }
                             }
                         }
-                        if secondary_button(ui, "Edit profile").clicked() {
+                        if secondary_button(ui, "Open Sync workspace").clicked() {
                             open_sync = true;
                         }
                     });
@@ -3757,7 +3762,7 @@ impl SyncPlusApp {
                 ui.add_space(16.0);
             });
         if open_sync {
-            self.show_profiles();
+            self.show_sync_workspace();
         } else if open_recovery {
             self.open_recovery_review();
         } else if request_sync {
@@ -4103,8 +4108,8 @@ impl SyncPlusApp {
         let form_before_draw = self.form.clone();
         let mut request_validate = false;
         let mut request_save = false;
-        let mut open_sync = false;
         let mut profile_to_select = None;
+        let form_is_dirty = self.profile_form_is_dirty();
         let profile_options = self
             .profiles
             .iter()
@@ -4131,8 +4136,8 @@ impl SyncPlusApp {
                     section_intro(
                         ui,
                         "Active Sync Profile",
-                        "Profile",
-                        "Edit the named Sync Profile. Fresh Analysis, plan review, and Execution Confirmation stay in the Sync workspace.",
+                        "Sync workspace",
+                        "Select a Sync Profile to populate these fields. Save becomes available when something has changed.",
                     );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -4161,11 +4166,15 @@ impl SyncPlusApp {
                 if secondary_button(ui, "Validate profile").clicked() {
                     request_validate = true;
                 }
-                if secondary_button(ui, "Save profile").clicked() {
+                if primary_button_enabled(ui, "Save profile", form_is_dirty).clicked() {
                     request_save = true;
                 }
-                if primary_button(ui, "Open Sync workspace").clicked() {
-                    open_sync = true;
+                if form_is_dirty {
+                    ui.label(
+                        egui::RichText::new("Unsaved changes")
+                            .small()
+                            .color(palette.warning),
+                    );
                 }
             });
             ui.add_space(10.0);
@@ -4495,9 +4504,6 @@ impl SyncPlusApp {
         }
         if request_save && let Err(error) = self.save_profile() {
             self.status = format_form_validation_diagnostic(&self.form, &error);
-        }
-        if open_sync {
-            self.show_sync_workspace();
         }
     }
 
@@ -5648,6 +5654,7 @@ impl SyncPlusApp {
                         self.draw_notifications(ui);
                         self.draw_missed_schedule_notices(ui);
                         self.draw_scheduler_events(ui);
+                        self.draw_profile_form(ui);
                         self.draw_review(ui);
                     });
             }
@@ -6260,6 +6267,36 @@ fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 3.5, color);
 }
 
+fn draw_endpoint_pair(ui: &mut egui::Ui, source: &str, destination: &str) {
+    let palette = ui_palette(ui);
+    ui.columns(2, |columns| {
+        egui::Frame::new()
+            .fill(palette.field)
+            .stroke(egui::Stroke::new(1.0, palette.border))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(&mut columns[0], |ui| {
+                ui.horizontal(|ui| {
+                    status_dot(ui, palette.copper);
+                    ui.label(egui::RichText::new("Source folder").strong());
+                });
+                ui.label(egui::RichText::new(source).monospace());
+            });
+        egui::Frame::new()
+            .fill(palette.field)
+            .stroke(egui::Stroke::new(1.0, palette.border))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(&mut columns[1], |ui| {
+                ui.horizontal(|ui| {
+                    status_dot(ui, palette.steel);
+                    ui.label(egui::RichText::new("Destination folder").strong());
+                });
+                ui.label(egui::RichText::new(destination).monospace());
+            });
+    });
+}
+
 fn paint_focus_ring(ui: &egui::Ui, response: &egui::Response, _inner_color: egui::Color32) {
     if response.has_focus() {
         let palette = ui_palette(ui);
@@ -6832,7 +6869,7 @@ mod tests {
     }
 
     #[test]
-    fn selecting_a_saved_profile_loads_it_into_the_profiles_editor() {
+    fn selecting_a_saved_profile_loads_it_into_the_sync_workspace() {
         let mut syncplus = app();
         let profile = SyncProfile::new(
             "Documents backup",
@@ -6844,7 +6881,7 @@ mod tests {
 
         syncplus.select_profile(persisted.id());
 
-        assert_eq!(syncplus.view, AppView::Profiles);
+        assert_eq!(syncplus.view, AppView::Sync);
         assert_eq!(syncplus.form.id, Some(persisted.id()));
         assert_eq!(syncplus.form.name, "Documents backup");
         assert!(syncplus.status().contains("Editing Documents backup"));
@@ -8000,6 +8037,14 @@ mod tests {
                 "{appearance} empty Overview missing primary action in {joined}"
             );
             assert!(
+                texts.iter().any(|text| text.contains("Source folder")),
+                "{appearance} empty Overview missing Source folder in {joined}"
+            );
+            assert!(
+                texts.iter().any(|text| text.contains("Destination folder")),
+                "{appearance} empty Overview missing Destination folder in {joined}"
+            );
+            assert!(
                 texts.iter().any(|text| text.contains("Settings")),
                 "{appearance} chrome missing Settings in {joined}"
             );
@@ -8023,6 +8068,14 @@ mod tests {
             assert!(
                 texts.iter().any(|text| text.contains("Documents backup")),
                 "{appearance} populated Overview missing Sync Profile in {joined}"
+            );
+            assert!(
+                texts.iter().any(|text| text.contains("Source folder")),
+                "{appearance} populated Overview missing Source folder in {joined}"
+            );
+            assert!(
+                texts.iter().any(|text| text.contains("Destination folder")),
+                "{appearance} populated Overview missing Destination folder in {joined}"
             );
             assert!(
                 texts
@@ -8051,7 +8104,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_workspace_is_analyze_plan_and_confirmation_not_editor_and_reports() {
+    fn sync_workspace_loads_the_selected_profile_and_keeps_reports_separate() {
         let mut app = app_with_saved_profile();
         app.show_sync_workspace();
         let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
@@ -8065,23 +8118,23 @@ mod tests {
             "Sync workspace missing Fresh Analysis in {joined}"
         );
         assert!(
-            !joined.contains("Sync Runs and Recovery Review"),
-            "Sync workspace still dumped historical Run Reports in {joined}"
+            joined.contains("Save profile"),
+            "Sync workspace missing profile save in {joined}"
         );
         assert!(
-            !joined.contains("Save profile"),
-            "Sync workspace still dumped the profile editor in {joined}"
+            joined.contains("Documents backup"),
+            "Sync workspace missing the selected Sync Profile in {joined}"
+        );
+        assert!(
+            !joined.contains("Sync Runs and Recovery Review"),
+            "Sync workspace still dumped historical Run Reports in {joined}"
         );
         app.show_profiles();
         let (texts, _) = painted_output_for(&mut app, ThemePreference::Dark);
         let joined = texts.join("\n");
         assert!(
-            joined.contains("Documents backup"),
-            "Profiles missing Sync Profile editor in {joined}"
-        );
-        assert!(
-            joined.contains("Save profile"),
-            "Profiles missing profile save in {joined}"
+            joined.contains("Open Sync workspace"),
+            "Profiles missing Open Sync workspace in {joined}"
         );
         assert!(
             !joined.contains("Dry run · Analyze"),
@@ -8097,6 +8150,21 @@ mod tests {
     }
 
     #[test]
+    fn save_profile_is_inactive_until_the_loaded_form_changes() {
+        let mut app = app_with_saved_profile();
+        app.show_sync_workspace();
+        assert!(
+            !app.profile_form_is_dirty(),
+            "a freshly loaded Sync Profile should not look unsaved"
+        );
+        app.form.name = "Renamed backup".to_owned();
+        assert!(
+            app.profile_form_is_dirty(),
+            "editing a field should make Save available"
+        );
+    }
+
+    #[test]
     fn workspace_help_and_confirmation_render_at_minimum_and_typical_widths() {
         let screens: [(&str, fn(&mut SyncPlusApp), &[&str]); 3] = [
             (
@@ -8107,7 +8175,7 @@ mod tests {
             (
                 "Sync workspace",
                 |app| app.show_sync_workspace(),
-                &["Execution Confirmation"],
+                &["Sync workspace", "Save profile"],
             ),
             (
                 "Help",

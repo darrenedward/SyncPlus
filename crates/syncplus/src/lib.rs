@@ -13,6 +13,7 @@ mod app;
 mod brand_kit;
 mod brand_mark;
 mod chrome;
+mod fonts;
 mod theme;
 
 pub use app::{EndpointKind, SyncPlusApp, UiValidationError, run_background_scheduler_once};
