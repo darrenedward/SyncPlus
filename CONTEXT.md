@@ -497,3 +497,7 @@ Before restoring, SyncPlus quarantines the corrupt live database under a timesta
 **Brand Mark**:
 The SyncPlus identity mark: a rounded square with a copper outbound arrow and a steel inbound arrow in a protected loop. The packaged desktop icon and the window icon are this mark. The dark mark sits on warm ink; a light mark on warm paper and a monochrome mark exist so it stays legible without a white box.
 _Avoid_: Seafoam, neon mint, magenta, teal, a procedural window glyph, a menu icon that differs from the window icon
+
+**Brand Kit**:
+The repository public identity pack under `docs/brand/`. It contains the Brand Mark, wordmark, horizontal lockup, and monochrome variants in Dark Appearance and Light Appearance, plus the GitHub avatar, 1280×640 social preview, Facebook profile, 1640×924 cover source, and 1200×630 post image. It documents clear space, minimum size, allowed backgrounds, and forbidden treatments. The public promise is “Review the plan. Confirm what changes. Uncertainty preserves the source.” The kit does not create live social accounts.
+_Avoid_: Recolour to pink or teal, neon glow, slogans that imply silent deletion, treating Light Appearance as a white-only lockup
