@@ -44,7 +44,7 @@ pub fn install_regular_sans(context: &egui::Context) {
 }
 
 #[cfg(test)]
-fn candidate_is_regular_weight(path: &Path) -> bool {
+fn candidate_is_regular_weight(path: &std::path::Path) -> bool {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())

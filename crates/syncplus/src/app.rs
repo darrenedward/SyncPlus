@@ -19,12 +19,12 @@ use syncplus_core::{
     ConflictResolution, ConflictReview, DeletionMethod, FreshAnalysis, LocalPrecheckProbe,
     MetadataRequirements, MissedScheduleDecision, MissedScheduleNotice, OneWaySource,
     PartialTransferPolicy, Peer, PeerEndpoint, PersistedSyncProfile, PlanActionKind,
-    PrecheckErrorKind, PrecheckResult, RecoveryMethod, RemotePrecheckRequest, ResolutionRun,
-    RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle, RunPrecheck, RunReport,
-    RunReportStatus, SavedSecretReference, ScheduleDefinition, SchedulerEvent,
-    SchedulerNotification, SchedulerNotificationAction, SchedulerNotificationSink, SecretStore,
-    SecretStoreError, SpecialistMetadataRequirements, SshAuthentication, SyncMode, SyncOptions,
-    SyncProfile, SyncProfileId, ThemePreference,
+    PrecheckBlockerKind, PrecheckErrorKind, PrecheckResult, RecoveryMethod, RemotePrecheckRequest,
+    ResolutionRun, RetryPolicy, RunEvidenceStore, RunExecutionResult, RunId, RunLifecycle,
+    RunPrecheck, RunReport, RunReportStatus, SavedSecretReference, ScheduleDefinition,
+    SchedulerEvent, SchedulerNotification, SchedulerNotificationAction, SchedulerNotificationSink,
+    SecretStore, SecretStoreError, SpecialistMetadataRequirements, SshAuthentication, SyncMode,
+    SyncOptions, SyncProfile, SyncProfileId, ThemePreference,
 };
 
 use crate::chrome::{self, ChromeAccent, ChromeSurface, OverviewAction};
@@ -960,6 +960,16 @@ struct PlanReviewState {
     error: Option<String>,
     stronger_confirmation_path: String,
     confirmed: bool,
+}
+
+impl PlanReviewState {
+    fn is_blocked(&self) -> bool {
+        self.error.is_some()
+            || self
+                .precheck
+                .as_ref()
+                .is_some_and(|precheck| !precheck.can_execute())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2545,8 +2555,15 @@ impl SyncPlusApp {
     fn analyze_profile_snapshot(profile: SyncProfile) -> ProfileAnalysisResult {
         let precheck = Self::fresh_local_precheck(&profile);
         let analysis = match &precheck {
-            Ok(_) => Some(FreshAnalysis::analyze(&profile).map_err(|error| error.to_string())),
-            Err(_) => None,
+            Ok(result)
+                if !result
+                    .blockers()
+                    .iter()
+                    .any(|blocker| blocker.kind() == PrecheckBlockerKind::PeerUnavailable) =>
+            {
+                Some(FreshAnalysis::analyze(&profile).map_err(|error| error.to_string()))
+            }
+            _ => None,
         };
         ProfileAnalysisResult {
             profile,
@@ -2668,8 +2685,9 @@ impl SyncPlusApp {
         };
         self.active_analysis = None;
 
-        let current_profile = self.form.build().ok();
-        if current_profile.as_ref() != Some(&completion.result.profile) {
+        if let Ok(current_profile) = self.form.build()
+            && current_profile != completion.result.profile
+        {
             self.status = "Fresh Analysis finished for an older profile state; run it again to review the current fields.".to_owned();
             return;
         }
@@ -3720,6 +3738,7 @@ impl SyncPlusApp {
                 ui.vertical(|ui| {
                     ui.set_width(content_width);
                     ui.add_space(28.0);
+                    self.draw_fresh_analysis_banner(ui);
                     card_frame(ui).show(ui, |ui| {
                         ui.columns(2, |columns| {
                             columns[0].vertical(|ui| {
@@ -4170,6 +4189,7 @@ impl SyncPlusApp {
         let form_before_draw = self.form.clone();
         let mut request_validate = false;
         let mut request_save = false;
+        let mut request_analyze = false;
         let mut profile_to_select = None;
         let form_is_dirty = self.profile_form_is_dirty();
         let profile_options = self
@@ -4190,7 +4210,7 @@ impl SyncPlusApp {
         let review_blocked = self
             .review
             .as_ref()
-            .is_some_and(|review| review.error.is_some());
+            .is_some_and(PlanReviewState::is_blocked);
         let palette = ui_palette(ui);
         card_frame(ui).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -4231,6 +4251,19 @@ impl SyncPlusApp {
                 if primary_button_enabled(ui, "Save profile", form_is_dirty).clicked() {
                     request_save = true;
                 }
+                if primary_button_enabled(
+                    ui,
+                    if self.review.is_some() {
+                        "Run dry run again"
+                    } else {
+                        "Dry run · Analyze"
+                    },
+                    self.active_analysis.is_none(),
+                )
+                .clicked()
+                {
+                    request_analyze = true;
+                }
                 if form_is_dirty {
                     ui.label(
                         egui::RichText::new("Unsaved changes")
@@ -4263,7 +4296,11 @@ impl SyncPlusApp {
                     },
                 );
                 ui.label(egui::RichText::new("Latest status").strong());
-                ui.label(egui::RichText::new(&self.status).color(palette.muted));
+                ui.label(egui::RichText::new(&self.status).color(if review_blocked {
+                    palette.danger
+                } else {
+                    palette.muted
+                }));
             });
             draw_contextual_help_link(
                 ui,
@@ -4567,6 +4604,78 @@ impl SyncPlusApp {
         if request_save && let Err(error) = self.save_profile() {
             self.status = format_form_validation_diagnostic(&self.form, &error);
         }
+        if request_analyze && let Err(error) = self.start_analysis(ui.ctx()) {
+            self.status = format_form_validation_diagnostic(&self.form, &error);
+        }
+    }
+
+    fn draw_fresh_analysis_banner(&self, ui: &mut egui::Ui) {
+        let palette = ui_palette(ui);
+        if self.active_analysis.is_some() {
+            egui::Frame::new()
+                .fill(palette.warning_soft)
+                .stroke(egui::Stroke::new(1.0, palette.warning))
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("Fresh Analysis is running")
+                            .strong()
+                            .color(palette.on_warning_soft),
+                    );
+                    ui.label(egui::RichText::new(&self.status).color(palette.on_warning_soft));
+                    ui.label("No files are being changed.");
+                });
+            ui.add_space(12.0);
+            return;
+        }
+        let Some(review) = self.review.as_ref() else {
+            if self.status.contains("could not")
+                || self.status.contains("blocked")
+                || self.status.contains("unavailable")
+            {
+                egui::Frame::new()
+                    .fill(palette.danger_soft)
+                    .stroke(egui::Stroke::new(1.0, palette.danger))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Dry run did not complete")
+                                .strong()
+                                .color(palette.on_danger_soft),
+                        );
+                        ui.label(egui::RichText::new(&self.status).color(palette.on_danger_soft));
+                    });
+                ui.add_space(12.0);
+            }
+            return;
+        };
+        if !review.is_blocked() {
+            return;
+        }
+        egui::Frame::new()
+            .fill(palette.danger_soft)
+            .stroke(egui::Stroke::new(1.0, palette.danger))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Dry run blocked")
+                        .strong()
+                        .color(palette.on_danger_soft),
+                );
+                ui.label(egui::RichText::new(&self.status).color(palette.on_danger_soft));
+                if let Some(precheck) = review.precheck.as_ref() {
+                    for blocker in precheck.blockers() {
+                        ui.label(format_precheck_diagnostic(&review.profile, blocker));
+                    }
+                }
+                if let Some(error) = &review.error {
+                    ui.label(error);
+                }
+            });
+        ui.add_space(12.0);
     }
 
     fn draw_review(&mut self, ui: &mut egui::Ui) {
@@ -5656,11 +5765,13 @@ impl eframe::App for SyncPlusApp {
             context.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        context.request_repaint_after(Duration::from_millis(if self.active_manual_run.is_some() {
-            200
-        } else {
-            1_000
-        }));
+        context.request_repaint_after(Duration::from_millis(
+            if self.active_manual_run.is_some() || self.active_analysis.is_some() {
+                200
+            } else {
+                1_000
+            },
+        ));
         self.apply_theme(ui.ctx());
         if let Err(error) = self.refresh_run_reports() {
             self.status = format!("Run Reports are unavailable: {error}");
@@ -5716,6 +5827,7 @@ impl SyncPlusApp {
                         self.draw_notifications(ui);
                         self.draw_missed_schedule_notices(ui);
                         self.draw_scheduler_events(ui);
+                        self.draw_fresh_analysis_banner(ui);
                         self.draw_profile_form(ui);
                         self.draw_review(ui);
                     });
@@ -7037,6 +7149,72 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(syncplus.active_analysis.is_none());
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn dry_run_of_unavailable_source_surfaces_precheck_blockers_in_the_workspace() {
+        let (mut form, _source, base) = filesystem_form();
+        form.peer_a.local_path = base.join("unplugged-source").display().to_string();
+        form.peer_b.local_path = base.join("unplugged-destination").display().to_string();
+        let mut app = app();
+        app.form = form;
+        let context = egui::Context::default();
+
+        app.start_analysis(&context)
+            .expect("dry run should dispatch");
+        for _ in 0..200 {
+            app.poll_analysis();
+            if app.active_analysis.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(app.active_analysis.is_none(), "analysis should finish");
+        let review = app
+            .review
+            .as_ref()
+            .expect("blocked dry run must keep a review");
+        assert!(review.is_blocked());
+        assert!(review.analysis.is_none());
+        let precheck = review.precheck.as_ref().expect("precheck result");
+        assert!(!precheck.can_execute());
+        assert!(
+            precheck
+                .blockers()
+                .iter()
+                .any(|blocker| blocker.kind() == PrecheckBlockerKind::PeerUnavailable)
+        );
+        assert!(
+            app.status().contains("blocker")
+                || app.status().contains("unavailable")
+                || app.status().contains("Fresh precheck"),
+            "status should explain the blocked dry run, got {}",
+            app.status()
+        );
+
+        let typical = Some(egui::vec2(1280.0, 720.0));
+        app.show_sync_workspace();
+        let (texts, _) = painted_shapes_for_size(&mut app, ThemePreference::Dark, false, typical);
+        let joined = texts.join("\n");
+        assert!(
+            texts.iter().any(|text| text.contains("Dry run blocked")),
+            "Sync workspace must show a Dry run blocked banner at typical height, got {joined}"
+        );
+        assert!(
+            joined.contains("unplugged-source") || joined.contains("unplugged-destination"),
+            "blocked dry run must name the missing peer path, got {joined}"
+        );
+
+        app.show_welcome();
+        let (texts, _) = painted_shapes_for_size(&mut app, ThemePreference::Dark, false, typical);
+        let joined = texts.join("\n");
+        assert!(
+            texts.iter().any(|text| text.contains("Dry run blocked")),
+            "Overview must show a Dry run blocked banner at typical height, got {joined}"
+        );
+
         fs::remove_dir_all(base).expect("test directory cleanup");
     }
 
