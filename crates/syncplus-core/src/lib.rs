@@ -107,8 +107,8 @@ pub use evidence::{
 };
 pub use backup::{BackupError, DatabaseBackupManager, ValidatedBackup};
 pub use storage::{
-    ApplicationMode, ApplicationSettings, PersistedSyncProfile, ScheduleDefinition, SyncProfileId,
-    ThemePreference,
+    AnalysisConfiguration, ApplicationMode, ApplicationSettings, PersistedSyncProfile,
+    ScheduleDefinition, SyncProfileId, ThemePreference,
 };
 pub use config_transfer::{
     ConfigurationImportPreview, ConfigurationTransferError,
