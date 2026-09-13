@@ -62,6 +62,7 @@ pub enum UiValidationError {
     InvalidScheduleInterval,
     InvalidScheduleTimezone,
     ScheduleRequiresAdvanced,
+    DestinationCleanupRequiresAdvanced,
     DeletionMethodRequired,
     CloneEndpointsUnchanged,
     DuplicateEndpointPair,
@@ -406,6 +407,9 @@ impl std::fmt::Display for UiValidationError {
             Self::ScheduleRequiresAdvanced => {
                 formatter.write_str("Enabling a schedule requires Advanced Mode.")
             }
+            Self::DestinationCleanupRequiresAdvanced => {
+                formatter.write_str("Destination Cleanup is available only in Advanced Mode.")
+            }
             Self::DeletionMethodRequired => {
                 formatter.write_str("Choose the Deletion Method in Execution Confirmation before starting this Safe Delete run.")
             }
@@ -703,6 +707,7 @@ struct ProfileForm {
     deletion_method: Option<DeletionMethod>,
     destination_cleanup: bool,
     exclusions: String,
+    executable_permissions: bool,
     timestamps: bool,
     ownership: bool,
     access_control_lists: bool,
@@ -735,6 +740,7 @@ impl Default for ProfileForm {
             deletion_method: None,
             destination_cleanup: false,
             exclusions: String::new(),
+            executable_permissions: true,
             timestamps: false,
             ownership: false,
             access_control_lists: false,
@@ -776,6 +782,7 @@ impl ProfileForm {
             deletion_method: options.deletion_method,
             destination_cleanup: options.destination_cleanup,
             exclusions: value.exclusions().join("\n"),
+            executable_permissions: metadata.executable_permissions(),
             timestamps: metadata.timestamps(),
             ownership: specialist.ownership(),
             access_control_lists: specialist.access_control_lists(),
@@ -825,7 +832,12 @@ impl ProfileForm {
             safe_delete: self.safe_delete,
             destination_cleanup: self.destination_cleanup,
             deletion_method: self.safe_delete.then_some(self.deletion_method).flatten(),
-            metadata: MetadataRequirements::new(true, true, true, self.timestamps)
+            metadata: MetadataRequirements::new(
+                true,
+                self.executable_permissions,
+                true,
+                self.timestamps,
+            )
                 .with_specialist_metadata(SpecialistMetadataRequirements::new(
                     self.ownership,
                     self.access_control_lists,
@@ -1926,6 +1938,7 @@ impl SyncPlusApp {
                 .clone()
                 .ok_or(UiValidationError::ReviewNotReady)?;
             let profile = expected.profile().clone();
+            self.validate_advanced_only_options(&profile)?;
             if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
                 && self.settings.mode() != ApplicationMode::Advanced
             {
@@ -2522,6 +2535,7 @@ impl SyncPlusApp {
         {
             return Err(UiValidationError::ScheduleRequiresAdvanced);
         }
+        self.validate_advanced_only_options(&profile)?;
         if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
             && self.settings.mode() != ApplicationMode::Advanced
         {
@@ -2654,6 +2668,18 @@ impl SyncPlusApp {
             }
         }
         Ok(profile)
+    }
+
+    fn validate_advanced_only_options(
+        &self,
+        profile: &SyncProfile,
+    ) -> Result<(), UiValidationError> {
+        if profile.options().destination_cleanup
+            && self.settings.mode() != ApplicationMode::Advanced
+        {
+            return Err(UiValidationError::DestinationCleanupRequiresAdvanced);
+        }
+        Ok(())
     }
 
     fn analyze_profile_snapshot(profile: SyncProfile) -> ProfileAnalysisResult {
@@ -2901,6 +2927,7 @@ impl SyncPlusApp {
             ));
         }
         let profile = self.validated_profile()?;
+        self.validate_advanced_only_options(&profile)?;
         let profile_name = profile.name().to_owned();
         let (source_peer, _destination_peer) = mapped_peers(&profile);
         let source = source_peer.root().display().to_string();
@@ -3045,6 +3072,7 @@ impl SyncPlusApp {
 
     pub fn analyze_profile(&mut self) -> Result<(), UiValidationError> {
         let profile = self.validated_profile()?;
+        self.validate_advanced_only_options(&profile)?;
         let result = Self::analyze_profile_snapshot(profile);
         self.apply_analysis_result(result)
     }
@@ -3483,6 +3511,7 @@ impl SyncPlusApp {
                 {
                     return Err(UiValidationError::ScheduleRequiresAdvanced);
                 }
+                self.validate_advanced_only_options(&profile)?;
                 if self.form.schedule_enabled
                     && profile.options().safe_delete
                     && profile.options().deletion_method.is_none()
@@ -4963,6 +4992,13 @@ impl SyncPlusApp {
                 );
                 ui.add_space(8.0);
                     ui.checkbox(&mut self.form.destination_cleanup, "Destination Cleanup");
+                    ui.label(
+                        egui::RichText::new(
+                            "Destination Cleanup removes destination items that are absent from the current source inventory. It is Advanced Mode only and remains subject to Fresh Analysis, verification, and reconciliation.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
                     ui.separator();
                     ui.label("Unattended authorization (explicit and profile-specific)");
                     let destructive_actions_enabled = self.form.safe_delete || self.form.destination_cleanup;
@@ -5010,6 +5046,13 @@ impl SyncPlusApp {
                             allow_permanent,
                         );
                         ui.label("Permanent Removal requires this separate authorization for unattended scheduled runs.");
+                        ui.label(
+                            egui::RichText::new(
+                                "Permanent Removal is irreversible. It is never used as a fallback when Trash is unavailable.",
+                            )
+                            .small()
+                            .color(palette.warning),
+                        );
                     } else {
                         if self
                             .form
@@ -5025,10 +5068,69 @@ impl SyncPlusApp {
                     }
                     ui.separator();
                     ui.label("Metadata preservation (validated named options)");
+                    ui.label(
+                        egui::RichText::new(
+                            "These options are checked at both endpoints. If a selected capability cannot be preserved and verified, precheck blocks the run; it never counts unsupported metadata as success.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Mirror Equality always includes content and item type, plus the selected executable-permission and timestamp checks. Specialist metadata must be supported and verified before it can contribute to equality.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
+                    ui.checkbox(
+                        &mut self.form.executable_permissions,
+                        "Preserve and verify executable permissions",
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Executable permissions preserves the file's execute bits where the endpoint supports them.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
                     ui.checkbox(&mut self.form.timestamps, "Preserve and verify timestamps");
-                    ui.checkbox(&mut self.form.ownership, "Preserve ownership");
-                    ui.checkbox(&mut self.form.access_control_lists, "Preserve access-control lists");
-                    ui.checkbox(&mut self.form.extended_attributes, "Preserve extended attributes");
+                    ui.label(
+                        egui::RichText::new(
+                            "Timestamps preserves and compares modification times; filesystem timestamp precision may limit equality.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
+                    ui.checkbox(&mut self.form.ownership, "Preserve and verify ownership");
+                    ui.label(
+                        egui::RichText::new(
+                            "Ownership preserves owner and group where the endpoint permits it; unsupported or unverified ownership blocks the run.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
+                    ui.checkbox(
+                        &mut self.form.access_control_lists,
+                        "Preserve and verify access-control lists",
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Access-control lists preserves ACL entries where supported; both endpoints must report verified ACL capability.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
+                    ui.checkbox(
+                        &mut self.form.extended_attributes,
+                        "Preserve and verify extended attributes",
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "Extended attributes preserves xattrs where supported; inability to verify them keeps the run unresolved.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
                     ui.separator();
                     ui.label("Transfer resilience");
                     ui.horizontal(|ui| {
@@ -10285,6 +10387,13 @@ mod tests {
             app.save_profile(),
             Err(UiValidationError::PermanentRemovalRequiresAdvanced)
         );
+
+        app.form.deletion_method = Some(DeletionMethod::Trash);
+        app.form.destination_cleanup = true;
+        assert_eq!(
+            app.save_profile(),
+            Err(UiValidationError::DestinationCleanupRequiresAdvanced)
+        );
         assert!(app.profiles().is_empty());
     }
 
@@ -10355,6 +10464,7 @@ mod tests {
         );
         for advanced_only in [
             "Preserve and verify timestamps",
+            "Preserve and verify executable permissions",
             "Retry attempts",
             "Background Scheduler (Advanced Mode only)",
             "Authorize unattended Permanent Removal (irreversible; Advanced only)",
@@ -10374,14 +10484,21 @@ mod tests {
         );
 
         app.set_mode(ApplicationMode::Advanced);
+        app.form.safe_delete = true;
+        app.form.deletion_method = Some(DeletionMethod::PermanentRemoval);
         let (advanced_texts, _) = painted_output_for(&mut app, ThemePreference::Light);
         let advanced = advanced_texts.join("\n");
         assert!(
             advanced.contains("Destination Cleanup"),
             "Advanced Mode must show Destination Cleanup in {advanced}"
         );
+        assert!(
+            advanced.contains("Permanent Removal (irreversible; separate authorization)"),
+            "Advanced Mode must label Permanent Removal as irreversible in {advanced}"
+        );
         for advanced_only in [
             "Preserve and verify timestamps",
+            "Preserve and verify executable permissions",
             "Retry attempts",
             "Background Scheduler (Advanced Mode only)",
         ] {
@@ -10753,6 +10870,7 @@ mod tests {
     #[test]
     fn advanced_options_are_typed_and_round_trip_without_command_editing() {
         let mut form = valid_form();
+        form.executable_permissions = false;
         form.timestamps = true;
         form.ownership = true;
         form.access_control_lists = true;
@@ -10763,6 +10881,7 @@ mod tests {
 
         let profile = form.build().expect("typed advanced options");
         let options = profile.options();
+        assert!(!options.metadata.executable_permissions());
         assert!(options.metadata.timestamps());
         assert!(options.metadata.specialist_metadata().ownership());
         assert!(
@@ -10788,11 +10907,57 @@ mod tests {
                 .contains("--arbitrary")
         );
 
+        let mut advanced_app = app();
+        advanced_app.form = valid_form();
+        advanced_app.set_mode(ApplicationMode::Advanced);
+        advanced_app.show_sync_workspace();
+        advanced_app.workspace_tab = WorkspaceTab::Options;
+        let (advanced_texts, _) = painted_output_for(&mut advanced_app, ThemePreference::Light);
+        let advanced = advanced_texts.join("\n");
+        for explanation in [
+            "Preserve and verify executable permissions",
+            "Preserve and verify timestamps",
+            "Preserve and verify ownership",
+            "Preserve and verify access-control lists",
+            "Preserve and verify extended attributes",
+        ] {
+            assert!(advanced.contains(explanation), "Advanced Mode must show {explanation} in {advanced}");
+        }
+        assert!(advanced.contains("precheck blocks the run"));
+        assert!(advanced.contains("Mirror Equality always includes content and item type"));
+
         form.retry_attempts = "11".to_owned();
         assert_eq!(form.build(), Err(UiValidationError::InvalidRetryAttempts));
         form.retry_attempts = "5".to_owned();
         form.retry_delay_millis = "3600001".to_owned();
         assert_eq!(form.build(), Err(UiValidationError::InvalidRetryDelay));
+    }
+
+    #[test]
+    fn advanced_metadata_controls_round_trip_through_profile_persistence() {
+        let mut syncplus = app();
+        syncplus.set_mode(ApplicationMode::Advanced);
+        let mut form = valid_form();
+        form.executable_permissions = false;
+        form.timestamps = true;
+        form.ownership = true;
+        form.access_control_lists = true;
+        form.extended_attributes = true;
+        syncplus.form = form;
+
+        let id = syncplus.save_profile().expect("save profile");
+        let persisted = syncplus
+            .profiles()
+            .iter()
+            .find(|profile| profile.id() == id)
+            .expect("persisted profile");
+        let restored = ProfileForm::from_persisted(persisted);
+
+        assert!(!restored.executable_permissions);
+        assert!(restored.timestamps);
+        assert!(restored.ownership);
+        assert!(restored.access_control_lists);
+        assert!(restored.extended_attributes);
     }
 
     #[test]

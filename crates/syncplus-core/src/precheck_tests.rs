@@ -8,7 +8,8 @@ use crate::{
     RemoteTrashCapability, ResolvedSshCredential, RunEvidenceStore, RunPrecheck,
     ScopeLockOwner, SshHostFingerprint, SshHostIdentityError, SshHostIdentityProbe,
     SshHostTrustController, SshPeer, SshRemotePrecheck, SshRemotePrecheckProbe,
-    SyncMode, SyncOptions, SyncProfile,
+    SpecialistMetadataCapabilities, SpecialistMetadataRequirements, SyncMode, SyncOptions,
+    SyncProfile,
 };
 
 #[derive(Clone)]
@@ -19,6 +20,7 @@ struct FakeProbe {
     required_space: u64,
     naming_conflicts: Vec<crate::NamingConflict>,
     probe_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    specialist_capabilities: SpecialistMetadataCapabilities,
 }
 
 impl PrecheckProbe for FakeProbe {
@@ -76,6 +78,13 @@ impl PrecheckProbe for FakeProbe {
     ) -> Result<Vec<crate::NamingConflict>, crate::PrecheckError> {
         Ok(self.naming_conflicts.clone())
     }
+
+    fn specialist_metadata_capabilities(
+        &self,
+        _destination: &std::path::Path,
+    ) -> Result<SpecialistMetadataCapabilities, crate::PrecheckError> {
+        Ok(self.specialist_capabilities)
+    }
 }
 
 fn profile(source: PathBuf, destination: PathBuf) -> SyncProfile {
@@ -90,7 +99,53 @@ fn passing_probe() -> FakeProbe {
         required_space: 10,
         naming_conflicts: Vec::new(),
         probe_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        specialist_capabilities: SpecialistMetadataCapabilities::default(),
     }
+}
+
+#[test]
+fn unsupported_selected_specialist_metadata_blocks_without_claiming_success() {
+    let metadata = crate::MetadataRequirements::default().with_specialist_metadata(
+        SpecialistMetadataRequirements::new(true, true, true),
+    );
+    let profile = profile(PathBuf::from("/source"), PathBuf::from("/destination"))
+        .with_options(SyncOptions {
+            metadata,
+            ..SyncOptions::default()
+        });
+    let result = RunPrecheck::check(&profile, &passing_probe())
+        .expect("unsupported metadata should be represented as a blocker");
+
+    assert!(!result.can_execute());
+    let blocker = result
+        .blockers()
+        .iter()
+        .find(|blocker| blocker.kind() == PrecheckBlockerKind::SpecialistMetadataUnsupported)
+        .expect("selected unsupported metadata should block the run");
+    assert!(blocker.reason().contains("requested ownership=true"));
+    assert!(blocker.remediation().contains("disable the named Advanced metadata options"));
+}
+
+#[test]
+fn supported_selected_specialist_metadata_can_pass_precheck() {
+    let metadata = crate::MetadataRequirements::default().with_specialist_metadata(
+        SpecialistMetadataRequirements::new(true, true, true),
+    );
+    let profile = profile(PathBuf::from("/source"), PathBuf::from("/destination"))
+        .with_options(SyncOptions {
+            metadata,
+            ..SyncOptions::default()
+        });
+    let mut probe = passing_probe();
+    probe.specialist_capabilities = SpecialistMetadataCapabilities::new(true, true, true);
+
+    let result = RunPrecheck::check(&profile, &probe).expect("supported metadata should pass");
+
+    assert!(result.can_execute());
+    assert!(!result
+        .blockers()
+        .iter()
+        .any(|blocker| blocker.kind() == PrecheckBlockerKind::SpecialistMetadataUnsupported));
 }
 
 struct FixedHostProbe(SshHostFingerprint);

@@ -162,6 +162,12 @@ impl FileMetadataProof {
         other: &Self,
         requirements: MetadataRequirements,
     ) -> bool {
+        // FileMetadataProof does not carry ownership, ACL, or xattr values.
+        // Never let a selected specialist requirement become an unverified
+        // success until inventory and proof records can carry those values.
+        if requirements.specialist_metadata().any() {
+            return false;
+        }
         (!requirements.file_type() || self.item_type == other.item_type)
             && (!requirements.symlink_targets() || self.symlink_target == other.symlink_target)
             && (!requirements.executable_permissions()
@@ -185,6 +191,9 @@ impl FileMetadataProof {
         metadata: &Metadata,
         requirements: MetadataRequirements,
     ) -> bool {
+        if requirements.specialist_metadata().any() {
+            return false;
+        }
         (!requirements.file_type() || self.item_type == ItemType::RegularFile)
             && (!requirements.file_type() || metadata.file_type().is_file())
             && (!requirements.executable_permissions()

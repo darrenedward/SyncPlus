@@ -11,7 +11,7 @@ use crate::{
     ApplicationMode, ApplicationSettings, AuthorizationSnapshot, HostTrustError, Peer,
     RunEvidenceStore, RunId, RunSnapshot, SavedSecretReference, ScheduleDefinition,
     SshAuthentication, SshHost, SshHostFingerprint, StorageError, SyncMode, SyncProfile,
-    ThemePreference,
+    SpecialistMetadataRequirements, ThemePreference,
 };
 
 fn profile() -> SyncProfile {
@@ -130,6 +130,30 @@ fn profiles_round_trip_with_validated_endpoints_and_safe_defaults() {
             .expect("load removed profile")
             .is_none()
     );
+}
+
+#[test]
+fn selected_metadata_requirements_round_trip_with_a_profile() {
+    let database = database();
+    let metadata = crate::MetadataRequirements::new(true, false, true, true)
+        .with_specialist_metadata(SpecialistMetadataRequirements::new(true, true, true));
+    let original = profile().with_options(crate::SyncOptions {
+        metadata,
+        ..crate::SyncOptions::default()
+    });
+    let profile_id;
+    {
+        let mut store = RunEvidenceStore::open(database.path()).expect("open database");
+        profile_id = store.create_profile(&original).expect("create profile").id();
+    }
+
+    let reopened = RunEvidenceStore::open(database.path()).expect("reopen database");
+    let loaded = reopened
+        .load_profile(profile_id)
+        .expect("load profile")
+        .expect("profile exists");
+
+    assert_eq!(loaded.profile().options().metadata, metadata);
 }
 
 #[test]
