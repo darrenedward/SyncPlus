@@ -316,6 +316,7 @@ pub enum ProcessSpecError {
     InvalidRetryPolicy { max_attempts: u8 },
     InvalidRetryDelay { milliseconds: u128 },
     HostTrustPermitMismatch,
+    DeletionMethodRequired,
 }
 
 impl fmt::Display for ProcessSpecError {
@@ -368,6 +369,9 @@ impl fmt::Display for ProcessSpecError {
             Self::HostTrustPermitMismatch => {
                 formatter.write_str("SSH host-trust permit does not match the remote endpoint")
             }
+            Self::DeletionMethodRequired => formatter.write_str(
+                "Safe Delete requires an explicit Deletion Method before an active run can start",
+            ),
         }
     }
 }
@@ -414,12 +418,6 @@ impl ValidatedSyncOptions {
 
 impl SyncOptions {
     pub fn validate(self) -> Result<ValidatedSyncOptions, ProcessSpecError> {
-        if self.safe_delete && self.deletion_method.is_none() {
-            return Err(ProcessSpecError::InvalidOptionCombination {
-                reason: "Safe Delete requires an explicit deletion method",
-            });
-        }
-
         if self.deletion_method.is_some() && !self.safe_delete && !self.destination_cleanup {
             return Err(ProcessSpecError::InvalidOptionCombination {
                 reason: "a deletion method requires an explicit destructive action",
@@ -465,6 +463,19 @@ pub struct ProcessSpecification {
 }
 
 impl ProcessSpecification {
+    /// Build a specification for an active run. Analysis may intentionally
+    /// omit the recovery method until the user confirms the execution choice,
+    /// but an active run must freeze that choice in its snapshot.
+    pub fn from_profile_for_run(profile: &SyncProfile) -> Result<Self, ProcessSpecError> {
+        let specification = Self::from_profile(profile)?;
+        if specification.options().safe_delete()
+            && specification.options().deletion_method().is_none()
+        {
+            return Err(ProcessSpecError::DeletionMethodRequired);
+        }
+        Ok(specification)
+    }
+
     pub fn from_profile(profile: &SyncProfile) -> Result<Self, ProcessSpecError> {
         if !matches!(profile.mode(), SyncMode::OneWay | SyncMode::Mirror) {
             return Err(ProcessSpecError::UnsupportedSyncMode);
@@ -487,8 +498,9 @@ impl ProcessSpecification {
             return Err(ProcessSpecError::UnsupportedSshTopology);
         }
 
+        let destination_root = process_destination_root(profile, destination);
         validate_peer_path(source.name(), source.root())?;
-        validate_peer_path(destination.name(), destination.root())?;
+        validate_peer_path(destination.name(), &destination_root)?;
 
         let ssh_transport = profile
             .peer_a()
@@ -529,18 +541,27 @@ impl ProcessSpecification {
 
         arguments.push(ProcessArgument::Flag(RsyncFlag::EndOfOptions));
         arguments.push(peer_argument(source));
-        arguments.push(peer_argument(destination));
+        arguments.push(peer_argument_at_path(destination, &destination_root)?);
+
+        let mut peer_a_root = profile.peer_a().root().to_path_buf();
+        let mut peer_b_root = profile.peer_b().root().to_path_buf();
+        if profile.mode() == SyncMode::OneWay {
+            match profile.source() {
+                OneWaySource::PeerA => peer_b_root = destination_root.clone(),
+                OneWaySource::PeerB => peer_a_root = destination_root.clone(),
+            }
+        }
 
         Ok(Self {
             arguments,
             options,
             source: profile.source(),
             source_root: source.root().to_path_buf(),
-            destination_root: destination.root().to_path_buf(),
+            destination_root,
             secret_bindings: Vec::new(),
             mode: profile.mode(),
-            peer_a_root: profile.peer_a().root().to_path_buf(),
-            peer_b_root: profile.peer_b().root().to_path_buf(),
+            peer_a_root,
+            peer_b_root,
             ssh_transport,
             peer_a_ssh: profile.peer_a().ssh_peer().cloned(),
             peer_b_ssh: profile.peer_b().ssh_peer().cloned(),
@@ -859,6 +880,25 @@ fn peer_argument(peer: &Peer) -> ProcessArgument {
         Some(ssh) => ProcessArgument::RemotePeerPath(SshTarget::from_peer(ssh)),
         None => ProcessArgument::PeerPath(peer.root().to_path_buf()),
     }
+}
+
+fn peer_argument_at_path(peer: &Peer, path: &Path) -> Result<ProcessArgument, ProcessSpecError> {
+    match peer.ssh_peer() {
+        Some(ssh) => Ok(ProcessArgument::RemotePeerPath(
+            SshTarget::from_peer_path(ssh, path.to_path_buf())?,
+        )),
+        None => Ok(ProcessArgument::PeerPath(path.to_path_buf())),
+    }
+}
+
+fn process_destination_root(profile: &SyncProfile, destination: &Peer) -> PathBuf {
+    if profile.mode() == SyncMode::OneWay && !destination.is_ssh() {
+        let effective_root = profile.effective_destination_root();
+        if effective_root.is_dir() {
+            return effective_root;
+        }
+    }
+    destination.root().to_path_buf()
 }
 
 impl SshTarget {

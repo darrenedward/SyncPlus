@@ -557,15 +557,24 @@ impl RunEvidenceStore {
                 }
             })
             .transpose()?;
+        let existing = self
+            .load_profile(id)?
+            .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
         if let Some(schedule) = &schedule {
             schedule.validate()?;
             if schedule.enabled() && mode != ApplicationMode::Advanced {
                 return Err(StorageError::ScheduleRequiresAdvanced);
             }
+            if schedule.enabled()
+                && existing.profile().options().safe_delete
+                && existing.profile().options().deletion_method.is_none()
+            {
+                return Err(StorageError::InvalidSchedule(
+                    "scheduled Safe Delete requires an explicitly selected Deletion Method"
+                        .to_owned(),
+                ));
+            }
         }
-        let existing = self
-            .load_profile(id)?
-            .ok_or(StorageError::ProfileNotFound { id: id.value() })?;
         let revision = existing.revision().checked_add(1).ok_or_else(|| {
             StorageError::CorruptEvidence("profile revision is exhausted".to_owned())
         })?;

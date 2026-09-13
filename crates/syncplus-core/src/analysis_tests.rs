@@ -131,6 +131,29 @@ fn hidden_items_are_included_and_inventory_records_identity_type_metadata_and_ou
 }
 
 #[test]
+fn one_way_analysis_uses_the_existing_source_named_destination_child() {
+    let source = TestDirectory::new("mapped-source");
+    let destination_parent = TestDirectory::new("mapped-destination-parent");
+    let destination_child = destination_parent.join(source.path.file_name().expect("source name"));
+    fs::create_dir_all(&destination_child).expect("destination child should be creatable");
+    write_file(&destination_parent.join("outside-the-sync.txt"), b"must not be inventoried");
+    write_file(&destination_child.join("inside-the-sync.txt"), b"destination item");
+
+    let profile = profile(&source, &destination_parent);
+    let analysis = FreshAnalysis::analyze(&profile).expect("mapped peers should be analyzable");
+
+    assert_eq!(analysis.destination_inventory().root(), destination_child.as_path());
+    assert!(analysis
+        .destination_inventory()
+        .item("outside-the-sync.txt")
+        .is_none());
+    assert!(analysis
+        .destination_inventory()
+        .item("inside-the-sync.txt")
+        .is_some());
+}
+
+#[test]
 fn only_owned_syncplus_transfer_artifacts_are_hidden_from_user_inventory() {
     let source = TestDirectory::new("partial-artifact-source");
     let destination = TestDirectory::new("partial-artifact-destination");
@@ -331,6 +354,28 @@ fn symlinks_are_inventoried_as_links_without_following_their_targets() {
     assert_eq!(link.item_type(), ItemType::Symlink);
     assert_eq!(link.metadata().symlink_target(), Some(Path::new("target.txt")));
     assert!(analysis.source_inventory().item("link.txt/target.txt").is_none());
+}
+
+#[test]
+fn manual_safe_delete_method_is_selected_at_confirmation_time() {
+    let source = TestDirectory::new("manual-method-source");
+    let destination = TestDirectory::new("manual-method-destination");
+    write_file(&source.join("drain.txt"), b"drain");
+    let profile = profile(&source, &destination).with_options(SyncOptions {
+        safe_delete: true,
+        deletion_method: Some(DeletionMethod::Trash),
+        ..Default::default()
+    });
+
+    let analysis = FreshAnalysis::analyze(&profile).expect("safe-delete analysis should succeed");
+    let confirmed = analysis
+        .confirm_with_deletion_method(&profile, DeletionMethod::PermanentRemoval)
+        .expect("the manual method should be part of the confirmed plan");
+
+    assert_eq!(
+        confirmed.profile().options().deletion_method,
+        Some(DeletionMethod::PermanentRemoval)
+    );
 }
 
 #[test]

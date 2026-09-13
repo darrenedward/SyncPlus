@@ -25,6 +25,7 @@ pub type ActionId = u64;
 pub struct RunSnapshot {
     run_id: RunId,
     snapshot_id: ProfileSnapshotId,
+    created_at_unix_seconds: i64,
     profile: SyncProfile,
     validated_options: ValidatedSyncOptions,
     authorizations: AuthorizationSnapshot,
@@ -48,8 +49,8 @@ impl RunSnapshot {
         peer_a_volume_identity: Option<VolumeIdentity>,
         peer_b_volume_identity: Option<VolumeIdentity>,
     ) -> Result<Self, StorageError> {
-        let specification =
-            ProcessSpecification::from_profile(profile).map_err(StorageError::InvalidProfile)?;
+        let specification = ProcessSpecification::from_profile_for_run(profile)
+            .map_err(StorageError::InvalidProfile)?;
         if authorizations.allow_unattended_permanent_removal()
             && (specification.options().deletion_method() != Some(DeletionMethod::PermanentRemoval)
                 || !specification.options().safe_delete())
@@ -62,6 +63,7 @@ impl RunSnapshot {
         Ok(Self {
             run_id,
             snapshot_id: ProfileSnapshotId::new(run_id.value()),
+            created_at_unix_seconds: current_unix_seconds()?,
             profile: profile.clone(),
             validated_options: specification.options(),
             authorizations,
@@ -76,6 +78,10 @@ impl RunSnapshot {
 
     pub const fn snapshot_id(&self) -> ProfileSnapshotId {
         self.snapshot_id
+    }
+
+    pub const fn created_at_unix_seconds(&self) -> i64 {
+        self.created_at_unix_seconds
     }
 
     pub fn profile(&self) -> &SyncProfile {
@@ -1417,7 +1423,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 20 {
+        if version > 21 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -2075,6 +2081,29 @@ impl RunEvidenceStore {
             transaction.pragma_update(None, "user_version", 20)?;
             verify_integrity(&transaction)?;
             transaction.commit()?;
+            version = 20;
+        }
+        if version == 20 {
+            let transaction = connection.transaction()?;
+            let has_created_at_column: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('run_snapshots')
+                    WHERE name = 'created_at_unix_seconds'
+                )",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_created_at_column {
+                transaction.execute(
+                    "ALTER TABLE run_snapshots
+                     ADD COLUMN created_at_unix_seconds INTEGER NOT NULL DEFAULT 0
+                     CHECK (created_at_unix_seconds >= 0)",
+                    [],
+                )?;
+            }
+            transaction.pragma_update(None, "user_version", 21)?;
+            verify_integrity(&transaction)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -2140,8 +2169,8 @@ impl RunEvidenceStore {
                 metadata_ownership, metadata_access_control_lists,
                 metadata_extended_attributes,
                 partial_transfer_policy, retry_max_attempts,
-                retry_initial_delay_millis
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38)",
+                retry_initial_delay_millis, created_at_unix_seconds
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
             params![
                 snapshot.run_id().value(),
                 snapshot.snapshot_id().value(),
@@ -2185,6 +2214,7 @@ impl RunEvidenceStore {
                 encode_partial_transfer_policy(options.partial_transfer_policy()),
                 options.retry_policy().max_attempts(),
                 options.retry_policy().initial_delay().as_millis() as u64,
+                snapshot.created_at_unix_seconds(),
             ],
         )?;
         let next_run_id = i64::try_from(snapshot.run_id().value())
@@ -3501,7 +3531,7 @@ impl RunEvidenceStore {
                         metadata_ownership, metadata_access_control_lists,
                         metadata_extended_attributes,
                         partial_transfer_policy, retry_max_attempts,
-                        retry_initial_delay_millis
+                        retry_initial_delay_millis, created_at_unix_seconds
                  FROM run_snapshots WHERE run_id = ?1",
                 params![run_id.value()],
                 |row| {
@@ -3543,6 +3573,7 @@ impl RunEvidenceStore {
                         row.get::<_, String>(34)?,
                         row.get::<_, u8>(35)?,
                         row.get::<_, u64>(36)?,
+                        row.get::<_, i64>(37)?,
                     ))
                 },
             )
@@ -3585,6 +3616,7 @@ impl RunEvidenceStore {
             partial_transfer_policy,
             retry_max_attempts,
             retry_initial_delay_millis,
+            created_at_unix_seconds,
         )) = row
         else {
             return Err(StorageError::InvalidEvent(format!(
@@ -3669,6 +3701,7 @@ impl RunEvidenceStore {
             decode_volume_identity(peer_b_volume_identity.as_deref())?,
         )?;
         snapshot.snapshot_id = ProfileSnapshotId::new(snapshot_id);
+        snapshot.created_at_unix_seconds = created_at_unix_seconds;
         Ok(snapshot)
     }
 
@@ -6496,7 +6529,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
         assert!(
             migrated
                 .connection
@@ -6550,7 +6583,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
         for table in [
             "application_settings",
             "sync_profiles",
@@ -6607,7 +6640,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            20
+            21
         );
     }
 

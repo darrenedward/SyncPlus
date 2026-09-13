@@ -88,7 +88,7 @@ Run statuses:
 
 ### User confirmation
 
-Every data-changing run shows a fresh **Execution Confirmation** immediately before execution. It lists:
+Every data-changing run requires a fresh **Execution Confirmation** immediately before execution. In the desktop Review, the successful-dry-run `Synchronise` action is the explicit confirmation boundary; the review surface keeps the mapping, counts, inventory panes, grouped blockers, and short state messages visible rather than presenting a second confirmation form. Historical Run Reports are opened from the Sync workspace's Report tab, not shown as a permanent sidebar destination. It lists:
 
 - mode and exact source/destination mapping;
 - counts and sizes for copies, overwrites, removals, preserved copies, conflicts, exclusions, and unresolved items;
@@ -113,7 +113,7 @@ Before Analyze and before execution, the non-mutating Run Precheck checks:
 - remote SSH host identity, credentials, remote rsync capability, remote hash capability, and remote recovery capability where relevant;
 - SQLite integrity and the required pre-run database backup.
 
-Required permission, capability, naming, recovery, or database failures block all file-changing execution. Read-only analysis may explain the issue and its remediation. SyncPlus never invokes `sudo`, changes ownership/permissions, or recommends broad permissions such as `chmod 777`.
+Required permission, capability, naming, recovery, or database failures block all file-changing execution. Read-only analysis may explain the issue and its remediation. An unavailable or unmounted local peer blocks before Source Inventory, including a leftover mount whose device is gone. The desktop Dry run must show those blockers immediately in plain language rather than an empty plan or a duplicated operating-system error dump. For a missing local folder, the matching source or destination section glows red with a short message and Retry on the same saved path; Retry does not start a Sync Run. SyncPlus never invokes `sudo`, changes ownership/permissions, or recommends broad permissions such as `chmod 777`.
 
 ### Fresh Analysis and Source Inventory
 
@@ -499,7 +499,7 @@ Examples of required messages:
 
 ## Follow-on visual identity
 
-Brand Theme tokens for Dark Appearance and Light Appearance live in `crates/syncplus/src/theme.rs`. Core still stores only the named preference System, Light, or Dark. Brand Mark catalog and window icon loading live in `crates/syncplus/src/brand_mark.rs`. Navigation chrome and Overview identity live in `crates/syncplus/src/chrome.rs`. Workspace type roles, Help grouping, and Execution Confirmation presentation live in the desktop GUI. The public Brand Kit lives under `docs/brand/` and must not weaken the v1 safety contract.
+Brand Theme tokens for the single blue-and-white Desktop Appearance live in `crates/syncplus/src/theme.rs`. Core may still persist a named System, Light, or Dark preference; the desktop chrome does not switch skins from it and Settings does not offer an appearance picker. Brand Mark catalog and window icon loading live in `crates/syncplus/src/brand_mark.rs`. Navigation chrome and Overview identity live in `crates/syncplus/src/chrome.rs`. Workspace type roles, Help grouping, and Execution Confirmation presentation live in the desktop GUI. The public Brand Kit lives under `docs/brand/` and must not weaken the v1 safety contract.
 
 ## Deferred design work
 

@@ -235,7 +235,7 @@ _Avoid_: Technical output only, opaque operation
 
 Simple Mode presents Explainable Actions and plain-language summaries by default. Advanced Mode may reveal the exact generated command and technical diagnostics, but command previews and copyable output always redact passwords, key material, and other secrets. The Help section provides detailed explanations for users who want them.
 
-Folder selection in Simple Mode abstracts rsync trailing-slash semantics and states the resulting mapping explicitly, such as “copy the contents of `public_html` into the remote `public_html` folder.” Advanced Mode may show the exact path syntax and generated command.
+Folder selection in Simple Mode treats the selected destination as the parent for the complete source folder and states the resulting mapping explicitly, such as “copy `public_html` into the remote `public_html` folder.” If that child folder is absent but its parent is available, SyncPlus offers reviewed creation of the exact child path. Advanced Mode may show the exact path syntax and generated command.
 
 **Help Guidance**:
 Plain-language information that explains what an option or result means, why it matters, when to use it, and what consequences or limitations apply.
@@ -252,6 +252,27 @@ verification, host-identity review, confirmation, or Recovery Review.
 When a configured SSH peer reaches a desktop boundary without a remote probe
 result, the diagnostic says that the required host, credential, account,
 capability, and recovery evidence is not proven and keeps execution blocked.
+
+**Sync workspace**:
+Report rows start collapsed; at most one durable Sync Run report expands at a time, and the open report can be collapsed again to return to the list.
+The desktop surface for the active Sync Profile. A compact toolbar keeps the profile selector, Save, and Dry run visible. Synchronise, Options, Review, and Report are underline tabs on a baseline, not a row of ordinary selectable labels. Synchronise is one screen: a slim One-Way Sync / Mirror Sync strip, the task name, and source and destination folder pickers side by side with Browse. Options holds one Exclusion Rules list (file and folder patterns together, such as `*.tmp` and `node_modules/`) and, when Advanced Mode is on, Advanced safety options. Review is the Dry run result: its compact action header names the profile and mode, keeps Dry run and Synchronise together, and appears above the underline tab strip like the other workspace actions; endpoint roots are shown once in the explorer-style Source Inventory / Destination Inventory view with compact copy/overwrite/exclude counts and grouped blockers. The summary keeps Available, Copies, Overwrites, Excluded, Unresolved, and Transfer as compact stat cards in that workflow order; readiness is conveyed by the gated `Synchronise` action rather than a redundant status badge. Report presents every durable Sync Run as a one-line accordion row with its run, profile, status, and timestamp; only one report expands at a time to show evidence and Recovery Review details. It is not a permanent sidebar destination. A successful dry run exposes one explicit `Synchronise` action; that action performs the fresh Execution Confirmation boundary immediately before execution. Live work uses a progress card with status, files, method, elapsed time, and the source-to-destination mapping. Browse opens the desktop folder picker as a child of the SyncPlus window so it stays in front.
+_Avoid_: An Advance tab, two separate exclude-file and exclude-folder boxes, stacking source above destination so the setup requires scrolling, hiding one endpoint, putting historical reports above the current dry-run decision, moving confirmation into Options, or importing third-party mode names such as Basic Sync or Real-Time Sync
+
+**Activity prompt**:
+While Fresh Analysis or a Manual Sync Run is active, SyncPlus shows a progress dialog on every workspace surface. Dry run names the current phase (checking folders, then reading files), the selected paths, and elapsed time, and states that no files are being changed. An active Sync Run names the current durable action and byte progress when that evidence exists. The dialog is not proof of completion.
+_Avoid_: A status line as the only live-work signal, or implying that a transfer finished because a spinner is moving
+
+**Desktop notification**:
+A best-effort operating-system balloon used only while the SyncPlus window is hidden in the tray, so a settled run or scheduler event can still be noticed. The body is the reason and next action as two sentences. While the window is visible, the latest notice appears as a compact dismissible popup with an optional **Open Run Report** action; it does not occupy persistent workspace space. Marking Review Cleared never posts a balloon: that action already happened in the open window.
+_Avoid_: Reason:/Next action: labeled dumps, or balloons for in-app actions the user just completed
+
+**Folder gate**:
+Opening a saved Sync Profile runs a non-mutating availability check of local source and destination folders. For paths under `/mnt`, `/media`, or `/run/media`, SyncPlus reads the kernel mount table first; if the volume is not mounted it does not `stat` the path, because that wait can last a minute on an unplugged drive. Other paths use a short timed `stat`. A missing source remains blocked. When the selected destination parent exists and is writable but the source-named child does not, SyncPlus shows a reviewed **Create destination folder** action for that exact child path and keeps Dry run blocked until it is accepted. A destination whose parent is unavailable remains blocked. Retry on that folder section rechecks the same saved path. Dry run is for building a plan after the effective destination exists; it is not how a missing drive is recovered. SSH peers stay unproven until Dry run.
+_Avoid_: Auto-starting a Sync Run on open, showing a Dry-run progress card for the open-profile folder check, enabling Synchronise on a missing folder, treating an empty plan as success, or invoking `ls`/`grep` as a shell command to test a mount
+
+**Reconnect prompt**:
+When a local source or destination folder is missing, unmounted, or unplugged, that folder's section glows red with a short message underneath and a Retry control. Retry rechecks the same saved path and does not start a Sync Run. A path under a common removable-mount prefix may be described as a removable drive; SyncPlus does not name USB, DVD, or memory-card hardware unless that identity is actually known.
+_Avoid_: A separate full-page error dialog for a missing folder, auto-starting a run when a drive reappears, guessing a different path, or naming a device type that has not been identified
 
 **Simple Mode**:
 The default SyncPlus experience showing the common source, destination, mode, exclusions, safety options, and run actions without exposing specialist filesystem or transport controls.
@@ -341,7 +362,7 @@ _Avoid_: Hidden schedules, Simple Mode scheduling, or unattended execution that 
 The per-OS-user scheduling component that can start authorized Scheduled Runs while the SyncPlus window is closed. It runs without root/administrator privileges, uses the profile's normal permissions and credentials, cannot bypass SyncPlus safety invariants, and persists reports and notifications for later review.
 _Avoid_: Root daemons, hidden privileged services, or schedules that work only while the window is open
 
-Closing the SyncPlus window hides it to the system tray and does not interrupt an active run. **Quit** is a separate action; when a manual run is active, it asks whether to stop and recover it. A crash or forced termination creates an Interrupted Run and follows the cleanup and resume policy.
+Closing the SyncPlus window hides it to the system tray and does not interrupt an active run. The tray uses the Brand Mark; left-click shows the window and right-click offers Show or Quit. Hide-to-tray stays active after the window is hidden so a follow-up close event cannot quit the process. If the tray cannot be registered, the window stays open and SyncPlus says so in plain language. **Quit** is a separate action; when a manual run is active, it asks whether to stop and recover it. A crash or forced termination creates an Interrupted Run and follows the cleanup and resume policy.
 
 If the user selects **No**, the active run continues. If the user selects **Yes**, SyncPlus stops the run safely, records the interrupted state, preserves the source, and applies the partial-transfer cleanup policy. When schedules are enabled, quitting the foreground UI does not disable the separate Background Scheduler; disabling schedules is a separate explicit action.
 
@@ -397,7 +418,7 @@ The core remote precheck accepts only a selected credential and approved host-id
 _Avoid_: Starting a transfer after connectivity-only checks, silently installing tools, or falling back to an unverified destructive method
 
 **Run Precheck**:
-The non-mutating validation phase before Analyze and Execution Confirmation. It checks the selected paths, source readability, destination writability, required removal permissions, path overlap, available space, Trash capacity when relevant, and remote capability when using SSH. Hard blockers prevent the run; clearly labeled warnings may require acknowledgement without silently changing the requested safety policy.
+The non-mutating validation phase before Analyze and Execution Confirmation. It checks the selected paths, source readability, destination writability, required removal permissions, path overlap, available space, Trash capacity when relevant, and remote capability when using SSH. Hard blockers prevent the run; clearly labeled warnings may require acknowledgement without silently changing the requested safety policy. An unavailable, unmounted, missing, or unplugged local peer is a hard blocker, including when the mount path remains but the drive is gone. Dry run and Fresh Analysis must show that result immediately on Overview and Sync workspace in plain language: name the folder, say it is not available, tell the user to connect or mount it, and state that nothing was changed. They must not look like an empty successful plan, dump a duplicated operating-system error, or inventory a peer that is not present.
 _Avoid_: Treating a successful path selection or SSH login as proof that a run is safe to execute
 
 The Run Precheck also evaluates destination naming rules. It detects case-insensitive and Unicode-normalization collisions, reserved or invalid names, path-length limits, and other filesystem restrictions that could make distinct source items collide or fail at the destination. These findings are shown before confirmation and block affected actions until resolved.
@@ -504,18 +525,14 @@ _Avoid_: Recolour to pink or teal, neon glow, slogans that imply silent deletion
 
 ## Appearance
 
-**Dark Appearance**:
-The first-class dark theme: warm ink surfaces, copper primary accent, and steel companion accent. It is not pure black and not a neon-on-black HUD.
-_Avoid_: OLED black, cyberpunk, treating dark as the only real product
-
-**Light Appearance**:
-The first-class light theme: warm paper, cream, and stone surfaces. The canvas is not white and is not a brightness-inverted Dark Appearance.
-_Avoid_: White sheet, bright fallback, leftover dark-mode chrome
+**Desktop Appearance**:
+The single live desktop skin: a navy sidebar, a white workspace, and a blue primary accent. There is no Dark Appearance / Light Appearance switch in Settings.
+_Avoid_: Dual skins, warm-paper cream, copper chrome, a theme picker that spends layout on unused modes
 
 **Brand Theme**:
-The desktop GUI token set that supplies canvas, surface, elevated, field, text, muted, border, copper, steel, danger, warning, and their on/soft pairs for both appearances. Core stores only the named preference System, Light, or Dark; it does not store colours.
-_Avoid_: Per-screen one-off colours, user-supplied chrome, colours in SQLite
+The desktop GUI token set that supplies canvas (navy rail), on-canvas text, surface (white workspace), elevated, field, text, muted, border, primary (`copper` token), companion (`steel` token), danger, warning, and their on/soft pairs. It also sets the shared single-line field height and centers field text. Core may still persist a named System, Light, or Dark preference; the desktop does not change colours from it.
+_Avoid_: Per-screen one-off colours, user-supplied chrome, colours in SQLite, or single-line fields with top-aligned text
 
 **Overview**:
-The home surface of the desktop app. Empty Overview explains first-run calmly and offers one action to create a Sync Profile. Populated Overview shows the active Sync Profile, last Sync Run or review state, and the next safe action.
-_Avoid_: Marketing landing page, neon hero, fake metrics
+The home surface of the desktop app. It always shows the Brand Mark, a short welcome blurb, Create Sync Profile now, and the activity stats. When a Sync Profile is selected it also shows that profile, last Sync Run or review state, and the next safe action.
+_Avoid_: Marketing landing page, neon hero, fake metrics, hiding the welcome hero after the first profile exists

@@ -32,6 +32,7 @@ mod restore;
 mod workflow;
 mod reconciliation;
 mod volume;
+mod local_mount;
 mod ssh_host;
 mod ssh;
 mod ssh_workflow;

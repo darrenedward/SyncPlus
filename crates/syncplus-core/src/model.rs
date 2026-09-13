@@ -526,6 +526,13 @@ impl Default for SyncOptions {
     }
 }
 
+impl SyncOptions {
+    pub const fn with_deletion_method(mut self, deletion_method: Option<DeletionMethod>) -> Self {
+        self.deletion_method = deletion_method;
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AuthorizationSnapshot {
     allow_unattended_destructive: bool,
@@ -596,6 +603,31 @@ impl SyncProfile {
         self.source
     }
 
+    /// Return the destination root used by a One-Way Sync. The selected
+    /// destination is a parent folder: preserve the complete source folder
+    /// beneath it unless the destination already names that source folder.
+    pub fn effective_destination_root(&self) -> std::path::PathBuf {
+        if self.mode == SyncMode::Mirror {
+            return selected_destination(self).root().to_path_buf();
+        }
+        let source = match self.source {
+            OneWaySource::PeerA => &self.peer_a,
+            OneWaySource::PeerB => &self.peer_b,
+        };
+        let destination = match self.source {
+            OneWaySource::PeerA => &self.peer_b,
+            OneWaySource::PeerB => &self.peer_a,
+        };
+        let Some(source_name) = source.root().file_name() else {
+            return destination.root().to_path_buf();
+        };
+        if destination.root().file_name() == Some(source_name) {
+            destination.root().to_path_buf()
+        } else {
+            destination.root().join(source_name)
+        }
+    }
+
     pub const fn options(&self) -> SyncOptions {
         self.options
     }
@@ -635,6 +667,13 @@ impl SyncProfile {
     }
 }
 
+fn selected_destination(profile: &SyncProfile) -> &Peer {
+    match profile.source {
+        OneWaySource::PeerA => &profile.peer_b,
+        OneWaySource::PeerB => &profile.peer_a,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileSnapshot {
     id: ProfileSnapshotId,
@@ -649,7 +688,7 @@ impl ProfileSnapshot {
         profile: &SyncProfile,
         authorizations: AuthorizationSnapshot,
     ) -> Result<Self, ProcessSpecError> {
-        let validated_options = ProcessSpecification::from_profile(profile)?.options();
+        let validated_options = ProcessSpecification::from_profile_for_run(profile)?.options();
         Ok(Self {
             id,
             profile: profile.clone(),

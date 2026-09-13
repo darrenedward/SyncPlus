@@ -192,6 +192,7 @@ impl RunWorkflow {
         C: FnOnce(&ConfirmedPlan) -> bool,
         F: Fn() -> bool,
     {
+        require_deletion_method(profile)?;
         let lease = match self.acquire_precheck(run_id, profile, probe) {
             Ok(lease) => lease,
             Err(error) => {
@@ -588,6 +589,7 @@ impl RunWorkflow {
         C: FnOnce(&ConfirmedPlan) -> bool,
         F: Fn() -> bool,
     {
+        require_deletion_method(profile)?;
         let _scope_lock = self.acquire_ssh_scope(run_id, profile)?;
         let (_remote_side, remote_peer) = ssh_peer_for_profile(profile)?;
         let (_, remote_request) = RemotePrecheckRequest::from_profile(profile)
@@ -2737,6 +2739,11 @@ fn validate_unattended_authorizations(
     authorizations: AuthorizationSnapshot,
 ) -> Result<(), WorkflowError> {
     let options = profile.options();
+    if options.safe_delete && options.deletion_method.is_none() {
+        return Err(WorkflowError::InvalidRun(
+            "scheduled Safe Delete requires an explicitly selected Deletion Method".to_owned(),
+        ));
+    }
     if (options.safe_delete || options.destination_cleanup)
         && !authorizations.allow_unattended_destructive()
     {
@@ -2749,6 +2756,16 @@ fn validate_unattended_authorizations(
     {
         return Err(WorkflowError::InvalidRun(
             "scheduled Permanent Removal requires separate explicit authorization".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_deletion_method(profile: &crate::SyncProfile) -> Result<(), WorkflowError> {
+    if profile.options().safe_delete && profile.options().deletion_method.is_none() {
+        return Err(WorkflowError::InvalidRun(
+            "Safe Delete requires an explicitly selected Deletion Method before execution"
+                .to_owned(),
         ));
     }
     Ok(())
