@@ -884,7 +884,8 @@ const PROFILE_SELECT: &str = "SELECT
     metadata_timestamps, metadata_ownership, metadata_access_control_lists,
     metadata_extended_attributes, partial_transfer_policy, retry_max_attempts,
     retry_initial_delay_millis, schedule_enabled, allow_unattended_destructive,
-    allow_unattended_permanent_removal, profile_revision
+    allow_unattended_permanent_removal, profile_revision,
+    bandwidth_limit_kib_per_second
     FROM sync_profiles";
 
 struct ProfileValues {
@@ -921,6 +922,7 @@ struct PersistedOptions {
     partial_transfer_policy: &'static str,
     retry_max_attempts: i64,
     retry_initial_delay_millis: i64,
+    bandwidth_limit_kib_per_second: Option<i64>,
 }
 
 impl ProfileValues {
@@ -953,6 +955,9 @@ impl ProfileValues {
                     options.retry_policy.initial_delay().as_millis(),
                 )
                 .unwrap_or(i64::MAX),
+                bandwidth_limit_kib_per_second: options
+                    .bandwidth_limit_kib_per_second
+                    .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
             },
         }
     }
@@ -997,6 +1002,7 @@ fn insert_profile(
     parameters.push(Box::new(i64::from(
         authorizations.allow_unattended_permanent_removal(),
     )));
+    parameters.push(Box::new(values.options.bandwidth_limit_kib_per_second));
     transaction.execute(
         "INSERT INTO sync_profiles (
             name, mode, source,
@@ -1009,13 +1015,13 @@ fn insert_profile(
             metadata_timestamps, metadata_ownership, metadata_access_control_lists,
             metadata_extended_attributes, partial_transfer_policy, retry_max_attempts,
             retry_initial_delay_millis, schedule_enabled, allow_unattended_destructive,
-            allow_unattended_permanent_removal
+            allow_unattended_permanent_removal, bandwidth_limit_kib_per_second
         ) VALUES (
             ?1, ?2, ?3,
             ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
             ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
             ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
-            ?30, ?31, ?32, 0, ?33, ?34
+            ?30, ?31, ?32, 0, ?33, ?34, ?35
         )",
         rusqlite::params_from_iter(parameters.iter().map(|value| value.as_ref())),
     )?;
@@ -1036,6 +1042,7 @@ fn update_profile_row(
     parameters.push(Box::new(i64::from(
         authorizations.allow_unattended_permanent_removal(),
     )));
+    parameters.push(Box::new(values.options.bandwidth_limit_kib_per_second));
     parameters.push(Box::new(id.value_as_i64()?));
     parameters.push(Box::new(expected_revision));
     Ok(transaction.execute(
@@ -1055,8 +1062,9 @@ fn update_profile_row(
             retry_max_attempts = ?31, retry_initial_delay_millis = ?32,
             allow_unattended_destructive = ?33,
             allow_unattended_permanent_removal = ?34,
+            bandwidth_limit_kib_per_second = ?35,
             profile_revision = profile_revision + 1
-        WHERE profile_id = ?35 AND profile_revision = ?36",
+        WHERE profile_id = ?36 AND profile_revision = ?37",
         rusqlite::params_from_iter(parameters.iter().map(|value| value.as_ref())),
     )?)
 }
@@ -1188,6 +1196,7 @@ struct RawProfile {
     allow_unattended_destructive: i64,
     allow_unattended_permanent_removal: i64,
     profile_revision: i64,
+    bandwidth_limit_kib_per_second: Option<i64>,
 }
 
 struct RawPeer {
@@ -1245,6 +1254,7 @@ impl RawProfile {
             allow_unattended_destructive: row.get(34)?,
             allow_unattended_permanent_removal: row.get(35)?,
             profile_revision: row.get(36)?,
+            bandwidth_limit_kib_per_second: row.get(37)?,
         })
     }
 
@@ -1280,6 +1290,10 @@ impl RawProfile {
                         .map_err(|_| corrupt_profile())?,
                 ),
             ),
+            bandwidth_limit_kib_per_second: self
+                .bandwidth_limit_kib_per_second
+                .map(|value| u64::try_from(value).map_err(|_| corrupt_profile()))
+                .transpose()?,
         };
         let profile = SyncProfile::new(self.name, peer_a, peer_b)
             .with_mode(mode)

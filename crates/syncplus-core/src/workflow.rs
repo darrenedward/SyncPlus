@@ -3646,6 +3646,7 @@ mod tests {
             metadata: Default::default(),
             partial_transfer_policy: Default::default(),
             retry_policy: Default::default(),
+            bandwidth_limit_kib_per_second: None,
         });
 
         let error = super::validate_unattended_authorizations(
@@ -3677,6 +3678,7 @@ mod tests {
             metadata: Default::default(),
             partial_transfer_policy: Default::default(),
             retry_policy: Default::default(),
+            bandwidth_limit_kib_per_second: None,
         });
         let mut store = RunEvidenceStore::open_in_memory().expect("evidence store");
 
@@ -4175,6 +4177,7 @@ mod tests {
                 metadata: Default::default(),
                 partial_transfer_policy: Default::default(),
                 retry_policy: Default::default(),
+                bandwidth_limit_kib_per_second: None,
             }),
             ssh,
         )
@@ -5807,6 +5810,7 @@ mod tests {
             metadata: Default::default(),
             partial_transfer_policy: Default::default(),
             retry_policy: Default::default(),
+            bandwidth_limit_kib_per_second: None,
         });
         let (credential, host_permit, precheck) = ssh_permits_with_trash(&profile, &ssh, false);
         let backend = FakeSshBackend::new(fixture.remote());

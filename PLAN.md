@@ -381,6 +381,7 @@ Any state can become `Blocked`, `Failed`, `Cancelled`, or `Interrupted` accordin
 
 - Use deterministic, validated option builders; provide no unrestricted argument field.
 - Expose named options only: mode, Safe Delete, Destination Cleanup, Resume, compression, bandwidth limit, essential metadata, specialist metadata, exclusions, SSH port/identity/auth, and retry policy.
+- Advanced Mode accepts an optional bandwidth cap from 1 through 4,000,000 KiB/s; empty means unlimited and the validated value is frozen into each Run Snapshot.
 - `--delete` is never used to implement Safe Delete. Destination Cleanup is a separate opt-in action with its own plan and confirmation.
 - Itemized output and progress parsing are covered by fixture tests with chunk-split input, carriage returns, `*deleting`, escaped control characters, spaces, Unicode, and unknown flags.
 - Treat rsync partial/vanished-source outcomes as incomplete until SyncPlus reconciles the current state. Exit code 0 is not a Safe Delete proof.

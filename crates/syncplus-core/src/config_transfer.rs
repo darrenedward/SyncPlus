@@ -206,6 +206,8 @@ struct ExportOptions {
     partial_transfer_policy: ExportPartialTransferPolicy,
     retry_max_attempts: u8,
     retry_initial_delay_millis: u64,
+    #[serde(default)]
+    bandwidth_limit_kib_per_second: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -555,6 +557,7 @@ impl ExportOptions {
             partial_transfer_policy: options.partial_transfer_policy.into(),
             retry_max_attempts: options.retry_policy.max_attempts(),
             retry_initial_delay_millis: options.retry_policy.initial_delay().as_millis() as u64,
+            bandwidth_limit_kib_per_second: options.bandwidth_limit_kib_per_second,
         }
     }
 
@@ -583,6 +586,7 @@ impl ExportOptions {
                     self.retry_max_attempts,
                     Duration::from_millis(self.retry_initial_delay_millis),
                 ),
+                bandwidth_limit_kib_per_second: self.bandwidth_limit_kib_per_second,
             },
             stripped_destructive,
         )

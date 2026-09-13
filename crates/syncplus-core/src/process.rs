@@ -83,6 +83,7 @@ fn specialist_rsync_flags(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessArgument {
     Flag(RsyncFlag),
+    BandwidthLimit(u64),
     ExclusionPattern(String),
     PeerPath(PathBuf),
     RemotePeerPath(SshTarget),
@@ -337,6 +338,7 @@ pub enum ProcessSpecError {
     InvalidTransferPath { path: PathBuf },
     InvalidRetryPolicy { max_attempts: u8 },
     InvalidRetryDelay { milliseconds: u128 },
+    InvalidBandwidthLimit { kibibytes_per_second: u64 },
     HostTrustPermitMismatch,
     DeletionMethodRequired,
 }
@@ -388,6 +390,13 @@ impl fmt::Display for ProcessSpecError {
                 formatter,
                 "retry policy initial delay must be at most 3600000 milliseconds, got {milliseconds}"
             ),
+            Self::InvalidBandwidthLimit {
+                kibibytes_per_second,
+            } => write!(
+                formatter,
+                "bandwidth limit must be between 1 and {} KiB/s, got {kibibytes_per_second}",
+                SyncOptions::MAX_BANDWIDTH_LIMIT_KIB_PER_SECOND
+            ),
             Self::HostTrustPermitMismatch => {
                 formatter.write_str("SSH host-trust permit does not match the remote endpoint")
             }
@@ -408,6 +417,7 @@ pub struct ValidatedSyncOptions {
     metadata: MetadataRequirements,
     partial_transfer_policy: PartialTransferPolicy,
     retry_policy: RetryPolicy,
+    bandwidth_limit_kib_per_second: Option<u64>,
 }
 
 impl ValidatedSyncOptions {
@@ -436,6 +446,10 @@ impl ValidatedSyncOptions {
     pub const fn retry_policy(self) -> RetryPolicy {
         self.retry_policy
     }
+
+    pub const fn bandwidth_limit_kib_per_second(self) -> Option<u64> {
+        self.bandwidth_limit_kib_per_second
+    }
 }
 
 impl SyncOptions {
@@ -457,6 +471,14 @@ impl SyncOptions {
             });
         }
 
+        if let Some(limit) = self.bandwidth_limit_kib_per_second
+            && !(1..=SyncOptions::MAX_BANDWIDTH_LIMIT_KIB_PER_SECOND).contains(&limit)
+        {
+            return Err(ProcessSpecError::InvalidBandwidthLimit {
+                kibibytes_per_second: limit,
+            });
+        }
+
         Ok(ValidatedSyncOptions {
             safe_delete: self.safe_delete,
             destination_cleanup: self.destination_cleanup,
@@ -464,6 +486,7 @@ impl SyncOptions {
             metadata: self.metadata,
             partial_transfer_policy: self.partial_transfer_policy,
             retry_policy: self.retry_policy,
+            bandwidth_limit_kib_per_second: self.bandwidth_limit_kib_per_second,
         })
     }
 }
@@ -534,6 +557,10 @@ impl ProcessSpecification {
             ProcessArgument::Flag(RsyncFlag::Archive),
             ProcessArgument::Flag(RsyncFlag::ItemizeChanges),
         ];
+
+        if let Some(limit) = options.bandwidth_limit_kib_per_second() {
+            arguments.push(ProcessArgument::BandwidthLimit(limit));
+        }
 
         // Rsync otherwise lets its remote-shell layer reinterpret apostrophes,
         // control characters, and shell metacharacters in remote paths.
@@ -611,6 +638,7 @@ impl ProcessSpecification {
         self.arguments.iter().filter_map(|argument| match argument {
             ProcessArgument::ExclusionPattern(pattern) => Some(pattern.as_str()),
             ProcessArgument::Flag(_)
+            | ProcessArgument::BandwidthLimit(_)
             | ProcessArgument::PeerPath(_)
             | ProcessArgument::RemotePeerPath(_)
             | ProcessArgument::SshTransport(_) => None,
@@ -668,6 +696,9 @@ impl ProcessSpecification {
                     ProcessArgument::Flag(RsyncFlag::Archive).to_os_string(),
                     ProcessArgument::Flag(RsyncFlag::ItemizeChanges).to_os_string(),
                 ];
+                if let Some(limit) = self.options.bandwidth_limit_kib_per_second() {
+                    arguments.push(ProcessArgument::BandwidthLimit(limit).to_os_string());
+                }
                 arguments.extend(
                     specialist_rsync_flags(self.options.metadata())
                         .map(|flag| ProcessArgument::Flag(flag).to_os_string()),
@@ -732,6 +763,9 @@ impl ProcessSpecification {
             ProcessArgument::Flag(RsyncFlag::Archive).to_os_string(),
             ProcessArgument::Flag(RsyncFlag::ItemizeChanges).to_os_string(),
         ];
+        if let Some(limit) = self.options.bandwidth_limit_kib_per_second() {
+            arguments.push(ProcessArgument::BandwidthLimit(limit).to_os_string());
+        }
         // Per-item SSH transfers use the same argument-protection contract as
         // whole-tree SSH invocations.
         arguments.push(ProcessArgument::Flag(RsyncFlag::ProtectArgs).to_os_string());
@@ -878,6 +912,7 @@ impl ProcessArgument {
     fn to_os_string(&self) -> OsString {
         match self {
             Self::Flag(flag) => OsString::from(flag.as_str()),
+            Self::BandwidthLimit(limit) => OsString::from(format!("--bwlimit={limit}")),
             Self::ExclusionPattern(pattern) => {
                 let mut argument = OsString::from("--exclude=");
                 argument.push(pattern);

@@ -53,6 +53,7 @@ fn profile(source: &TestDirectory, destination: &TestDirectory) -> SyncProfile {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     })
 }
 
@@ -201,6 +202,7 @@ fn permanent_removal_removes_only_after_verified_transfer() {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     });
     let analysis = FreshAnalysis::analyze(&profile).expect("profile should be analyzable");
     let action = analysis
@@ -274,6 +276,7 @@ fn enabled_timestamp_metadata_is_applied_before_verified_removal() {
         metadata,
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     });
     let analysis = FreshAnalysis::analyze(&profile).expect("profile should be analyzable");
     let action = analysis

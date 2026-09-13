@@ -511,6 +511,9 @@ pub struct SyncOptions {
     pub metadata: MetadataRequirements,
     pub partial_transfer_policy: PartialTransferPolicy,
     pub retry_policy: RetryPolicy,
+    /// Optional rsync bandwidth cap in KiB/s. `None` leaves the transport
+    /// uncapped; zero is rejected rather than being treated ambiguously.
+    pub bandwidth_limit_kib_per_second: Option<u64>,
 }
 
 impl Default for SyncOptions {
@@ -522,11 +525,14 @@ impl Default for SyncOptions {
             metadata: MetadataRequirements::default(),
             partial_transfer_policy: PartialTransferPolicy::Cleanup,
             retry_policy: RetryPolicy::default(),
+            bandwidth_limit_kib_per_second: None,
         }
     }
 }
 
 impl SyncOptions {
+    pub const MAX_BANDWIDTH_LIMIT_KIB_PER_SECOND: u64 = 4_000_000;
+
     pub const fn with_deletion_method(mut self, deletion_method: Option<DeletionMethod>) -> Self {
         self.deletion_method = deletion_method;
         self

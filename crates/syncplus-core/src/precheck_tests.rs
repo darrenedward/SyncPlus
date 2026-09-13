@@ -470,6 +470,7 @@ fn path_warning_is_advisory_and_only_safe_delete_receives_it() {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     });
     let result = RunPrecheck::check(&safe_delete, &probe).expect("safe delete should precheck");
     assert_eq!(result.warnings().len(), 1);

@@ -81,6 +81,7 @@ fn persisted_snapshot_remains_unchanged_when_the_profile_is_edited() {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     });
     assert_ne!(edited, *original.profile());
 
@@ -119,6 +120,7 @@ fn active_sync_run_owns_validated_options_and_authorizations_from_start() {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     });
     let run = SyncRun::new_with_authorizations(
         RunId::new(5),
@@ -185,6 +187,7 @@ fn retry_and_partial_policies_are_frozen_in_the_run_snapshot() {
     let options = SyncOptions {
         partial_transfer_policy: PartialTransferPolicy::KeepPartialForResume,
         retry_policy: RetryPolicy::new(5, Duration::from_millis(250)),
+        bandwidth_limit_kib_per_second: Some(2048),
         ..SyncOptions::default()
     };
     let original = SyncProfile::new(
@@ -211,6 +214,12 @@ fn retry_and_partial_policies_are_frozen_in_the_run_snapshot() {
         PartialTransferPolicy::KeepPartialForResume
     );
     assert_eq!(restored.validated_options().retry_policy(), options.retry_policy);
+    assert_eq!(
+        restored
+            .validated_options()
+            .bandwidth_limit_kib_per_second(),
+        Some(2048)
+    );
 }
 
 #[test]
@@ -774,6 +783,7 @@ fn safe_delete_actions_cannot_settle_through_generic_completed_event() {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     });
     let run_id = RunId::new(11);
     let snapshot = RunSnapshot::from_profile(
@@ -819,6 +829,7 @@ fn journal_replay_rejects_corrupt_generic_completion_for_safe_delete() {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     });
     let run_id = RunId::new(12);
     let snapshot = RunSnapshot::from_profile(
@@ -884,6 +895,7 @@ fn journal_replay_rejects_corrupt_recovery_completion_for_safe_delete() {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     });
     let run_id = RunId::new(13);
     let snapshot = RunSnapshot::from_profile(
