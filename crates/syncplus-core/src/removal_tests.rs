@@ -189,6 +189,71 @@ fn verified_source_is_moved_to_recovery_and_journaled_before_next_item() {
 }
 
 #[test]
+fn permanent_removal_removes_only_after_verified_transfer() {
+    let source = TestDirectory::new("permanent-source");
+    let destination = TestDirectory::new("permanent-destination");
+    fs::write(source.join("item.txt"), b"permanently removed after proof")
+        .expect("source should be writable");
+    let profile = profile(&source, &destination).with_options(SyncOptions {
+        safe_delete: true,
+        destination_cleanup: false,
+        deletion_method: Some(DeletionMethod::PermanentRemoval),
+        metadata: Default::default(),
+        partial_transfer_policy: Default::default(),
+        retry_policy: Default::default(),
+    });
+    let analysis = FreshAnalysis::analyze(&profile).expect("profile should be analyzable");
+    let action = analysis
+        .plan()
+        .actions()
+        .iter()
+        .find(|action| action.kind() == PlanActionKind::RemoveSourceAfterVerification)
+        .expect("safe-delete plan should contain a source removal action");
+    let source_path = source.join("item.txt");
+    let destination_path = destination.join("item.txt");
+    let replacement = crate::replacement::perform_verified_replacement(
+        &source_path,
+        &destination_path,
+        |temporary| {
+            fs::copy(&source_path, temporary)
+                .map(|_| ())
+                .map_err(|error| crate::ReplacementError::Io(error.to_string()))
+        },
+    )
+    .expect("destination should be independently verified");
+    let run_id = RunId::new(109);
+    let mut store = begin_store_for_profile(run_id, &profile);
+    record_started(&mut store, run_id, action, &replacement);
+
+    // Application Mode and fresh confirmation are enforced by RunWorkflow;
+    // this seam verifies the irreversible filesystem proof boundary itself.
+    let receipt = SafeDeleteExecutor::new(RecoveryMethod::permanent_removal())
+        .settle_one(run_id, analysis.plan(), action, &replacement, &mut store)
+        .expect("explicit Permanent Removal should settle after verification");
+
+    assert_eq!(receipt.deletion_method(), DeletionMethod::PermanentRemoval);
+    assert!(!source_path.exists(), "the explicitly selected source should be removed");
+    assert_eq!(
+        fs::read(destination_path).expect("installed destination"),
+        b"permanently removed after proof"
+    );
+    let report = store.load_report(run_id).expect("report should load");
+    assert!(matches!(
+        report.items()[0].outcome(),
+        crate::ActionOutcome::Completed
+    ));
+    let result = report.items()[0]
+        .journal()
+        .removal_result()
+        .expect("removal result should be persisted");
+    assert_eq!(result.deletion_method(), DeletionMethod::PermanentRemoval);
+    assert!(result.evidence().provenance().is_none());
+    assert!(result.evidence().recovery_target().is_none());
+    assert!(result.evidence().recovery_size().is_none());
+    assert!(result.evidence().recovery_sha256().is_none());
+}
+
+#[test]
 fn enabled_timestamp_metadata_is_applied_before_verified_removal() {
     let source = TestDirectory::new("timestamp-source");
     let destination = TestDirectory::new("timestamp-destination");
