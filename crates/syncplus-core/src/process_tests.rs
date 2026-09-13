@@ -430,7 +430,7 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
     assert!(safe_delete.safe_delete());
     assert_eq!(safe_delete.deletion_method(), Some(DeletionMethod::Trash));
 
-    let missing_method = SyncOptions {
+    let manual_safe_delete = SyncOptions {
         safe_delete: true,
         destination_cleanup: false,
         deletion_method: None,
@@ -439,11 +439,9 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
         retry_policy: Default::default(),
     }
     .validate()
-    .expect_err("Safe Delete without a recovery method is ambiguous");
-    assert!(matches!(
-        missing_method,
-        ProcessSpecError::InvalidOptionCombination { .. }
-    ));
+    .expect("manual Safe Delete can choose its method at confirmation time");
+    assert!(manual_safe_delete.safe_delete());
+    assert_eq!(manual_safe_delete.deletion_method(), None);
 
     let invalid = SyncOptions {
         safe_delete: false,
@@ -586,6 +584,36 @@ fn transfer_paths_are_bound_to_the_validated_plan_scope() {
         .expect("a plan action should resolve inside the profile roots");
 
     assert_eq!(resolved_source, source.join("approved.txt"));
+    assert_eq!(resolved_destination, destination.join("approved.txt"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn one_way_process_paths_use_the_existing_source_named_destination_child() {
+    let root = std::env::temp_dir().join(format!(
+        "syncplus-process-mapped-destination-{}",
+        std::process::id()
+    ));
+    let source = root.join("source");
+    let destination_parent = root.join("destination");
+    let destination = destination_parent.join("source");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&destination).unwrap();
+    fs::write(source.join("approved.txt"), b"approved").unwrap();
+
+    let profile = profile(source.clone(), destination_parent);
+    let analysis = FreshAnalysis::analyze(&profile).expect("analysis should use the mapped child");
+    let action = analysis
+        .plan()
+        .actions()
+        .first()
+        .expect("the source item should produce a copy action");
+    let (_, resolved_destination) = analysis
+        .specification()
+        .transfer_paths(action)
+        .expect("the mapped action should resolve inside the child");
+
     assert_eq!(resolved_destination, destination.join("approved.txt"));
     let _ = fs::remove_dir_all(root);
 }

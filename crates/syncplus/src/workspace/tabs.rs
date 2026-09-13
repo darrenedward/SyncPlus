@@ -7,22 +7,24 @@ pub enum WorkspaceTab {
     #[default]
     Folders,
     Options,
-    Plan,
+    Review,
+    Report,
 }
 
 impl WorkspaceTab {
-    pub const ALL: [Self; 3] = [Self::Folders, Self::Options, Self::Plan];
+    pub const ALL: [Self; 4] = [Self::Folders, Self::Options, Self::Review, Self::Report];
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Folders => "Folders",
+            Self::Folders => "Synchronise",
             Self::Options => "Options",
-            Self::Plan => "Plan",
+            Self::Review => "Review",
+            Self::Report => "Report",
         }
     }
 }
 
-pub fn draw_tab_bar(ui: &mut egui::Ui, selected: &mut WorkspaceTab, theme: BrandTheme) {
+pub fn draw_tab_bar(ui: &mut egui::Ui, selected: &mut WorkspaceTab, theme: BrandTheme) -> bool {
     let height = 38.0;
     let full_width = ui.available_width();
     let (bar_rect, _) =
@@ -34,6 +36,7 @@ pub fn draw_tab_bar(ui: &mut egui::Ui, selected: &mut WorkspaceTab, theme: Brand
     );
 
     let mut cursor = bar_rect.left();
+    let mut changed = false;
     for (index, tab) in WorkspaceTab::ALL.into_iter().enumerate() {
         let is_selected = *selected == tab;
         let color = if is_selected {
@@ -82,9 +85,11 @@ pub fn draw_tab_bar(ui: &mut egui::Ui, selected: &mut WorkspaceTab, theme: Brand
         );
         if response.clicked() {
             *selected = tab;
+            changed = true;
         }
         cursor += tab_width;
     }
+    changed
 }
 
 #[cfg(test)]
@@ -92,10 +97,10 @@ mod tests {
     use super::WorkspaceTab;
 
     #[test]
-    fn workspace_tabs_are_folders_options_and_plan() {
+    fn workspace_tabs_are_synchronise_options_review_and_report() {
         assert_eq!(
             WorkspaceTab::ALL.map(WorkspaceTab::label),
-            ["Folders", "Options", "Plan"]
+            ["Synchronise", "Options", "Review", "Report"]
         );
         assert_ne!(WorkspaceTab::Options.label(), "Advance");
         assert_ne!(WorkspaceTab::Options.label(), "Advanced");

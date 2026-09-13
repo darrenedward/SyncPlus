@@ -1975,12 +1975,12 @@ impl PrecheckProbe for LocalPrecheckProbe {
             for relative in destination_entries {
                 let path = destination.join(&relative);
                 let access = local_access(&path, true);
-                if !access.writable() {
+                if !access.removable() {
                     issues.push(PermissionIssue::with_reason(
                         &path,
-                        "destination items that may be replaced must be writable",
-                        "the existing destination item cannot be changed with the current user's effective access",
-                        "grant the current user write access to this destination item or remove the conflict explicitly",
+                        "destination items that may be replaced must be replaceable",
+                        "the containing destination directory cannot be changed with the current user's effective access",
+                        "grant the current user write and directory-traverse access to the containing destination directory or resolve the conflict explicitly",
                     ));
                 }
                 if options.destination_cleanup() && !access.removable() {

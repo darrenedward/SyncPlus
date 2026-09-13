@@ -566,6 +566,37 @@ fn local_availability_check_accepts_present_directories() {
 
 #[cfg(unix)]
 #[test]
+fn destination_symlink_target_does_not_need_to_be_writable() {
+    let root = TestTree::new();
+    let source = root.path().join("source");
+    let destination = root.path().join("destination");
+    fs::create_dir_all(&source).expect("create source");
+    fs::create_dir_all(&destination).expect("create destination");
+    let read_only_target = root.path().join("read-only-target");
+    fs::write(&read_only_target, b"target").expect("write target");
+    std::os::unix::fs::symlink(&read_only_target, source.join("python"))
+        .expect("create source symlink");
+    std::os::unix::fs::symlink(&read_only_target, destination.join("python"))
+        .expect("create destination symlink");
+    let mut permissions = fs::metadata(&read_only_target)
+        .expect("target metadata")
+        .permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o444);
+    fs::set_permissions(&read_only_target, permissions).expect("make target read-only");
+
+    let result = RunPrecheck::check(
+        &profile(source, destination),
+        &crate::LocalPrecheckProbe::default(),
+    )
+    .expect("symlink precheck should complete");
+
+    assert!(result.can_execute(), "a preserved symlink must not inherit target permissions: {result:?}");
+    assert!(result.blockers().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn local_precheck_rejects_real_path_aliases_before_access_or_naming_probes() {
     let root = TestTree::new();
     let source = root.path().join("source");

@@ -30,6 +30,10 @@ pub struct BrandTheme {
     pub on_warning: egui::Color32,
     pub warning_soft: egui::Color32,
     pub on_warning_soft: egui::Color32,
+    pub success: egui::Color32,
+    pub on_success: egui::Color32,
+    pub success_soft: egui::Color32,
+    pub on_success_soft: egui::Color32,
 }
 
 const fn rgb(red: u8, green: u8, blue: u8) -> egui::Color32 {
@@ -101,6 +105,10 @@ impl BrandTheme {
             on_warning: rgb(0xFF, 0xFF, 0xFF),
             warning_soft: rgb(0xFF, 0xF3, 0xD6),
             on_warning_soft: rgb(0x8A, 0x5A, 0x00),
+            success: rgb(0x1B, 0x6E, 0x3A),
+            on_success: rgb(0xFF, 0xFF, 0xFF),
+            success_soft: rgb(0xE7, 0xF4, 0xEA),
+            on_success_soft: rgb(0x18, 0x5C, 0x30),
         }
     }
 
@@ -120,7 +128,7 @@ impl BrandTheme {
         Self::desktop()
     }
 
-    pub const fn roles(self) -> [(&'static str, egui::Color32); 24] {
+    pub const fn roles(self) -> [(&'static str, egui::Color32); 28] {
         [
             ("canvas", self.canvas),
             ("on_canvas", self.on_canvas),
@@ -146,6 +154,10 @@ impl BrandTheme {
             ("on_warning", self.on_warning),
             ("warning_soft", self.warning_soft),
             ("on_warning_soft", self.on_warning_soft),
+            ("success", self.success),
+            ("on_success", self.on_success),
+            ("success_soft", self.success_soft),
+            ("on_success_soft", self.on_success_soft),
         ]
     }
 
@@ -258,6 +270,10 @@ mod tests {
             "warning",
             "on_warning",
             "warning_soft",
+            "success",
+            "on_success",
+            "success_soft",
+            "on_success_soft",
         ] {
             assert!(
                 roles.contains(&required),
@@ -300,12 +316,14 @@ mod tests {
             ("muted on surface", theme.muted, theme.surface),
             ("on-accent on copper", theme.on_copper, theme.copper),
             ("danger-on-soft", theme.on_danger_soft, theme.danger_soft),
+            ("success-on-soft", theme.on_success_soft, theme.success_soft),
             ("on-canvas on rail", theme.on_canvas, theme.canvas),
             (
                 "on-canvas-muted on rail",
                 theme.on_canvas_muted,
                 theme.canvas,
             ),
+            ("on-success on success", theme.on_success, theme.success),
         ] {
             assert!(
                 contrast_ratio(foreground, background) >= 4.5,

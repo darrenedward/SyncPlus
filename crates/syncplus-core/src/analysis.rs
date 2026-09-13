@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::{
-    ActionId, ContentProof, OneWaySource, ProcessSpecError, ProcessSpecification, SyncProfile,
+    ActionId, ContentProof, DeletionMethod, OneWaySource, ProcessSpecError, ProcessSpecification,
+    SyncProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -637,17 +638,18 @@ impl FreshAnalysis {
                 peer: peer.name().to_owned(),
             });
         }
-        let (source, destination) = if profile.mode() == crate::SyncMode::Mirror {
-            (profile.peer_a(), profile.peer_b())
+        let source = if profile.mode() == crate::SyncMode::Mirror {
+            profile.peer_a()
         } else {
-            selected_peers(profile)
+            selected_peers(profile).0
         };
+        let destination = analysis_destination_peer(profile);
         let exclusions: Vec<String> = specification
             .exclusions()
             .map(ToOwned::to_owned)
             .collect();
         let source_inventory = collect_inventory(source, &exclusions)?;
-        let destination_inventory = collect_inventory(destination, &exclusions)?;
+        let destination_inventory = collect_inventory(&destination, &exclusions)?;
         Self::from_inventories(profile, specification, source_inventory, destination_inventory)
     }
 
@@ -791,6 +793,33 @@ impl FreshAnalysis {
         self.confirm_refreshed(current_profile, &refreshed)
     }
 
+    /// Confirm the same reviewed plan for a manually selected Safe Delete
+    /// method. The recovery method is a run-time choice, so it may differ from
+    /// the saved profile suggestion, but every other profile field must still
+    /// match the reviewed snapshot and the plan is freshly rechecked.
+    pub fn confirm_with_deletion_method(
+        &self,
+        current_profile: &SyncProfile,
+        deletion_method: DeletionMethod,
+    ) -> Result<ConfirmedPlan, AnalysisError> {
+        let runtime_profile = current_profile.clone().with_options(
+            current_profile
+                .options()
+                .with_deletion_method(Some(deletion_method)),
+        );
+        let reviewed_profile = self.profile.clone().with_options(
+            self.profile
+                .options()
+                .with_deletion_method(Some(deletion_method)),
+        );
+        if reviewed_profile != runtime_profile {
+            return Err(AnalysisError::ProfileChanged);
+        }
+
+        let refreshed = Self::analyze(&runtime_profile)?;
+        self.confirm_refreshed_unchecked(&runtime_profile, &refreshed)
+    }
+
     pub(crate) fn confirm_refreshed(
         &self,
         current_profile: &SyncProfile,
@@ -800,6 +829,14 @@ impl FreshAnalysis {
             return Err(AnalysisError::ProfileChanged);
         }
 
+        self.confirm_refreshed_unchecked(current_profile, refreshed)
+    }
+
+    fn confirm_refreshed_unchecked(
+        &self,
+        current_profile: &SyncProfile,
+        refreshed: &FreshAnalysis,
+    ) -> Result<ConfirmedPlan, AnalysisError> {
         let mut changed_paths = self.revision.changed_paths(&refreshed.revision);
         if self.plan.actions != refreshed.plan.actions {
             changed_paths.extend(
@@ -869,6 +906,24 @@ fn selected_peers(profile: &SyncProfile) -> (&crate::Peer, &crate::Peer) {
     match profile.source() {
         OneWaySource::PeerA => (profile.peer_a(), profile.peer_b()),
         OneWaySource::PeerB => (profile.peer_b(), profile.peer_a()),
+    }
+}
+
+fn analysis_destination_peer(profile: &SyncProfile) -> crate::Peer {
+    if profile.mode() == crate::SyncMode::Mirror {
+        return profile.peer_b().clone();
+    }
+
+    let destination = selected_peers(profile).1;
+    let effective_root = profile.effective_destination_root();
+
+    // The desktop folder gate proves this child exists before Fresh Analysis.
+    // Keep direct core callers that have not run that gate compatible with the
+    // legacy peer-root fixtures while using the reviewed child in real runs.
+    if !destination.is_ssh() && effective_root.is_dir() {
+        crate::Peer::new(destination.name(), effective_root)
+    } else {
+        destination.clone()
     }
 }
 

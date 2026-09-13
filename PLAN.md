@@ -88,7 +88,7 @@ Run statuses:
 
 ### User confirmation
 
-Every data-changing run shows a fresh **Execution Confirmation** immediately before execution. It lists:
+Every data-changing run requires a fresh **Execution Confirmation** immediately before execution. In the desktop Review, the successful-dry-run `Synchronise` action is the explicit confirmation boundary; the review surface keeps the mapping, counts, inventory panes, grouped blockers, and short state messages visible rather than presenting a second confirmation form. Historical Run Reports are opened from the Sync workspace's Report tab, not shown as a permanent sidebar destination. It lists:
 
 - mode and exact source/destination mapping;
 - counts and sizes for copies, overwrites, removals, preserved copies, conflicts, exclusions, and unresolved items;

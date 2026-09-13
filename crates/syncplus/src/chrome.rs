@@ -6,7 +6,6 @@ pub enum ChromeSurface {
     Overview,
     Profiles,
     SyncWorkspace,
-    Reports,
     Settings,
     Help,
 }
@@ -39,7 +38,6 @@ pub const NEXT_ACTION_RECOVERY_REVIEW: &str = "Open Recovery Review";
 pub const PRIMARY_SYNCHRONISE: &str = "Synchronise";
 pub const PRIMARY_OPEN_RECOVERY: &str = "Open Recovery Review";
 pub const RECOVERY_REVIEW_NOTICE: &str = "Recovery Review required";
-pub const REPORTS_REVIEW_BADGE: &str = "Review";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverviewAction {
@@ -112,13 +110,6 @@ where
     statuses.into_iter().any(status_requires_recovery_review)
 }
 
-pub fn report_review_is_pending<I>(statuses: I) -> bool
-where
-    I: IntoIterator<Item = RunReportStatus>,
-{
-    statuses.into_iter().any(status_requires_report_review)
-}
-
 pub fn status_requires_recovery_review(status: RunReportStatus) -> bool {
     matches!(
         status,
@@ -126,17 +117,11 @@ pub fn status_requires_recovery_review(status: RunReportStatus) -> bool {
     )
 }
 
-pub fn status_requires_report_review(status: RunReportStatus) -> bool {
-    status_requires_recovery_review(status)
-        || status == RunReportStatus::CompletedWithReviewRequired
-}
-
 pub fn sidebar_items(current: ChromeSurface) -> Vec<SidebarItem> {
-    const DESTINATIONS: [(ChromeSurface, &'static str); 6] = [
+    const DESTINATIONS: [(ChromeSurface, &'static str); 5] = [
         (ChromeSurface::Overview, "Overview"),
         (ChromeSurface::Profiles, "Profiles"),
         (ChromeSurface::SyncWorkspace, "Sync workspace"),
-        (ChromeSurface::Reports, "Run Reports"),
         (ChromeSurface::Settings, "Settings"),
         (ChromeSurface::Help, "Help & Support"),
     ];
@@ -160,10 +145,6 @@ pub fn sidebar_items(current: ChromeSurface) -> Vec<SidebarItem> {
 
 pub fn recovery_review_notice(pending: bool) -> Option<&'static str> {
     pending.then_some(RECOVERY_REVIEW_NOTICE)
-}
-
-pub fn reports_badge(pending: bool) -> Option<&'static str> {
-    pending.then_some(REPORTS_REVIEW_BADGE)
 }
 
 pub fn empty_overview() -> OverviewModel {
@@ -232,7 +213,7 @@ pub fn run_report_status_phrase(status: RunReportStatus) -> &'static str {
         RunReportStatus::Blocked => "Blocked",
         RunReportStatus::CompletedWithReviewRequired => "Pending review",
         RunReportStatus::RecoveryReview => "Recovery Review required",
-        RunReportStatus::ReviewCleared => "Review cleared",
+        RunReportStatus::ReviewCleared => "Review acknowledged",
     }
 }
 
@@ -260,7 +241,6 @@ mod tests {
                 "Overview",
                 "Profiles",
                 "Sync workspace",
-                "Run Reports",
                 "Settings",
                 "Help & Support",
             ]
@@ -291,12 +271,10 @@ mod tests {
 
     #[test]
     fn recovery_review_surfaces_as_notice_not_permanent_nav() {
-        let items = sidebar_items(ChromeSurface::Reports);
+        let items = sidebar_items(ChromeSurface::SyncWorkspace);
         assert!(items.iter().all(|item| item.label != "Recovery Review"));
         assert_eq!(recovery_review_notice(false), None);
         assert_eq!(recovery_review_notice(true), Some(RECOVERY_REVIEW_NOTICE));
-        assert_eq!(reports_badge(false), None);
-        assert_eq!(reports_badge(true), Some(REPORTS_REVIEW_BADGE));
         assert!(recovery_review_is_pending([
             RunReportStatus::Completed,
             RunReportStatus::RecoveryReview
@@ -311,12 +289,6 @@ mod tests {
         assert!(!status_requires_recovery_review(
             RunReportStatus::CompletedWithReviewRequired
         ));
-        assert!(status_requires_report_review(
-            RunReportStatus::CompletedWithReviewRequired
-        ));
-        assert!(report_review_is_pending([
-            RunReportStatus::CompletedWithReviewRequired
-        ]));
     }
 
     #[test]
