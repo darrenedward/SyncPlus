@@ -185,6 +185,11 @@ impl SafeDeleteExecutor {
         &self.recovery_method
     }
 
+    /// Settle one already-planned source removal at the irreversible proof
+    /// boundary. `RunWorkflow` owns Application Mode and fresh manual
+    /// confirmation; this executor consumes the frozen method and enforces
+    /// the filesystem proof, while also defending scheduled runs with the
+    /// persisted unattended authorization.
     pub fn settle_one(
         &self,
         run_id: RunId,
@@ -226,6 +231,17 @@ impl SafeDeleteExecutor {
         if selected_method != self.recovery_method.deletion_method() {
             return Err(SafeDeleteError::InvalidAction(
                 "the executor method does not match the frozen profile selection".to_owned(),
+            ));
+        }
+        if selected_method == DeletionMethod::PermanentRemoval
+            && store.is_scheduled_run(run_id)?
+            && !store
+                .load_snapshot(run_id)?
+                .authorizations()
+                .allow_unattended_permanent_removal()
+        {
+            return Err(SafeDeleteError::InvalidAction(
+                "scheduled Permanent Removal requires separate explicit authorization".to_owned(),
             ));
         }
         ensure_prior_source_removals_settled(run_id, plan, action.action_id(), store)?;
@@ -403,15 +419,6 @@ impl SafeDeleteExecutor {
             .map_err(|error| SafeDeleteError::RecoveryUnavailable(error.to_string()))?;
             (Some(recovery_target), Some(provenance))
         } else {
-            self.fail_unresolved(
-                run_id,
-                action.action_id(),
-                store,
-                SafeDeleteError::RecoveryUnavailable(
-                    "Permanent Removal requires the parent recovery and authorization slice"
-                        .to_owned(),
-                ),
-            )?;
             (None, None)
         };
 
@@ -466,9 +473,7 @@ impl SafeDeleteExecutor {
             action.relative_path(),
             proof,
             metadata_requirements,
-            provenance
-                .as_ref()
-                .ok_or_else(|| SafeDeleteError::RecoveryUnavailable("recovery provenance is unavailable".to_owned()))?,
+            provenance.as_ref(),
         ) {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -528,10 +533,15 @@ impl SafeDeleteExecutor {
         relative_path: &Path,
         proof: &crate::VerifiedTransferProof,
         metadata_requirements: crate::MetadataRequirements,
-        provenance: &crate::RecoveryProvenance,
+        provenance: Option<&crate::RecoveryProvenance>,
     ) -> Result<RemovalAttempt, SafeDeleteError> {
         match self.recovery_method.recovery_root() {
             Some(recovery_root) => {
+                let provenance = provenance.ok_or_else(|| {
+                    SafeDeleteError::RecoveryUnavailable(
+                        "recovery provenance is unavailable".to_owned(),
+                    )
+                })?;
                 let (recovery_root, recovery_target, same_filesystem) =
                     validate_recovery_root(source_root, source, &recovery_root)?;
                 if matches!(self.recovery_method, RecoveryMethod::VerifiedRecoveryFolder { .. }) {
@@ -571,9 +581,44 @@ impl SafeDeleteExecutor {
                 }
                 result
             }
-            None => Err(SafeDeleteError::RecoveryUnavailable(
-                "Permanent Removal is not available in this core slice".to_owned(),
-            )),
+            None => self.perform_permanent_removal(source_root, relative_path, proof),
+        }
+    }
+
+    fn perform_permanent_removal(
+        &self,
+        source_root: &Path,
+        relative_path: &Path,
+        proof: &crate::VerifiedTransferProof,
+    ) -> Result<RemovalAttempt, SafeDeleteError> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut source_guard = create_source_guard_for_path(source_root, relative_path, proof)?;
+            match remove_source_exact(source_root, relative_path, proof, &source_guard) {
+                Ok(()) => {
+                    source_guard.retain();
+                    Ok(RemovalAttempt {
+                        result: RemovalResult::new(
+                            DeletionMethod::PermanentRemoval,
+                            removal_evidence(None, false, proof, None),
+                        ),
+                        source_guard,
+                    })
+                }
+                Err(error) => {
+                    if matches!(error, SafeDeleteError::RecoveryUncertain(_)) {
+                        source_guard.retain();
+                    }
+                    Err(error)
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (source_root, relative_path, proof);
+            Err(SafeDeleteError::RecoveryUnavailable(
+                "descriptor-relative permanent removal is supported only on Linux".to_owned(),
+            ))
         }
     }
 
@@ -688,7 +733,12 @@ impl SafeDeleteExecutor {
             Ok(RemovalAttempt {
                 result: RemovalResult::new(
                     DeletionMethod::Trash,
-                    removal_evidence(Some(recovery_target), true, proof, provenance.clone()),
+                    removal_evidence(
+                        Some(recovery_target),
+                        true,
+                        proof,
+                        Some(provenance.clone()),
+                    ),
                 ),
                 source_guard,
             })
@@ -788,7 +838,12 @@ impl SafeDeleteExecutor {
                     Ok(RemovalAttempt {
                         result: RemovalResult::new(
                             DeletionMethod::Trash,
-                            removal_evidence(Some(recovery_target), true, proof, provenance.clone()),
+                            removal_evidence(
+                                Some(recovery_target),
+                                true,
+                                proof,
+                                Some(provenance.clone()),
+                            ),
                         ),
                         source_guard,
                     })
@@ -1806,7 +1861,7 @@ fn removal_evidence(
     recovery_target: Option<&Path>,
     recovery_present: bool,
     proof: &crate::VerifiedTransferProof,
-    provenance: crate::RecoveryProvenance,
+    provenance: Option<crate::RecoveryProvenance>,
 ) -> RecoveryEvidence {
     let content = proof.installed_destination_proof();
     let evidence = RecoveryEvidence::new(
@@ -1821,11 +1876,18 @@ fn removal_evidence(
             .or_else(|| Some(proof.source_after().metadata().size())),
         None,
         content.map(|content| *content.sha256()),
-    )
-    .with_provenance(provenance);
-    match proof.source_after().content_proof() {
-        Some(content) => evidence.with_recovery_proof(content.size(), Some(*content.sha256())),
+    );
+    let evidence = match provenance {
+        Some(provenance) => evidence.with_provenance(provenance),
         None => evidence,
+    };
+    if recovery_present {
+        match proof.source_after().content_proof() {
+            Some(content) => evidence.with_recovery_proof(content.size(), Some(*content.sha256())),
+            None => evidence,
+        }
+    } else {
+        evidence
     }
 }
 

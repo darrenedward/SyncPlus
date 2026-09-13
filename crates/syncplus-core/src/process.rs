@@ -17,6 +17,8 @@ pub enum RsyncFlag {
     Compress,
     DestinationCleanup,
     EndOfOptions,
+    Owner,
+    Group,
     Acls,
     Xattrs,
 }
@@ -30,6 +32,8 @@ impl RsyncFlag {
             Self::Compress => "--compress",
             Self::DestinationCleanup => "--delete",
             Self::EndOfOptions => "--",
+            Self::Owner => "--owner",
+            Self::Group => "--group",
             Self::Acls => "--acls",
             Self::Xattrs => "--xattrs",
         }
@@ -46,6 +50,10 @@ impl TryFrom<&str> for RsyncFlag {
             "--protect-args" => Ok(Self::ProtectArgs),
             "--compress" => Ok(Self::Compress),
             "--" => Ok(Self::EndOfOptions),
+            "--owner" => Ok(Self::Owner),
+            "--group" => Ok(Self::Group),
+            "--acls" => Ok(Self::Acls),
+            "--xattrs" => Ok(Self::Xattrs),
             "--delete" | "--delete-after" | "--delete-before" | "--delete-during" => {
                 Err(ProcessSpecError::ArbitraryArgument {
                     value: value.to_owned(),
@@ -56,6 +64,20 @@ impl TryFrom<&str> for RsyncFlag {
             }),
         }
     }
+}
+
+fn specialist_rsync_flags(
+    metadata: MetadataRequirements,
+) -> impl Iterator<Item = RsyncFlag> {
+    let specialist = metadata.specialist_metadata();
+    [
+        (specialist.ownership(), RsyncFlag::Owner),
+        (specialist.ownership(), RsyncFlag::Group),
+        (specialist.access_control_lists(), RsyncFlag::Acls),
+        (specialist.extended_attributes(), RsyncFlag::Xattrs),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, flag)| enabled.then_some(flag))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,12 +541,9 @@ impl ProcessSpecification {
             arguments.push(ProcessArgument::Flag(RsyncFlag::ProtectArgs));
         }
 
-        if options.specialist_metadata().access_control_lists() {
-            arguments.push(ProcessArgument::Flag(RsyncFlag::Acls));
-        }
-        if options.specialist_metadata().extended_attributes() {
-            arguments.push(ProcessArgument::Flag(RsyncFlag::Xattrs));
-        }
+        arguments.extend(
+            specialist_rsync_flags(options.metadata()).map(ProcessArgument::Flag),
+        );
 
         if options.destination_cleanup() {
             arguments.push(ProcessArgument::Flag(RsyncFlag::DestinationCleanup));
@@ -649,12 +668,10 @@ impl ProcessSpecification {
                     ProcessArgument::Flag(RsyncFlag::Archive).to_os_string(),
                     ProcessArgument::Flag(RsyncFlag::ItemizeChanges).to_os_string(),
                 ];
-                if self.options.specialist_metadata().access_control_lists() {
-                    arguments.push(ProcessArgument::Flag(RsyncFlag::Acls).to_os_string());
-                }
-                if self.options.specialist_metadata().extended_attributes() {
-                    arguments.push(ProcessArgument::Flag(RsyncFlag::Xattrs).to_os_string());
-                }
+                arguments.extend(
+                    specialist_rsync_flags(self.options.metadata())
+                        .map(|flag| ProcessArgument::Flag(flag).to_os_string()),
+                );
                 arguments.extend([
                     ProcessArgument::Flag(RsyncFlag::EndOfOptions).to_os_string(),
                     ProcessArgument::PeerPath(source.to_path_buf()).to_os_string(),
@@ -718,12 +735,10 @@ impl ProcessSpecification {
         // Per-item SSH transfers use the same argument-protection contract as
         // whole-tree SSH invocations.
         arguments.push(ProcessArgument::Flag(RsyncFlag::ProtectArgs).to_os_string());
-        if self.options.specialist_metadata().access_control_lists() {
-            arguments.push(ProcessArgument::Flag(RsyncFlag::Acls).to_os_string());
-        }
-        if self.options.specialist_metadata().extended_attributes() {
-            arguments.push(ProcessArgument::Flag(RsyncFlag::Xattrs).to_os_string());
-        }
+        arguments.extend(
+            specialist_rsync_flags(self.options.metadata())
+                .map(|flag| ProcessArgument::Flag(flag).to_os_string()),
+        );
         if let Some(transport) = &self.ssh_transport {
             arguments.push(ProcessArgument::SshTransport(transport.clone()).to_os_string());
         }

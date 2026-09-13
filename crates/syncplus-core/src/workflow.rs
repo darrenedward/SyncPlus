@@ -3637,6 +3637,70 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_recoverable_deletion_requires_explicit_unattended_authorization() {
+        let fixture = Fixture::new();
+        let profile = fixture.profile().with_options(SyncOptions {
+            safe_delete: true,
+            destination_cleanup: false,
+            deletion_method: Some(DeletionMethod::Trash),
+            metadata: Default::default(),
+            partial_transfer_policy: Default::default(),
+            retry_policy: Default::default(),
+        });
+
+        let error = super::validate_unattended_authorizations(
+            &profile,
+            AuthorizationSnapshot::default(),
+        )
+        .expect_err("scheduled Safe Delete must require explicit authorization");
+
+        assert!(error
+            .to_string()
+            .contains("scheduled destructive actions require explicit unattended authorization"));
+        assert!(super::validate_unattended_authorizations(
+            &profile,
+            AuthorizationSnapshot::new(true, false),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn manual_permanent_removal_uses_confirmation_without_unattended_authorization() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.source()).expect("source");
+        fs::create_dir_all(fixture.destination()).expect("destination");
+        write_file(&fixture.source().join("confirmed.txt"), b"manual permanent proof");
+        let profile = fixture.profile().with_options(SyncOptions {
+            safe_delete: true,
+            destination_cleanup: false,
+            deletion_method: Some(DeletionMethod::PermanentRemoval),
+            metadata: Default::default(),
+            partial_transfer_policy: Default::default(),
+            retry_policy: Default::default(),
+        });
+        let mut store = RunEvidenceStore::open_in_memory().expect("evidence store");
+
+        let report = RunWorkflow::new(RecoveryMethod::permanent_removal())
+            .execute_with_authorizations(
+                RunId::new(8101),
+                &profile,
+                &LocalPrecheckProbe::default(),
+                AuthorizationSnapshot::default(),
+                |_| true,
+                &mut store,
+                || false,
+            )
+            .expect("manual confirmation should authorize the run");
+
+        assert_eq!(report.status(), RunReportStatus::Completed);
+        assert!(!fixture.source().join("confirmed.txt").exists());
+        assert_eq!(
+            fs::read(fixture.destination().join("confirmed.txt")).expect("destination item"),
+            b"manual permanent proof"
+        );
+    }
+
+    #[test]
     fn unattended_ssh_blocks_a_changed_host_before_remote_inventory_or_mutation() {
         let fixture = Fixture::new();
         fs::create_dir_all(fixture.source()).expect("source");

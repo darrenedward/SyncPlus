@@ -216,6 +216,9 @@ impl SshMetadataProof {
     }
 
     fn matches_item(&self, item: &InventoryItem, requirements: MetadataRequirements) -> bool {
+        if requirements.specialist_metadata().any() {
+            return false;
+        }
         (!requirements.file_type() || self.item_type == item.item_type())
             && (!requirements.executable_permissions()
                 || self.metadata.executable_permissions() == item.metadata().executable_permissions())
@@ -226,6 +229,9 @@ impl SshMetadataProof {
     }
 
     fn matches_other(&self, other: &Self, requirements: MetadataRequirements) -> bool {
+        if requirements.specialist_metadata().any() {
+            return false;
+        }
         (!requirements.file_type() || self.item_type == other.item_type)
             && (!requirements.executable_permissions()
                 || self.metadata.executable_permissions() == other.metadata.executable_permissions())

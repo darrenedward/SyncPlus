@@ -49,13 +49,15 @@ fn specialist_metadata_is_named_and_disabled_by_default() {
     assert!(!defaults.any());
 
     let specialist = MetadataRequirements::default().with_specialist_metadata(
-        SpecialistMetadataRequirements::new(false, true, true),
+        SpecialistMetadataRequirements::new(true, true, true),
     );
     let specification = ProcessSpecification::from_profile(
         &profile(PathBuf::from("/source"), PathBuf::from("/destination"))
             .with_options(SyncOptions { metadata: specialist, ..SyncOptions::default() }),
     )
     .expect("named specialist options should validate");
+    assert!(specification.arguments().contains(&ProcessArgument::Flag(RsyncFlag::Owner)));
+    assert!(specification.arguments().contains(&ProcessArgument::Flag(RsyncFlag::Group)));
     assert!(specification.arguments().contains(&ProcessArgument::Flag(RsyncFlag::Acls)));
     assert!(specification.arguments().contains(&ProcessArgument::Flag(RsyncFlag::Xattrs)));
 }

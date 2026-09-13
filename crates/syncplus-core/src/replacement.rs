@@ -69,7 +69,9 @@ impl std::fmt::Display for ReplacementError {
             }
             Self::Verification(error) => error.fmt(formatter),
             Self::MetadataMismatch => {
-                formatter.write_str("transferred file type or executable permissions did not match")
+                formatter.write_str(
+                    "transferred file type or selected metadata did not match",
+                )
             }
             Self::Cancelled => formatter.write_str("replacement was cancelled"),
             Self::RecoveryUncertain(reason) => {
@@ -788,6 +790,36 @@ mod tests {
         })
         .expect_err("cancellation must preserve both versions");
         assert_eq!(error, ReplacementError::Cancelled);
+        assert_eq!(fs::read(&source).unwrap(), b"source bytes");
+        assert_eq!(fs::read(&destination).unwrap(), b"old bytes");
+    }
+
+    #[test]
+    fn unsupported_specialist_metadata_never_counts_as_verified_transfer() {
+        let fixture = Fixture::new();
+        let source = fixture.path.join("source.txt");
+        let destination = fixture.path.join("destination.txt");
+        fs::write(&source, b"source bytes").unwrap();
+        fs::write(&destination, b"old bytes").unwrap();
+        let metadata = MetadataRequirements::default().with_specialist_metadata(
+            crate::SpecialistMetadataRequirements::new(true, true, true),
+        );
+
+        let error = perform_verified_replacement_with_cancel_and_metadata_and_partial(
+            &source,
+            &destination,
+            metadata,
+            PartialTransferPolicy::Cleanup,
+            || false,
+            |temporary| {
+                fs::copy(&source, temporary).map(|_| ()).map_err(|error| {
+                    ReplacementError::Transfer(error.to_string())
+                })
+            },
+        )
+        .expect_err("specialist metadata without proof must fail closed");
+
+        assert_eq!(error, ReplacementError::MetadataMismatch);
         assert_eq!(fs::read(&source).unwrap(), b"source bytes");
         assert_eq!(fs::read(&destination).unwrap(), b"old bytes");
     }

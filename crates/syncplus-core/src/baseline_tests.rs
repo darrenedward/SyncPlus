@@ -7,6 +7,7 @@ use std::{
 use super::{
     ActionReason, AnalysisOutcome, CompletionReconciliation, InventorySnapshotItem, ItemType,
     MetadataRequirements, MirrorEquality, ReconciliationReason, SourceInventorySnapshot,
+    SpecialistMetadataRequirements,
     RunEvidenceStore, SyncBaseline, SyncBaselineItemStatus,
 };
 
@@ -36,6 +37,17 @@ fn mirror_equality_uses_only_enabled_metadata() {
     assert!(MirrorEquality::new(MetadataRequirements::default()).equal(&left, &right));
     assert!(!MirrorEquality::new(MetadataRequirements::new(true, true, true, true))
         .equal(&left, &right));
+}
+
+#[test]
+fn specialist_metadata_requirements_fail_closed_until_inventory_can_verify_them() {
+    let left = file("same.txt", 1, 10);
+    let right = file("same.txt", 1, 10);
+    let requirements = MetadataRequirements::default().with_specialist_metadata(
+        SpecialistMetadataRequirements::new(true, false, false),
+    );
+
+    assert!(!MirrorEquality::new(requirements).equal(&left, &right));
 }
 
 #[test]
