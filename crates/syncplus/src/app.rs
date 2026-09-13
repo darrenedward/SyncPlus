@@ -15,8 +15,9 @@ use eframe::egui;
 use notify_rust::Notification;
 
 use syncplus_core::{
-    ActionOutcome, AnalysisOutcome, ApplicationMode, ApplicationSettings, AuthorizationSnapshot,
-    BackgroundScheduler, ConfirmedPlan, ConflictDecision, ConflictEntry, ConflictEntryKey,
+    ActionOutcome, AnalysisConfiguration, AnalysisOutcome, ApplicationMode, ApplicationSettings,
+    AuthorizationSnapshot, BackgroundScheduler, ConfirmedPlan, ConflictDecision, ConflictEntry,
+    ConflictEntryKey,
     ConflictResolution, ConflictReview, DeletionMethod, FreshAnalysis, LocalPrecheckProbe,
     MetadataRequirements, MissedScheduleDecision, MissedScheduleNotice, OneWaySource,
     PartialTransferPolicy, Peer, PeerEndpoint, PersistedSyncProfile, PlanActionKind,
@@ -346,14 +347,29 @@ struct ManualRunCompletion {
 }
 
 struct ProfileAnalysisResult {
-    profile: SyncProfile,
+    configuration: AnalysisConfiguration,
     precheck: Result<PrecheckResult, String>,
     analysis: Option<Result<FreshAnalysis, String>>,
 }
 
+fn analysis_result_matches_current_configuration(
+    result: &ProfileAnalysisResult,
+    current_profile: &SyncProfile,
+    application_mode: ApplicationMode,
+    authorizations: AuthorizationSnapshot,
+    schedule_enabled: bool,
+) -> bool {
+    result.configuration.matches(
+        current_profile,
+        application_mode,
+        authorizations,
+        schedule_enabled,
+    )
+}
+
 enum AnalysisWorkerEvent {
     Phase(AnalysisPhase),
-    Done(ProfileAnalysisResult),
+    Done(Box<ProfileAnalysisResult>),
 }
 
 struct ActiveAnalysis {
@@ -939,6 +955,9 @@ struct PlanReviewState {
     profile: SyncProfile,
     precheck: Option<PrecheckResult>,
     analysis: Option<FreshAnalysis>,
+    application_mode: ApplicationMode,
+    authorizations: AuthorizationSnapshot,
+    schedule_enabled: bool,
     conflicts: Option<ConflictReviewState>,
     error: Option<String>,
     stronger_confirmation_path: String,
@@ -947,6 +966,15 @@ struct PlanReviewState {
 }
 
 impl PlanReviewState {
+    fn analysis_configuration(&self) -> AnalysisConfiguration {
+        AnalysisConfiguration::new(
+            self.profile.clone(),
+            self.application_mode,
+            self.authorizations,
+            self.schedule_enabled,
+        )
+    }
+
     fn is_blocked(&self) -> bool {
         self.error.is_some()
             || self
@@ -1945,6 +1973,10 @@ impl SyncPlusApp {
                 "Synchronise is unavailable until the folders are connected and Execution Confirmation is recorded.".to_owned(),
             ));
         }
+        let current_profile = self.validated_profile()?;
+        if !self.review_matches_current_configuration(&current_profile) {
+            return Err(self.invalidate_stale_review());
+        }
         if self.active_manual_run.is_some() {
             return Err(UiValidationError::Core(
                 "a manual Sync Run is already active".to_owned(),
@@ -2707,14 +2739,13 @@ impl SyncPlusApp {
         Ok(())
     }
 
-    fn analyze_profile_snapshot(profile: SyncProfile) -> ProfileAnalysisResult {
-        Self::analyze_profile_snapshot_with_progress(profile, |_| {}, AnalysisKind::DryRun)
-    }
-
     fn analyze_profile_snapshot_with_progress(
         profile: SyncProfile,
         mut on_phase: impl FnMut(AnalysisPhase),
         kind: AnalysisKind,
+        application_mode: ApplicationMode,
+        authorizations: AuthorizationSnapshot,
+        schedule_enabled: bool,
     ) -> ProfileAnalysisResult {
         on_phase(AnalysisPhase::CheckingFolders);
         let precheck = if kind == AnalysisKind::FolderCheck {
@@ -2737,7 +2768,12 @@ impl SyncPlusApp {
             _ => None,
         };
         ProfileAnalysisResult {
-            profile,
+            configuration: AnalysisConfiguration::new(
+                profile,
+                application_mode,
+                authorizations,
+                schedule_enabled,
+            ),
             precheck,
             analysis,
         }
@@ -2748,10 +2784,14 @@ impl SyncPlusApp {
         result: ProfileAnalysisResult,
     ) -> Result<(), UiValidationError> {
         let ProfileAnalysisResult {
-            profile,
+            configuration,
             precheck,
             analysis,
         } = result;
+        let profile = configuration.profile().clone();
+        let application_mode = configuration.application_mode();
+        let authorizations = configuration.authorizations();
+        let schedule_enabled = configuration.schedule_enabled();
         self.manual_deletion_method = None;
         let precheck = match precheck {
             Ok(precheck) => precheck,
@@ -2781,6 +2821,9 @@ impl SyncPlusApp {
                 profile,
                 precheck: Some(precheck),
                 analysis,
+                application_mode,
+                authorizations,
+                schedule_enabled,
                 conflicts,
                 error: None,
                 stronger_confirmation_path: String::new(),
@@ -2812,8 +2855,11 @@ impl SyncPlusApp {
         self.review = Some(PlanReviewState {
             profile,
             precheck: Some(precheck),
-            conflicts,
             analysis: Some(analysis),
+            application_mode,
+            authorizations,
+            schedule_enabled,
+            conflicts,
             error: None,
             stronger_confirmation_path: String::new(),
             confirmed: false,
@@ -2954,6 +3000,9 @@ impl SyncPlusApp {
         let profile = self.validated_profile()?;
         self.validate_advanced_only_options(&profile)?;
         let profile_name = profile.name().to_owned();
+        let application_mode = self.settings.mode();
+        let authorizations = self.form.profile_authorizations;
+        let schedule_enabled = self.form.schedule_enabled;
         let (source_peer, _destination_peer) = mapped_peers(&profile);
         let source = source_peer.root().display().to_string();
         let destination = profile.effective_destination_root().display().to_string();
@@ -2970,8 +3019,11 @@ impl SyncPlusApp {
                         repaint_context.request_repaint();
                     },
                     kind,
+                    application_mode,
+                    authorizations,
+                    schedule_enabled,
                 );
-                let _ = sender.send(AnalysisWorkerEvent::Done(result));
+                let _ = sender.send(AnalysisWorkerEvent::Done(Box::new(result)));
                 repaint_context.request_repaint();
             })
             .map_err(|error| {
@@ -3003,8 +3055,9 @@ impl SyncPlusApp {
 
     fn apply_folder_check_result(&mut self, result: ProfileAnalysisResult) {
         let ProfileAnalysisResult {
-            profile, precheck, ..
+            configuration, precheck, ..
         } = result;
+        let profile = configuration.profile().clone();
         match precheck {
             Ok(precheck) if precheck.can_execute() => {
                 self.reconnect_prompt = None;
@@ -3041,7 +3094,7 @@ impl SyncPlusApp {
         enum Poll {
             Idle,
             Disconnected,
-            Done(ProfileAnalysisResult, AnalysisKind),
+            Done(Box<ProfileAnalysisResult>, AnalysisKind),
         }
         let poll = {
             let Some(active) = self.active_analysis.as_mut() else {
@@ -3066,15 +3119,23 @@ impl SyncPlusApp {
             }
             Poll::Done(result, kind) => {
                 self.active_analysis = None;
-                if let Ok(current_profile) = self.form.build()
-                    && current_profile != result.profile
-                {
+                let current_profile = self.form.build();
+                let current_configuration_matches = current_profile.as_ref().is_ok_and(|profile| {
+                    analysis_result_matches_current_configuration(
+                        &result,
+                        profile,
+                        self.settings.mode(),
+                        self.form.profile_authorizations,
+                        self.form.schedule_enabled,
+                    )
+                });
+                if !current_configuration_matches {
                     self.folder_gate = FolderGate::Unknown;
-                    self.status = "Fresh Analysis finished for an older profile state; run it again to review the current fields.".to_owned();
+                    self.status = "Fresh Analysis finished for an older profile, mode, or authorization state; run it again to review the current configuration.".to_owned();
                     return;
                 }
                 match kind {
-                    AnalysisKind::FolderCheck => self.apply_folder_check_result(result),
+                    AnalysisKind::FolderCheck => self.apply_folder_check_result(*result),
                     AnalysisKind::DryRun => {
                         let blocked = result
                             .precheck
@@ -3088,7 +3149,7 @@ impl SyncPlusApp {
                         } else {
                             FolderGate::Blocked
                         };
-                        let _ = self.apply_analysis_result(result);
+                        let _ = self.apply_analysis_result(*result);
                     }
                 }
             }
@@ -3098,7 +3159,14 @@ impl SyncPlusApp {
     pub fn analyze_profile(&mut self) -> Result<(), UiValidationError> {
         let profile = self.validated_profile()?;
         self.validate_advanced_only_options(&profile)?;
-        let result = Self::analyze_profile_snapshot(profile);
+        let result = Self::analyze_profile_snapshot_with_progress(
+            profile,
+            |_| {},
+            AnalysisKind::DryRun,
+            self.settings.mode(),
+            self.form.profile_authorizations,
+            self.form.schedule_enabled,
+        );
         self.apply_analysis_result(result)
     }
 
@@ -3358,8 +3426,11 @@ impl SyncPlusApp {
             return Err(UiValidationError::ReviewNotReady);
         }
 
-        let current_profile =
-            self.profile_for_manual_confirmation(self.validated_profile()?)?;
+        let current_profile = self.validated_profile()?;
+        if !self.review_matches_current_configuration(&current_profile) {
+            return Err(self.invalidate_stale_review());
+        }
+        let current_profile = self.profile_for_manual_confirmation(current_profile)?;
         let precheck = match Self::fresh_local_precheck(&current_profile) {
             Ok(result) => result,
             Err(message) => {
@@ -3447,6 +3518,31 @@ impl SyncPlusApp {
         Ok(())
     }
 
+    fn review_matches_current_configuration(&self, current_profile: &SyncProfile) -> bool {
+        self.review.as_ref().is_some_and(|review| {
+            review.analysis_configuration().matches(
+                current_profile,
+                self.settings.mode(),
+                self.form.profile_authorizations,
+                self.form.schedule_enabled,
+            )
+        })
+    }
+
+    fn invalidate_stale_review(&mut self) -> UiValidationError {
+        if let Some(review) = self.review.as_mut() {
+            review.confirmed = false;
+            review.confirmed_plan = None;
+            review.error = Some(
+                "Fresh Analysis is stale because the profile, mode, authorization, or schedule state changed."
+                    .to_owned(),
+            );
+        }
+        self.folder_gate = FolderGate::Unknown;
+        self.status = "Execution Confirmation is unavailable until Fresh Analysis is run again for the current configuration.".to_owned();
+        UiValidationError::Analysis("Fresh Analysis is stale for the current configuration".to_owned())
+    }
+
     fn profile_for_manual_confirmation(
         &self,
         profile: SyncProfile,
@@ -3486,6 +3582,9 @@ impl SyncPlusApp {
             profile,
             precheck,
             analysis: None,
+            application_mode: self.settings.mode(),
+            authorizations: self.form.profile_authorizations,
+            schedule_enabled: self.form.schedule_enabled,
             conflicts: None,
             error: Some(message),
             stronger_confirmation_path: String::new(),
@@ -5621,10 +5720,15 @@ fn draw_progress_bar(ui: &mut egui::Ui, ratio: f32, palette: &BrandTheme) {
         }
         if let Some(review) = self.review.as_mut() {
             if let Some(analysis) = review.analysis.clone() {
-                if draw_manual_deletion_method(
+                let display_mode = review.application_mode;
+                let authorizations = review.authorizations;
+                let schedule_enabled = review.schedule_enabled;
+                if draw_execution_confirmation(
                     ui,
                     review,
-                    self.settings.mode(),
+                    display_mode,
+                    authorizations,
+                    schedule_enabled,
                     &mut self.manual_deletion_method,
                 ) {
                     review.confirmed = false;
@@ -5637,7 +5741,9 @@ fn draw_progress_bar(ui: &mut egui::Ui, ratio: f32, palette: &BrandTheme) {
                     &analysis,
                     &mut self.help_topic,
                     displayed_run_report,
-                    self.settings.mode(),
+                    display_mode,
+                    authorizations,
+                    schedule_enabled,
                 );
                 if review.profile.mode() == SyncMode::Mirror {
                     match draw_conflict_review(ui, review, &mut self.help_topic) {
@@ -6519,6 +6625,168 @@ fn format_hash(hash: &[u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn draw_effective_review_summary(
+    ui: &mut egui::Ui,
+    review: &PlanReviewState,
+    analysis: &FreshAnalysis,
+    display_mode: ApplicationMode,
+    authorizations: AuthorizationSnapshot,
+    schedule_enabled: bool,
+) {
+    let palette = ui_palette(ui);
+    let options = analysis.specification().options();
+    let (source, _) = mapped_peers(&review.profile);
+    let deletion_method = options.deletion_method().map_or_else(
+        || "Not selected".to_owned(),
+        |method| deletion_method_label(method).to_owned(),
+    );
+    let metadata = options.metadata();
+    let mut verified_metadata = vec!["file type", "symbolic-link targets"];
+    if metadata.executable_permissions() {
+        verified_metadata.push("executable permissions");
+    }
+    if metadata.timestamps() {
+        verified_metadata.push("timestamps");
+    }
+    let specialist = metadata.specialist_metadata();
+    if specialist.ownership() {
+        verified_metadata.push("ownership");
+    }
+    if specialist.access_control_lists() {
+        verified_metadata.push("access-control lists");
+    }
+    if specialist.extended_attributes() {
+        verified_metadata.push("extended attributes");
+    }
+    let exclusions = analysis.specification().exclusions().count();
+    let bandwidth = options.bandwidth_limit_kib_per_second().map_or_else(
+        || "unlimited".to_owned(),
+        |limit| format!("{limit} KiB/s"),
+    );
+
+    card_frame(ui).show(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Effective configuration")
+                .size(16.0)
+                .strong(),
+        );
+        ui.label(
+            egui::RichText::new(
+                "This is the validated configuration used by the current Fresh Analysis. Changing it requires a new analysis.",
+            )
+            .small()
+            .color(palette.muted),
+        );
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Application mode: {}", mode_label(display_mode)));
+            ui.separator();
+            ui.label(format!("Sync mode: {}", sync_mode_label(review.profile.mode())));
+        });
+        ui.label(format!(
+            "Source: {} · Destination: {}",
+            source.root().display(),
+            review.profile.effective_destination_root().display()
+        ));
+        ui.label(format!(
+            "Safe Delete: {} · Deletion Method (saved profile policy): {}{}",
+            enabled_disabled(options.safe_delete()),
+            deletion_method,
+            if options.safe_delete() {
+                " (manual choice required at Synchronise)"
+            } else {
+                ""
+            }
+        ));
+        ui.label(format!(
+            "Destination Cleanup: {} · Permanent Removal (saved profile policy): {}",
+            enabled_disabled(options.destination_cleanup()),
+            if options.deletion_method() == Some(DeletionMethod::PermanentRemoval) {
+                "Selected"
+            } else {
+                "Not selected"
+            }
+        ));
+        ui.label(format!(
+            "Excluded patterns: {exclusions} · Metadata verification: {}",
+            verified_metadata.join(", ")
+        ));
+
+        if display_mode == ApplicationMode::Advanced {
+            ui.label(format!(
+                "Partial transfers: {} · Retries: {} attempts; initial delay {} ms",
+                partial_transfer_policy_label(options.partial_transfer_policy()),
+                options.retry_policy().max_attempts(),
+                options.retry_policy().initial_delay().as_millis(),
+            ));
+            ui.label(format!("Bandwidth limit: {bandwidth}"));
+            let unattended = unattended_consequence(
+                schedule_enabled,
+                options.safe_delete(),
+                options.destination_cleanup(),
+                options.deletion_method(),
+                authorizations,
+            );
+            ui.label(format!("Unattended Run: {unattended}"));
+        }
+    });
+}
+
+fn enabled_disabled(enabled: bool) -> &'static str {
+    if enabled {
+        "Enabled"
+    } else {
+        "Disabled"
+    }
+}
+
+fn unattended_consequence(
+    schedule_enabled: bool,
+    safe_delete: bool,
+    destination_cleanup: bool,
+    deletion_method: Option<DeletionMethod>,
+    authorizations: AuthorizationSnapshot,
+) -> String {
+    if !schedule_enabled {
+        return "Disabled".to_owned();
+    }
+    if deletion_method == Some(DeletionMethod::PermanentRemoval) {
+        return format!(
+            "Enabled; Permanent Removal requires separate authorization ({})",
+            if authorizations.allow_unattended_permanent_removal() {
+                "authorized"
+            } else {
+                "not authorized"
+            }
+        );
+    }
+    if safe_delete || destination_cleanup {
+        return format!(
+            "Enabled; destructive actions require authorization ({})",
+            if authorizations.allow_unattended_destructive() {
+                "authorized"
+            } else {
+                "not authorized"
+            }
+        );
+    }
+    "Enabled; no destructive action is authorized".to_owned()
+}
+
+fn deletion_method_label(method: DeletionMethod) -> &'static str {
+    match method {
+        DeletionMethod::Trash => "Trash",
+        DeletionMethod::PermanentRemoval => "Permanent Removal",
+    }
+}
+
+fn partial_transfer_policy_label(policy: PartialTransferPolicy) -> &'static str {
+    match policy {
+        PartialTransferPolicy::Cleanup => "Clean up failed partial files",
+        PartialTransferPolicy::KeepPartialForResume => "Keep partial files for reviewed resume",
+    }
+}
+
 fn draw_analysis_review(
     ui: &mut egui::Ui,
     review: &PlanReviewState,
@@ -6526,6 +6794,8 @@ fn draw_analysis_review(
     _help_topic: &mut HelpTopic,
     active_run_report: Option<&RunReport>,
     display_mode: ApplicationMode,
+    authorizations: AuthorizationSnapshot,
+    schedule_enabled: bool,
 ) {
     let summary = analysis.plan().summary();
     let unsupported_count = analysis
@@ -6537,6 +6807,15 @@ fn draw_analysis_review(
         .count();
     let excluded_count = analysis.source_inventory().excluded_items().count()
         + analysis.destination_inventory().excluded_items().count();
+
+    draw_effective_review_summary(
+        ui,
+        review,
+        analysis,
+        display_mode,
+        authorizations,
+        schedule_enabled,
+    );
 
     card_frame(ui).show(ui, |ui| {
         ui.horizontal(|ui| {
@@ -6638,55 +6917,111 @@ fn draw_advanced_process_diagnostics(
         });
 }
 
-fn draw_manual_deletion_method(
+fn draw_execution_confirmation(
     ui: &mut egui::Ui,
     review: &PlanReviewState,
     display_mode: ApplicationMode,
+    authorizations: AuthorizationSnapshot,
+    schedule_enabled: bool,
     selected: &mut Option<DeletionMethod>,
 ) -> bool {
-    if !review.profile.options().safe_delete {
-        return false;
-    }
-
     let before = *selected;
     card_frame(ui).show(ui, |ui| {
         ui.label(
-            egui::RichText::new("Execution Confirmation · Deletion Method")
+            egui::RichText::new("Execution Confirmation")
                 .size(16.0)
                 .strong(),
         );
         ui.label(
             egui::RichText::new(
-                "Safe Delete is enabled. Choose how verified source removals are recovered for this manual Sync Run. This choice is required every time and is not a saved unattended authorization.",
+                "Synchronise uses this reviewed scope only after the fresh precheck and this explicit confirmation pass. The active Sync Run and Run Report show progress and any recovery review.",
             )
             .color(ui_palette(ui).muted),
         );
         ui.add_space(6.0);
-        ui.radio_value(
-            selected,
-            Some(DeletionMethod::Trash),
-            "Move verified source removals to Trash",
-        );
+        let options = review.profile.options();
+        let selected_deletion_method = if options.safe_delete {
+            (*selected).map_or_else(
+                || "Not selected (required before Synchronise)".to_owned(),
+                |method| deletion_method_label(method).to_owned(),
+            )
+        } else {
+            "Not applicable (Safe Delete disabled)".to_owned()
+        };
+        let permanent_removal_status = if !options.safe_delete {
+            "Not applicable (Safe Delete disabled)"
+        } else {
+            match *selected {
+                Some(DeletionMethod::PermanentRemoval) => {
+                    "Selected for this manual Sync Run (irreversible)"
+                }
+                Some(DeletionMethod::Trash) => "Not selected for this manual Sync Run",
+                None => "Not selected (choose a Deletion Method first)",
+            }
+        };
+        ui.label(format!(
+            "Safe Delete: {}",
+            enabled_disabled(options.safe_delete)
+        ));
+        ui.label(format!("Deletion Method: {selected_deletion_method}"));
+        ui.label(format!(
+            "Destination Cleanup: {}",
+            enabled_disabled(options.destination_cleanup)
+        ));
+        ui.label(format!(
+            "Permanent Removal: {}",
+            permanent_removal_status
+        ));
         if display_mode == ApplicationMode::Advanced {
+            let unattended = unattended_consequence(
+                schedule_enabled,
+                options.safe_delete,
+                options.destination_cleanup,
+                options.deletion_method,
+                authorizations,
+            );
+            ui.label(format!("Unattended Run: {unattended}"));
+            if schedule_enabled {
+                ui.label(
+                    "Unattended credentials must be noninteractive; blockers preserve data.",
+                );
+            }
+        }
+
+        if options.safe_delete {
+            ui.separator();
+            ui.label(
+                egui::RichText::new(
+                    "Safe Delete is enabled. Choose how verified source removals are recovered for this manual Sync Run. This choice is required every time and is not a saved unattended authorization.",
+                )
+                .color(ui_palette(ui).muted),
+            );
             ui.radio_value(
                 selected,
-                Some(DeletionMethod::PermanentRemoval),
-                "Permanent Removal (irreversible; explicit confirmation)",
+                Some(DeletionMethod::Trash),
+                "Move verified source removals to Trash",
             );
-        }
-        ui.label(
-            egui::RichText::new(
-                "If Trash is unavailable, the run stops; SyncPlus never falls back to Permanent Removal.",
-            )
-            .small()
-            .color(ui_palette(ui).muted),
-        );
-        if selected.is_none() {
+            if display_mode == ApplicationMode::Advanced {
+                ui.radio_value(
+                    selected,
+                    Some(DeletionMethod::PermanentRemoval),
+                    "Permanent Removal (irreversible; explicit confirmation)",
+                );
+            }
             ui.label(
-                egui::RichText::new("Choose a Deletion Method before pressing Synchronise.")
-                    .small()
-                    .color(ui_palette(ui).warning),
+                egui::RichText::new(
+                    "If Trash is unavailable, the run stops; SyncPlus never falls back to Permanent Removal.",
+                )
+                .small()
+                .color(ui_palette(ui).muted),
             );
+            if selected.is_none() {
+                ui.label(
+                    egui::RichText::new("Choose a Deletion Method before pressing Synchronise.")
+                        .small()
+                        .color(ui_palette(ui).warning),
+                );
+            }
         }
     });
     before != *selected
@@ -9455,6 +9790,9 @@ mod tests {
             ),
             precheck: None,
             analysis: None,
+            application_mode: ApplicationMode::Simple,
+            authorizations: AuthorizationSnapshot::default(),
+            schedule_enabled: false,
             conflicts: None,
             error: None,
             stronger_confirmation_path: String::new(),
@@ -9551,7 +9889,7 @@ mod tests {
         assert!(joined.contains("Available"));
         assert!(joined.contains("Transfer"));
         assert!(!joined.contains("Ready to synchronise"));
-        assert!(!joined.contains("Execution Confirmation"));
+        assert!(joined.contains("Execution Confirmation"));
         let review_header = joined
             .find("Review:")
             .expect("Review header should be painted");
@@ -9590,7 +9928,7 @@ mod tests {
         assert!(joined.contains("In sync"));
         assert!(joined.contains("No change"));
         assert!(!joined.contains("No file changes are planned"));
-        assert!(!joined.contains("Execution Confirmation"));
+        assert!(joined.contains("Execution Confirmation"));
 
         fs::remove_dir_all(base).expect("test directory cleanup");
     }
@@ -10523,7 +10861,8 @@ mod tests {
         let (review_texts, _) = painted_output_for(&mut app, ThemePreference::Light);
         let review = review_texts.join("\n");
         assert!(
-            review.contains("Execution Confirmation · Deletion Method"),
+            review.contains("Execution Confirmation")
+                && review.contains("Deletion Method: Not selected (required before Synchronise)"),
             "Safe Delete review must ask for a per-run Deletion Method in {review}"
         );
         assert!(
@@ -10921,6 +11260,200 @@ mod tests {
         assert!(review.contains("Validated process specification (read-only)"));
         assert!(review.contains("validated Process Specification"));
         assert!(review.contains("rsync"));
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn review_shows_effective_options_and_execution_consequences() {
+        let (mut form, _source, base) = filesystem_form();
+        form.safe_delete = true;
+        form.deletion_method = Some(DeletionMethod::Trash);
+        form.destination_cleanup = true;
+        form.partial_transfer_policy = PartialTransferPolicy::KeepPartialForResume;
+        form.retry_attempts = "5".to_owned();
+        form.retry_delay_millis = "250".to_owned();
+        form.bandwidth_limit_kib_per_second = "512".to_owned();
+        form.timestamps = true;
+        form.schedule_enabled = true;
+        form.profile_authorizations = AuthorizationSnapshot::new(true, false);
+
+        let mut app = app();
+        app.set_mode(ApplicationMode::Advanced);
+        app.form = form;
+        app.analyze_profile().expect("local analysis should pass");
+        app.show_sync_workspace();
+        app.workspace_tab = WorkspaceTab::Review;
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Light);
+        let review = texts.join("\n");
+
+        for expected in [
+            "Effective configuration",
+            "Application mode: Advanced Mode",
+            "Sync mode: One-Way Sync",
+            "Safe Delete: Enabled",
+            "Deletion Method (saved profile policy): Trash (manual choice required at Synchronise)",
+            "Destination Cleanup: Enabled",
+            "Permanent Removal (saved profile policy): Not selected",
+            "Unattended Run: Enabled",
+            "Partial transfers: Keep partial files for reviewed resume",
+            "Retries: 5 attempts; initial delay 250 ms",
+            "Bandwidth limit: 512 KiB/s",
+            "Excluded patterns: 1",
+        ] {
+            assert!(review.contains(expected), "Review must show {expected}: {review}");
+        }
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn stale_analysis_is_rejected_when_mode_or_authorization_changes() {
+        let profile = valid_form().build().expect("valid profile");
+        let result = ProfileAnalysisResult {
+            configuration: AnalysisConfiguration::new(
+                profile.clone(),
+                ApplicationMode::Simple,
+                AuthorizationSnapshot::default(),
+                false,
+            ),
+            precheck: Err("test result".to_owned()),
+            analysis: None,
+        };
+
+        assert!(result.configuration.matches(
+            &profile,
+            ApplicationMode::Simple,
+            AuthorizationSnapshot::default(),
+            false,
+        ));
+        assert!(!result.configuration.matches(
+            &profile,
+            ApplicationMode::Advanced,
+            AuthorizationSnapshot::default(),
+            false,
+        ));
+        assert!(!result.configuration.matches(
+            &profile,
+            ApplicationMode::Simple,
+            AuthorizationSnapshot::new(true, false),
+            false,
+        ));
+
+        let current_profile = valid_form()
+            .build()
+            .expect("the profile comparison receives validated core data");
+        assert!(analysis_result_matches_current_configuration(
+            &result,
+            &current_profile,
+            ApplicationMode::Simple,
+            AuthorizationSnapshot::default(),
+            false,
+        ));
+    }
+
+    #[test]
+    fn execution_confirmation_rejects_changed_configuration() {
+        let (form, _source, base) = filesystem_form();
+        let mut app = app();
+        app.form = form;
+        app.analyze_profile().expect("local analysis should pass");
+
+        app.form.profile_authorizations = AuthorizationSnapshot::new(true, false);
+        let error = app
+            .confirm_review()
+            .expect_err("changed authorization must invalidate confirmation");
+        assert!(
+            matches!(error, UiValidationError::Analysis(ref message) if message.contains("stale")),
+            "unexpected error: {error:?}"
+        );
+        assert!(!app.review.as_ref().expect("review state").confirmed);
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn worker_analysis_result_is_rejected_when_current_configuration_changes() {
+        let (form, _source, base) = filesystem_form();
+        let mut app = app();
+        app.form = form;
+        let profile = app.form.build().expect("valid profile");
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(AnalysisWorkerEvent::Done(Box::new(ProfileAnalysisResult {
+                configuration: AnalysisConfiguration::new(
+                    profile.clone(),
+                    ApplicationMode::Simple,
+                    AuthorizationSnapshot::default(),
+                    false,
+                ),
+                precheck: Err("test result".to_owned()),
+                analysis: None,
+            })))
+            .expect("worker result receiver");
+        drop(sender);
+        app.active_analysis = Some(ActiveAnalysis {
+            receiver,
+            started: Instant::now(),
+            profile_name: profile.name().to_owned(),
+            source: profile.peer_a().root().display().to_string(),
+            destination: profile.peer_b().root().display().to_string(),
+            phase: AnalysisPhase::CheckingFolders,
+            kind: AnalysisKind::DryRun,
+        });
+        app.form.profile_authorizations = AuthorizationSnapshot::new(true, false);
+
+        app.poll_analysis();
+
+        assert!(app.active_analysis.is_none());
+        assert!(app.status().contains("older profile, mode, or authorization"));
+        assert!(!app.can_synchronise());
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn manual_run_cannot_start_after_confirmation_configuration_changes() {
+        let (form, _source, base) = filesystem_form();
+        let mut app = app();
+        app.form = form;
+        app.analyze_profile().expect("local analysis should pass");
+        app.confirm_review()
+            .expect("the clean review should be confirmed");
+        app.folder_gate = FolderGate::Ready;
+
+        app.form.profile_authorizations = AuthorizationSnapshot::new(true, false);
+        let error = app
+            .start_manual_run()
+            .expect_err("a changed authorization must block the run");
+        assert!(
+            matches!(error, UiValidationError::Analysis(ref message) if message.contains("stale")),
+            "unexpected error: {error:?}"
+        );
+        assert!(app.active_manual_run.is_none());
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
+    fn execution_confirmation_describes_the_manual_deletion_choice() {
+        let (mut form, _source, base) = filesystem_form();
+        form.safe_delete = true;
+        form.deletion_method = Some(DeletionMethod::PermanentRemoval);
+        let mut app = app();
+        app.form = form;
+        app.analyze_profile().expect("local analysis should pass");
+        app.manual_deletion_method = Some(DeletionMethod::Trash);
+        app.show_sync_workspace();
+        app.workspace_tab = WorkspaceTab::Review;
+
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Light);
+        let review = texts.join("\n");
+        assert!(review.contains("Deletion Method: Trash"), "{review}");
+        assert!(
+            review.contains("Permanent Removal: Not selected for this manual Sync Run"),
+            "{review}"
+        );
 
         fs::remove_dir_all(base).expect("test directory cleanup");
     }

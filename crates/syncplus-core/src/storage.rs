@@ -78,6 +78,62 @@ impl Default for ApplicationSettings {
     }
 }
 
+/// The complete nonsecret identity captured when the GUI or scheduler starts
+/// Fresh Analysis. Keeping the comparison in core ensures every caller uses
+/// the same profile, mode, authorization, and scheduling freshness boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalysisConfiguration {
+    profile: SyncProfile,
+    application_mode: ApplicationMode,
+    authorizations: AuthorizationSnapshot,
+    schedule_enabled: bool,
+}
+
+impl AnalysisConfiguration {
+    pub const fn new(
+        profile: SyncProfile,
+        application_mode: ApplicationMode,
+        authorizations: AuthorizationSnapshot,
+        schedule_enabled: bool,
+    ) -> Self {
+        Self {
+            profile,
+            application_mode,
+            authorizations,
+            schedule_enabled,
+        }
+    }
+
+    pub fn profile(&self) -> &SyncProfile {
+        &self.profile
+    }
+
+    pub const fn application_mode(&self) -> ApplicationMode {
+        self.application_mode
+    }
+
+    pub const fn authorizations(&self) -> AuthorizationSnapshot {
+        self.authorizations
+    }
+
+    pub const fn schedule_enabled(&self) -> bool {
+        self.schedule_enabled
+    }
+
+    pub fn matches(
+        &self,
+        current_profile: &SyncProfile,
+        application_mode: ApplicationMode,
+        authorizations: AuthorizationSnapshot,
+        schedule_enabled: bool,
+    ) -> bool {
+        self.profile == *current_profile
+            && self.application_mode == application_mode
+            && self.authorizations == authorizations
+            && self.schedule_enabled == schedule_enabled
+    }
+}
+
 /// A nonsecret theme preference. The UI owns the visual rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemePreference {
