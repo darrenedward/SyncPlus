@@ -1423,7 +1423,7 @@ impl RunEvidenceStore {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 21 {
+        if version > 22 {
             return Err(StorageError::CorruptEvidence(format!(
                 "unsupported evidence schema version {version}"
             )));
@@ -2104,6 +2104,33 @@ impl RunEvidenceStore {
             transaction.pragma_update(None, "user_version", 21)?;
             verify_integrity(&transaction)?;
             transaction.commit()?;
+            version = 21;
+        }
+        if version == 21 {
+            let transaction = connection.transaction()?;
+            for table in ["sync_profiles", "run_snapshots"] {
+                let has_bandwidth_limit: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pragma_table_info(?1)
+                        WHERE name = 'bandwidth_limit_kib_per_second'
+                    )",
+                    params![table],
+                    |row| row.get(0),
+                )?;
+                if !has_bandwidth_limit {
+                    transaction.execute(
+                        &format!(
+                            "ALTER TABLE {table}
+                             ADD COLUMN bandwidth_limit_kib_per_second INTEGER
+                             CHECK (bandwidth_limit_kib_per_second IS NULL OR bandwidth_limit_kib_per_second BETWEEN 1 AND 4000000)"
+                        ),
+                        [],
+                    )?;
+                }
+            }
+            transaction.pragma_update(None, "user_version", 22)?;
+            verify_integrity(&transaction)?;
+            transaction.commit()?;
         }
         verify_integrity(&connection)?;
         Ok(Self {
@@ -2169,8 +2196,9 @@ impl RunEvidenceStore {
                 metadata_ownership, metadata_access_control_lists,
                 metadata_extended_attributes,
                 partial_transfer_policy, retry_max_attempts,
-                retry_initial_delay_millis, created_at_unix_seconds
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39)",
+                retry_initial_delay_millis, created_at_unix_seconds,
+                bandwidth_limit_kib_per_second
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40)",
             params![
                 snapshot.run_id().value(),
                 snapshot.snapshot_id().value(),
@@ -2215,6 +2243,7 @@ impl RunEvidenceStore {
                 options.retry_policy().max_attempts(),
                 options.retry_policy().initial_delay().as_millis() as u64,
                 snapshot.created_at_unix_seconds(),
+                options.bandwidth_limit_kib_per_second(),
             ],
         )?;
         let next_run_id = i64::try_from(snapshot.run_id().value())
@@ -3531,7 +3560,8 @@ impl RunEvidenceStore {
                         metadata_ownership, metadata_access_control_lists,
                         metadata_extended_attributes,
                         partial_transfer_policy, retry_max_attempts,
-                        retry_initial_delay_millis, created_at_unix_seconds
+                        retry_initial_delay_millis, created_at_unix_seconds,
+                        bandwidth_limit_kib_per_second
                  FROM run_snapshots WHERE run_id = ?1",
                 params![run_id.value()],
                 |row| {
@@ -3574,6 +3604,7 @@ impl RunEvidenceStore {
                         row.get::<_, u8>(35)?,
                         row.get::<_, u64>(36)?,
                         row.get::<_, i64>(37)?,
+                        row.get::<_, Option<u64>>(38)?,
                     ))
                 },
             )
@@ -3617,6 +3648,7 @@ impl RunEvidenceStore {
             retry_max_attempts,
             retry_initial_delay_millis,
             created_at_unix_seconds,
+            bandwidth_limit_kib_per_second,
         )) = row
         else {
             return Err(StorageError::InvalidEvent(format!(
@@ -3688,6 +3720,7 @@ impl RunEvidenceStore {
                 retry_max_attempts,
                 std::time::Duration::from_millis(retry_initial_delay_millis),
             ),
+            bandwidth_limit_kib_per_second,
         })
         .with_exclusions(exclusions);
         let mut snapshot = RunSnapshot::from_profile_with_volume_identities(
@@ -4322,7 +4355,7 @@ fn open_canonical_connection(path: &Path) -> Result<Connection, StorageError> {
 }
 
 impl RunEvidenceStore {
-    pub(crate) fn load_ssh_host_fingerprint(
+    pub fn load_ssh_host_fingerprint(
         &self,
         host: &crate::SshHost,
     ) -> Result<Option<crate::SshHostFingerprint>, crate::HostTrustStoreError> {
@@ -6529,7 +6562,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
         assert!(
             migrated
                 .connection
@@ -6583,7 +6616,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("schema version should be readable");
 
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
         for table in [
             "application_settings",
             "sync_profiles",
@@ -6640,7 +6673,7 @@ mod tests {
                 .connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            21
+            22
         );
     }
 

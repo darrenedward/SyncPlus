@@ -32,6 +32,7 @@ fn profile() -> SyncProfile {
         safe_delete: true,
         destination_cleanup: true,
         deletion_method: Some(DeletionMethod::PermanentRemoval),
+        bandwidth_limit_kib_per_second: Some(1024),
         ..SyncOptions::default()
     })
     .with_exclusions(["*.tmp", "private/"])
@@ -91,6 +92,13 @@ fn export_is_explicit_nonsecret_configuration_and_import_strips_authority() {
     assert!(!persisted.profile().options().safe_delete);
     assert!(!persisted.profile().options().destination_cleanup);
     assert_eq!(persisted.profile().options().deletion_method, None);
+    assert_eq!(
+        persisted
+            .profile()
+            .options()
+            .bandwidth_limit_kib_per_second,
+        Some(1024)
+    );
     assert!(!persisted.authorizations().allow_unattended_destructive());
     assert!(
         !persisted

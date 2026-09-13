@@ -1,10 +1,11 @@
 use std::{fs, path::PathBuf};
 
 use crate::{
-    AnalysisError, AuthorizationSnapshot, DeletionMethod, FreshAnalysis, MetadataRequirements,
-    OneWaySource, ProcessArgument, ProcessSpecError, ProcessSpecification, Peer,
+    AnalysisError, AnalysisOutcome, AuthorizationSnapshot, DeletionMethod, FreshAnalysis,
+    InventoryItem, ItemMetadata, ItemType, MetadataRequirements, OneWaySource, ProcessArgument,
+    ProcessSpecError, ProcessSpecification, Peer,
     RemoteHelperInvocation, RemoteHelperKind, RsyncFlag,
-    RunId, RunSnapshot, SshAuthentication, SshPeer, SshPeerError, SyncMode,
+    RunId, RunSnapshot, SourceInventory, SshAuthentication, SshPeer, SshPeerError, SyncMode,
     SyncOptions, SyncProfile,
     SpecialistMetadataRequirements,
 };
@@ -426,6 +427,7 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     }
     .validate()
     .expect("Safe Delete with an explicit recovery method is valid");
@@ -439,6 +441,7 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     }
     .validate()
     .expect("manual Safe Delete can choose its method at confirmation time");
@@ -452,6 +455,7 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     }
     .validate()
     .expect_err("a deletion method without a destructive action is ambiguous");
@@ -468,6 +472,7 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
             metadata: Default::default(),
             partial_transfer_policy: Default::default(),
             retry_policy: Default::default(),
+            bandwidth_limit_kib_per_second: None,
         });
     let specification = ProcessSpecification::from_profile(&destination_cleanup)
         .expect("destination cleanup must be enabled only by explicit profile configuration");
@@ -483,6 +488,7 @@ fn destructive_options_are_explicit_and_invalid_combinations_fail() {
             metadata: Default::default(),
             partial_transfer_policy: Default::default(),
             retry_policy: Default::default(),
+            bandwidth_limit_kib_per_second: None,
         });
     let specification = ProcessSpecification::from_profile(&safe_delete)
         .expect("Safe Delete must be valid with an explicit recovery method");
@@ -508,6 +514,89 @@ fn retry_policy_is_bounded_and_uses_increasing_delays() {
     assert!(matches!(
         ProcessSpecification::from_profile(&invalid_delay),
         Err(ProcessSpecError::InvalidRetryDelay { .. })
+    ));
+}
+
+#[test]
+fn bandwidth_limit_is_validated_and_added_to_every_typed_transfer() {
+    let configured = profile(PathBuf::from("/source"), PathBuf::from("/destination")).with_options(
+        SyncOptions {
+            bandwidth_limit_kib_per_second: Some(512),
+            ..SyncOptions::default()
+        },
+    );
+    let specification = ProcessSpecification::from_profile(&configured).expect("valid bandwidth");
+    assert_eq!(specification.options().bandwidth_limit_kib_per_second(), Some(512));
+    assert!(specification
+        .arguments()
+        .contains(&ProcessArgument::BandwidthLimit(512)));
+    assert!(specification
+        .preview()
+        .contains("--bwlimit=512"));
+
+    let local_item = specification
+        .item_invocation(
+            PathBuf::from("/source/report.txt").as_path(),
+            PathBuf::from("/destination/.syncplus-temporary-report.txt").as_path(),
+        )
+        .expect("local item invocation should use the validated bandwidth limit");
+    assert!(local_item
+        .arguments()
+        .iter()
+        .any(|argument| argument == "--bwlimit=512"));
+
+    let source_inventory = SourceInventory::from_items(
+        "Source",
+        "/source",
+        vec![InventoryItem::new(
+            "report.txt",
+            ItemType::RegularFile,
+            ItemMetadata::new(4, None, false, None, None),
+            AnalysisOutcome::Included,
+            Some([1; 32]),
+        )],
+    );
+    let destination_inventory = SourceInventory::from_items("Destination", "/destination", vec![]);
+    let analysis = FreshAnalysis::from_inventories(
+        &configured,
+        specification.clone(),
+        source_inventory,
+        destination_inventory,
+    )
+    .expect("the fixture should produce one transfer action");
+    let ssh_specification = ProcessSpecification::from_profile(
+        &SyncProfile::new(
+            "SSH process specification",
+            Peer::new("Local", PathBuf::from("/source")),
+            ssh_peer("/srv/sync"),
+        )
+        .with_source(OneWaySource::PeerA)
+        .with_options(SyncOptions {
+            bandwidth_limit_kib_per_second: Some(512),
+            ..SyncOptions::default()
+        }),
+    )
+    .expect("SSH specification should validate");
+    let ssh_item = ssh_specification
+        .ssh_item_invocation_to(
+            analysis.plan().action_for("report.txt").expect("transfer action"),
+            PathBuf::from("/srv/sync/.syncplus-temporary-report.txt").as_path(),
+        )
+        .expect("SSH item invocation should use the validated bandwidth limit");
+    assert!(ssh_item
+        .arguments()
+        .iter()
+        .any(|argument| argument == "--bwlimit=512"));
+
+    let invalid = profile(PathBuf::from("/source"), PathBuf::from("/destination")).with_options(
+        SyncOptions {
+            bandwidth_limit_kib_per_second: Some(0),
+            ..SyncOptions::default()
+        },
+    );
+    assert!(matches!(
+        ProcessSpecification::from_profile(&invalid),
+        Err(ProcessSpecError::InvalidBandwidthLimit { .. })
     ));
 }
 

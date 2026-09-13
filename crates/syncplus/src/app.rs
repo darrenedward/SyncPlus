@@ -59,6 +59,7 @@ pub enum UiValidationError {
     SavedSecretUnavailable,
     InvalidRetryAttempts,
     InvalidRetryDelay,
+    InvalidBandwidthLimit,
     InvalidScheduleInterval,
     InvalidScheduleTimezone,
     ScheduleRequiresAdvanced,
@@ -398,6 +399,9 @@ impl std::fmt::Display for UiValidationError {
             Self::InvalidRetryDelay => {
                 formatter.write_str("Retry delay must be between 0 and 3,600,000 milliseconds.")
             }
+            Self::InvalidBandwidthLimit => formatter.write_str(
+                "Bandwidth limit must be empty (unlimited) or a whole number from 1 to 4,000,000 KiB/s.",
+            ),
             Self::InvalidScheduleInterval => {
                 formatter.write_str("Schedule interval must be a whole number from 1 minute to 7 days.")
             }
@@ -715,6 +719,7 @@ struct ProfileForm {
     partial_transfer_policy: PartialTransferPolicy,
     retry_attempts: String,
     retry_delay_millis: String,
+    bandwidth_limit_kib_per_second: String,
     schedule_enabled: bool,
     schedule_interval_minutes: String,
     schedule_timezone: String,
@@ -751,6 +756,7 @@ impl Default for ProfileForm {
                 .initial_delay()
                 .as_millis()
                 .to_string(),
+            bandwidth_limit_kib_per_second: String::new(),
             schedule_enabled: false,
             schedule_interval_minutes: "60".to_owned(),
             schedule_timezone: "UTC".to_owned(),
@@ -790,6 +796,9 @@ impl ProfileForm {
             partial_transfer_policy: options.partial_transfer_policy,
             retry_attempts: options.retry_policy.max_attempts().to_string(),
             retry_delay_millis: options.retry_policy.initial_delay().as_millis().to_string(),
+            bandwidth_limit_kib_per_second: options
+                .bandwidth_limit_kib_per_second
+                .map_or_else(String::new, |limit| limit.to_string()),
             schedule_enabled: profile.schedule_enabled(),
             schedule_interval_minutes: profile
                 .schedule()
@@ -828,6 +837,21 @@ impl ProfileForm {
             .ok()
             .filter(|delay| *delay <= 3_600_000)
             .ok_or(UiValidationError::InvalidRetryDelay)?;
+        let bandwidth_limit_kib_per_second =
+            if self.bandwidth_limit_kib_per_second.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    self.bandwidth_limit_kib_per_second
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|limit| {
+                            (1..=SyncOptions::MAX_BANDWIDTH_LIMIT_KIB_PER_SECOND).contains(limit)
+                        })
+                        .ok_or(UiValidationError::InvalidBandwidthLimit)?,
+                )
+            };
         let options = SyncOptions {
             safe_delete: self.safe_delete,
             destination_cleanup: self.destination_cleanup,
@@ -848,6 +872,7 @@ impl ProfileForm {
                 retry_attempts,
                 Duration::from_millis(retry_delay_millis),
             ),
+            bandwidth_limit_kib_per_second,
         };
         let exclusions = self
             .exclusions
@@ -4302,6 +4327,8 @@ impl SyncPlusApp {
         let step = self.wizard_step.unwrap_or(ProfileWizardStep::SyncMethod);
         let step_ready = self.wizard_step_validation(step).is_ok();
         let form_before_draw = self.form.clone();
+        let peer_a_approved_fingerprint = approved_ssh_fingerprint(&self.store, &self.form.peer_a);
+        let peer_b_approved_fingerprint = approved_ssh_fingerprint(&self.store, &self.form.peer_b);
         let palette = ui_palette(ui);
         let mut cancel = false;
         let mut previous = false;
@@ -4410,6 +4437,7 @@ impl SyncPlusApp {
                                     "Source endpoint",
                                     &mut self.form.peer_a,
                                     self.settings.mode(),
+                                    peer_a_approved_fingerprint.as_deref(),
                                 ) {
                                     self.pending_folder_pick =
                                         Some(PendingFolderPick::source(false));
@@ -4439,6 +4467,7 @@ impl SyncPlusApp {
                                     "Destination endpoint",
                                     &mut self.form.peer_b,
                                     self.settings.mode(),
+                                    peer_b_approved_fingerprint.as_deref(),
                                 ) {
                                     self.pending_folder_pick =
                                         Some(PendingFolderPick::destination(false));
@@ -5154,6 +5183,28 @@ impl SyncPlusApp {
                             singleline_edit(&mut self.form.retry_delay_millis).desired_width(75.0),
                         );
                     });
+                    ui.label(
+                        egui::RichText::new(
+                            "Choose 1–10 attempts and an initial delay from 0 to 3,600,000 ms. Only typed transient transfer or connection failures are retried; delays increase between attempts, completed actions are not replayed, and verification or recovery failures are never retried as transport failures.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Bandwidth limit (KiB/s)");
+                        ui.add(
+                            singleline_edit(&mut self.form.bandwidth_limit_kib_per_second)
+                                .desired_width(100.0)
+                                .hint_text("unlimited"),
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Leave this empty for unlimited transfer speed. The value is validated and applied as a named rsync bandwidth option.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
                     ui.separator();
                     ui.label("Background Scheduler (Advanced Mode only)");
                     ui.checkbox(
@@ -5586,6 +5637,7 @@ fn draw_progress_bar(ui: &mut egui::Ui, ratio: f32, palette: &BrandTheme) {
                     &analysis,
                     &mut self.help_topic,
                     displayed_run_report,
+                    self.settings.mode(),
                 );
                 if review.profile.mode() == SyncMode::Mirror {
                     match draw_conflict_review(ui, review, &mut self.help_topic) {
@@ -6473,6 +6525,7 @@ fn draw_analysis_review(
     analysis: &FreshAnalysis,
     _help_topic: &mut HelpTopic,
     active_run_report: Option<&RunReport>,
+    display_mode: ApplicationMode,
 ) {
     let summary = analysis.plan().summary();
     let unsupported_count = analysis
@@ -6549,7 +6602,40 @@ fn draw_analysis_review(
         }
     });
 
+    draw_advanced_process_diagnostics(ui, review, analysis, display_mode);
     draw_transfer_browser(ui, review, analysis, active_run_report);
+}
+
+fn draw_advanced_process_diagnostics(
+    ui: &mut egui::Ui,
+    review: &PlanReviewState,
+    analysis: &FreshAnalysis,
+    display_mode: ApplicationMode,
+) {
+    if review.profile.mode() != SyncMode::OneWay
+        || display_mode != ApplicationMode::Advanced
+    {
+        return;
+    }
+    let mut preview = analysis.specification().preview();
+    egui::CollapsingHeader::new("Validated process specification (read-only)")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "This whole-tree preview is generated from the validated Process Specification. Per-item transfers use the same typed options with a reviewed staging path; this diagnostic evidence cannot be edited.",
+                )
+                .small()
+                .color(ui_palette(ui).muted),
+            );
+            ui.add_enabled(
+                false,
+                egui::TextEdit::multiline(&mut preview)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(3)
+                    .desired_width(ui.available_width()),
+            );
+        });
 }
 
 fn draw_manual_deletion_method(
@@ -8940,6 +9026,7 @@ fn draw_endpoint(
     title: &str,
     endpoint: &mut EndpointForm,
     display_mode: ApplicationMode,
+    approved_fingerprint: Option<&str>,
 ) -> bool {
     let mut browsed = false;
     inset_frame(ui).show(ui, |ui| {
@@ -8994,6 +9081,18 @@ fn draw_endpoint(
                 if display_mode == ApplicationMode::Advanced {
                     ui.label(
                         "SSH host identity is checked by the core preflight before any mutation.",
+                    );
+                    ui.label(format!(
+                        "Host identity: {}:{} · checked before each run.",
+                        endpoint.server.trim(),
+                        endpoint.port.trim()
+                    ));
+                    ui.label(format!(
+                        "Approved fingerprint: {}",
+                        approved_fingerprint.unwrap_or("none stored; interactive approval required")
+                    ));
+                    ui.label(
+                        "A new or changed fingerprint blocks the run and remains visible for interactive review; it is never trusted automatically.",
                     );
                 }
                 ui.horizontal(|ui| {
@@ -9053,6 +9152,19 @@ fn draw_endpoint(
         }
     });
     browsed
+}
+
+fn approved_ssh_fingerprint(
+    store: &RunEvidenceStore,
+    endpoint: &EndpointForm,
+) -> Option<String> {
+    let peer = endpoint.build("SSH endpoint").ok()?;
+    let ssh_peer = peer.ssh_peer()?;
+    store
+        .load_ssh_host_fingerprint(&syncplus_core::SshHost::from_peer(ssh_peer))
+        .ok()
+        .flatten()
+        .map(|fingerprint| fingerprint.to_string())
 }
 
 fn mode_label(mode: ApplicationMode) -> &'static str {
@@ -10466,6 +10578,7 @@ mod tests {
             "Preserve and verify timestamps",
             "Preserve and verify executable permissions",
             "Retry attempts",
+            "Bandwidth limit (KiB/s)",
             "Background Scheduler (Advanced Mode only)",
             "Authorize unattended Permanent Removal (irreversible; Advanced only)",
         ] {
@@ -10496,10 +10609,15 @@ mod tests {
             advanced.contains("Permanent Removal (irreversible; separate authorization)"),
             "Advanced Mode must label Permanent Removal as irreversible in {advanced}"
         );
+        assert!(
+            advanced.contains("Choose 1–10 attempts and an initial delay"),
+            "Advanced Mode must explain the bounded retry boundary in {advanced}"
+        );
         for advanced_only in [
             "Preserve and verify timestamps",
             "Preserve and verify executable permissions",
             "Retry attempts",
+            "Bandwidth limit (KiB/s)",
             "Background Scheduler (Advanced Mode only)",
         ] {
             assert!(
@@ -10537,6 +10655,8 @@ mod tests {
         );
 
         app.set_mode(ApplicationMode::Advanced);
+        app.form.peer_a.authentication = AuthenticationForm::Key;
+        app.form.peer_a.identity = "/home/user/.ssh/id_sync".to_owned();
         let (advanced_texts, _) = painted_output_for(&mut app, ThemePreference::Light);
         let advanced = advanced_texts.join("\n");
         assert!(
@@ -10546,6 +10666,22 @@ mod tests {
         assert!(
             advanced.contains("SSH host identity is checked"),
             "Advanced Mode must expose SSH host identity guidance in {advanced}"
+        );
+        assert!(
+            advanced.contains("Host identity: backup.example.test:22"),
+            "Advanced Mode must show the nonsecret SSH host identity details in {advanced}"
+        );
+        assert!(
+            advanced.contains("Approved fingerprint: none stored; interactive approval required"),
+            "Advanced Mode must show that approval is required without exposing key material in {advanced}"
+        );
+        assert!(
+            advanced.contains("/home/user/.ssh/id_sync"),
+            "Advanced Mode must show the selected key reference without reading key contents in {advanced}"
+        );
+        assert!(
+            advanced.contains("new or changed fingerprint blocks"),
+            "Advanced Mode must explain changed-fingerprint blocking in {advanced}"
         );
     }
 
@@ -10770,6 +10906,26 @@ mod tests {
     }
 
     #[test]
+    fn advanced_review_shows_the_validated_process_command_as_read_only_diagnostics() {
+        let (form, _source, base) = filesystem_form();
+        let mut app = app();
+        app.set_mode(ApplicationMode::Advanced);
+        app.form = form;
+
+        app.analyze_profile().expect("local analysis should pass");
+        app.show_sync_workspace();
+        app.workspace_tab = WorkspaceTab::Review;
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Light);
+        let review = texts.join("\n");
+
+        assert!(review.contains("Validated process specification (read-only)"));
+        assert!(review.contains("validated Process Specification"));
+        assert!(review.contains("rsync"));
+
+        fs::remove_dir_all(base).expect("test directory cleanup");
+    }
+
+    #[test]
     fn unavailable_source_is_a_precheck_blocker_and_cannot_be_confirmed() {
         let (mut form, _source, base) = filesystem_form();
         let missing = base.join("missing-source");
@@ -10878,6 +11034,7 @@ mod tests {
         form.partial_transfer_policy = PartialTransferPolicy::KeepPartialForResume;
         form.retry_attempts = "5".to_owned();
         form.retry_delay_millis = "250".to_owned();
+        form.bandwidth_limit_kib_per_second = "512".to_owned();
 
         let profile = form.build().expect("typed advanced options");
         let options = profile.options();
@@ -10900,6 +11057,7 @@ mod tests {
             options.retry_policy.initial_delay(),
             Duration::from_millis(250)
         );
+        assert_eq!(options.bandwidth_limit_kib_per_second, Some(512));
         assert!(
             !syncplus_core::ProcessSpecification::from_profile(&profile)
                 .expect("validated specification")
@@ -10931,6 +11089,9 @@ mod tests {
         form.retry_attempts = "5".to_owned();
         form.retry_delay_millis = "3600001".to_owned();
         assert_eq!(form.build(), Err(UiValidationError::InvalidRetryDelay));
+        form.retry_delay_millis = "250".to_owned();
+        form.bandwidth_limit_kib_per_second = "0".to_owned();
+        assert_eq!(form.build(), Err(UiValidationError::InvalidBandwidthLimit));
     }
 
     #[test]

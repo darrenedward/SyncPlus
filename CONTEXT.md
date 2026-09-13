@@ -382,6 +382,14 @@ _Avoid_: Infinite restart loops, retrying destructive finalization blindly, or t
 
 Retries are resumptions, not fresh runs: completed and verified actions are not replayed, and the current action resumes only from a validated transfer boundary. A retry never authorizes source removal without repeating the required verification.
 
+**Bandwidth Limit**:
+An optional Advanced Mode transfer cap expressed in KiB/s. An empty value means
+unlimited; a configured value is validated from 1 through 4,000,000 KiB/s,
+frozen into the Profile Snapshot, and emitted only as the named `--bwlimit`
+process option. It does not change verification, recovery, or source-preservation
+requirements.
+_Avoid_: Raw rsync arguments, ambiguous zero values, or treating a transfer cap as a safety proof
+
 **Source Inventory**:
 The recorded set of source items eligible for a specific Sync Run after hidden-file handling and Exclusion Rules are applied. It is used to detect missed, changed, newly appeared, and unresolved items during final reconciliation. An inventory is evidence for the run, not permission to delete an item by itself.
 

@@ -27,6 +27,7 @@ fn new_profiles_default_to_non_destructive_one_way_sync() {
             metadata: Default::default(),
             partial_transfer_policy: Default::default(),
             retry_policy: Default::default(),
+            bandwidth_limit_kib_per_second: None,
         }
     );
 }
@@ -40,6 +41,7 @@ fn invalid_profiles_cannot_create_active_runs() {
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     });
 
     assert!(SyncRun::new(RunId::new(8), &invalid).is_err());

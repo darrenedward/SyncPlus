@@ -88,7 +88,10 @@ fn named_theme_preferences_survive_restart_without_stored_colours() {
 #[test]
 fn profiles_round_trip_with_validated_endpoints_and_safe_defaults() {
     let database = database();
-    let original = profile();
+    let original = profile().with_options(crate::SyncOptions {
+        bandwidth_limit_kib_per_second: Some(2048),
+        ..crate::SyncOptions::default()
+    });
     let edited = original
         .clone()
         .with_mode(SyncMode::Mirror)
@@ -121,6 +124,10 @@ fn profiles_round_trip_with_validated_endpoints_and_safe_defaults() {
         .expect("load profile")
         .expect("profile exists");
     assert_eq!(loaded.profile(), &edited);
+    assert_eq!(
+        loaded.profile().options().bandwidth_limit_kib_per_second,
+        Some(2048)
+    );
     assert_eq!(reopened.list_profiles().expect("list profiles").len(), 1);
 
     assert!(reopened.remove_profile(profile_id).expect("remove profile"));

@@ -194,6 +194,7 @@ fn exclusions_are_recorded_outside_scope_and_never_become_candidates() {
             metadata: Default::default(),
             partial_transfer_policy: Default::default(),
             retry_policy: Default::default(),
+            bandwidth_limit_kib_per_second: None,
         });
     let analysis = FreshAnalysis::analyze(&profile).expect("exclusions should be analyzable");
 
@@ -282,6 +283,7 @@ fn plan_summary_reports_action_counts_and_applicable_sizes() {
             metadata: Default::default(),
             partial_transfer_policy: Default::default(),
             retry_policy: Default::default(),
+            bandwidth_limit_kib_per_second: None,
         }),
     )
     .expect("the summary should be based on a valid process specification");
@@ -391,6 +393,7 @@ fn safe_delete_and_destination_cleanup_actions_follow_validated_process_options(
         metadata: Default::default(),
         partial_transfer_policy: Default::default(),
         retry_policy: Default::default(),
+        bandwidth_limit_kib_per_second: None,
     });
 
     let analysis = FreshAnalysis::analyze(&profile).expect("explicit destructive options are valid");
