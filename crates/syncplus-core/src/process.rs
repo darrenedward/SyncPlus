@@ -5,8 +5,9 @@ use std::{
 };
 
 use crate::{
-    DeletionMethod, MetadataRequirements, OneWaySource, PartialTransferPolicy, PeerSide,
-    Peer, PlanAction, PlanActionKind, RetryPolicy, SshPeer, SyncMode, SyncOptions, SyncProfile,
+    ApplicationMode, DeletionMethod, MetadataRequirements, OneWaySource, PartialTransferPolicy,
+    Peer, PeerSide, PlanAction, PlanActionKind, RetryPolicy, SshPeer, SyncMode, SyncOptions,
+    SyncProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -339,6 +340,7 @@ pub enum ProcessSpecError {
     InvalidRetryPolicy { max_attempts: u8 },
     InvalidRetryDelay { milliseconds: u128 },
     InvalidBandwidthLimit { kibibytes_per_second: u64 },
+    AdvancedModeRequired { option: &'static str },
     HostTrustPermitMismatch,
     DeletionMethodRequired,
 }
@@ -397,6 +399,9 @@ impl fmt::Display for ProcessSpecError {
                 "bandwidth limit must be between 1 and {} KiB/s, got {kibibytes_per_second}",
                 SyncOptions::MAX_BANDWIDTH_LIMIT_KIB_PER_SECOND
             ),
+            Self::AdvancedModeRequired { option } => {
+                write!(formatter, "Advanced Mode is required for {option}")
+            }
             Self::HostTrustPermitMismatch => {
                 formatter.write_str("SSH host-trust permit does not match the remote endpoint")
             }
@@ -612,6 +617,24 @@ impl ProcessSpecification {
             peer_a_ssh: profile.peer_a().ssh_peer().cloned(),
             peer_b_ssh: profile.peer_b().ssh_peer().cloned(),
         })
+    }
+
+    /// Build a specification only when its named options are visible in the
+    /// selected application mode. The application mode is presentation state,
+    /// not part of the profile, so this check preserves the profile's
+    /// effective options while preventing hidden Advanced settings from being
+    /// analysed or executed from Simple Mode.
+    pub fn from_profile_for_mode(
+        profile: &SyncProfile,
+        application_mode: ApplicationMode,
+    ) -> Result<Self, ProcessSpecError> {
+        let specification = Self::from_profile(profile)?;
+        if application_mode == ApplicationMode::Simple
+            && let Some(option) = profile.advanced_mode_requirement()
+        {
+            return Err(ProcessSpecError::AdvancedModeRequired { option });
+        }
+        Ok(specification)
     }
 
     pub fn arguments(&self) -> &[ProcessArgument] {
