@@ -1,12 +1,11 @@
 use std::{fs, path::PathBuf};
 
 use crate::{
-    AnalysisError, AnalysisOutcome, AuthorizationSnapshot, DeletionMethod, FreshAnalysis,
-    InventoryItem, ItemMetadata, ItemType, MetadataRequirements, OneWaySource, ProcessArgument,
-    ProcessSpecError, ProcessSpecification, Peer,
-    RemoteHelperInvocation, RemoteHelperKind, RsyncFlag,
-    RunId, RunSnapshot, SourceInventory, SshAuthentication, SshPeer, SshPeerError, SyncMode,
-    SyncOptions, SyncProfile,
+    AnalysisError, AnalysisOutcome, ApplicationMode, AuthorizationSnapshot, DeletionMethod,
+    FreshAnalysis, InventoryItem, ItemMetadata, ItemType, MetadataRequirements, OneWaySource, Peer,
+    ProcessArgument, ProcessSpecError, ProcessSpecification, RemoteHelperInvocation,
+    RemoteHelperKind, RsyncFlag, RunId, RunSnapshot, SourceInventory, SshAuthentication, SshPeer,
+    SshPeerError, SyncMode, SyncOptions, SyncProfile,
     SpecialistMetadataRequirements,
 };
 
@@ -61,6 +60,132 @@ fn specialist_metadata_is_named_and_disabled_by_default() {
     assert!(specification.arguments().contains(&ProcessArgument::Flag(RsyncFlag::Group)));
     assert!(specification.arguments().contains(&ProcessArgument::Flag(RsyncFlag::Acls)));
     assert!(specification.arguments().contains(&ProcessArgument::Flag(RsyncFlag::Xattrs)));
+}
+
+#[test]
+fn simple_mode_rejects_profiles_that_require_advanced_options() {
+    let base = profile(PathBuf::from("/source"), PathBuf::from("/destination"));
+
+    assert!(
+        ProcessSpecification::from_profile_for_mode(&base, ApplicationMode::Simple).is_ok(),
+        "the default profile must remain available in Simple Mode"
+    );
+    assert!(
+        ProcessSpecification::from_profile_for_mode(&base, ApplicationMode::Advanced).is_ok(),
+        "Advanced Mode must retain the same safe defaults"
+    );
+
+    let permanent_removal = base.clone().with_options(SyncOptions {
+        safe_delete: true,
+        deletion_method: Some(DeletionMethod::PermanentRemoval),
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&permanent_removal, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "Permanent Removal"
+        })
+    ));
+
+    let executable_permissions = base.clone().with_options(SyncOptions {
+        metadata: MetadataRequirements::new(true, false, true, false),
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(
+            &executable_permissions,
+            ApplicationMode::Simple
+        ),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "executable-permission comparison"
+        })
+    ));
+
+    let timestamps = base.clone().with_options(SyncOptions {
+        metadata: MetadataRequirements::new(true, true, true, true),
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&timestamps, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "timestamp preservation"
+        })
+    ));
+
+    let custom_retry = base.clone().with_options(SyncOptions {
+        retry_policy: crate::RetryPolicy::new(4, std::time::Duration::from_millis(100)),
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&custom_retry, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "custom retry policy"
+        })
+    ));
+
+    let destination_cleanup = base.clone().with_options(SyncOptions {
+        destination_cleanup: true,
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&destination_cleanup, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "Destination Cleanup"
+        })
+    ));
+
+    let specialist_metadata = base.clone().with_options(SyncOptions {
+        metadata: MetadataRequirements::default().with_specialist_metadata(
+            SpecialistMetadataRequirements::new(true, true, true),
+        ),
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&specialist_metadata, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "ownership preservation"
+        })
+    ));
+
+    let keep_partial = base.clone().with_options(SyncOptions {
+        partial_transfer_policy: crate::PartialTransferPolicy::KeepPartialForResume,
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&keep_partial, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "keeping partial transfers for resume"
+        })
+    ));
+
+    let bandwidth_limit = base.clone().with_options(SyncOptions {
+        bandwidth_limit_kib_per_second: Some(512),
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&bandwidth_limit, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "bandwidth limiting"
+        })
+    ));
+
+    let custom_ssh_port = SyncProfile::new(
+        "SSH process specification",
+        ssh_peer("/remote/source"),
+        Peer::new("Destination", PathBuf::from("/destination")),
+    );
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&custom_ssh_port, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "custom SSH port"
+        })
+    ));
+
+    assert!(
+        ProcessSpecification::from_profile_for_mode(&permanent_removal, ApplicationMode::Advanced)
+            .is_ok(),
+        "Advanced Mode must allow the named option after the normal safety validation"
+    );
 }
 
 #[test]

@@ -9,3 +9,12 @@ SyncPlus will prioritize data safety and user understanding: destructive options
 The app will provide Simple Mode as the default workflow and Advanced Mode as an opt-in view for experienced users. Advanced Mode exposes more controls but never bypasses the same safety rules.
 
 Simple Mode is used on first launch, after which the user's mode preference is persisted and restored across restarts.
+
+The display preference remains separate from the saved Sync Profile and never
+rewrites its effective options. The shared core Process Specification also
+offers a mode-aware validation boundary: if a profile contains an Advanced
+option hidden by Simple Mode, analysis and execution from that display mode
+are blocked with a plain-language requirement to switch modes. This keeps
+saved settings intact while preventing specialist consequences from becoming
+invisible. Scheduled Runs use their already validated frozen profile snapshot
+and are not changed by the foreground display preference.

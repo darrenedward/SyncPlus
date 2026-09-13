@@ -1995,12 +1995,6 @@ impl SyncPlusApp {
                 .clone()
                 .ok_or(UiValidationError::ReviewNotReady)?;
             let profile = expected.profile().clone();
-            self.validate_advanced_only_options(&profile)?;
-            if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
-                && self.settings.mode() != ApplicationMode::Advanced
-            {
-                return Err(UiValidationError::PermanentRemovalRequiresAdvanced);
-            }
             (profile, expected)
         };
         let run_id = self
@@ -2592,12 +2586,6 @@ impl SyncPlusApp {
         {
             return Err(UiValidationError::ScheduleRequiresAdvanced);
         }
-        self.validate_advanced_only_options(&profile)?;
-        if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
-            && self.settings.mode() != ApplicationMode::Advanced
-        {
-            return Err(UiValidationError::PermanentRemovalRequiresAdvanced);
-        }
         if self.form.schedule_enabled
             && profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
             && !authorizations.allow_unattended_permanent_removal()
@@ -2708,8 +2696,7 @@ impl SyncPlusApp {
 
     fn validated_profile(&self) -> Result<SyncProfile, UiValidationError> {
         let profile = self.form.build()?;
-        syncplus_core::ProcessSpecification::from_profile(&profile)
-            .map_err(|error| UiValidationError::Core(error.to_string()))?;
+        self.validate_profile_for_mode(&profile)?;
         for peer in [profile.peer_a(), profile.peer_b()] {
             if let Some(ssh) = peer.ssh_peer()
                 && let SshAuthentication::SavedPassword(reference) = ssh.authentication()
@@ -2727,16 +2714,10 @@ impl SyncPlusApp {
         Ok(profile)
     }
 
-    fn validate_advanced_only_options(
-        &self,
-        profile: &SyncProfile,
-    ) -> Result<(), UiValidationError> {
-        if profile.options().destination_cleanup
-            && self.settings.mode() != ApplicationMode::Advanced
-        {
-            return Err(UiValidationError::DestinationCleanupRequiresAdvanced);
-        }
-        Ok(())
+    fn validate_profile_for_mode(&self, profile: &SyncProfile) -> Result<(), UiValidationError> {
+        syncplus_core::ProcessSpecification::from_profile_for_mode(profile, self.settings.mode())
+            .map(|_| ())
+            .map_err(map_profile_mode_error)
     }
 
     fn analyze_profile_snapshot_with_progress(
@@ -2998,7 +2979,6 @@ impl SyncPlusApp {
             ));
         }
         let profile = self.validated_profile()?;
-        self.validate_advanced_only_options(&profile)?;
         let profile_name = profile.name().to_owned();
         let application_mode = self.settings.mode();
         let authorizations = self.form.profile_authorizations;
@@ -3158,7 +3138,6 @@ impl SyncPlusApp {
 
     pub fn analyze_profile(&mut self) -> Result<(), UiValidationError> {
         let profile = self.validated_profile()?;
-        self.validate_advanced_only_options(&profile)?;
         let result = Self::analyze_profile_snapshot_with_progress(
             profile,
             |_| {},
@@ -3635,18 +3614,13 @@ impl SyncPlusApp {
                 {
                     return Err(UiValidationError::ScheduleRequiresAdvanced);
                 }
-                self.validate_advanced_only_options(&profile)?;
                 if self.form.schedule_enabled
                     && profile.options().safe_delete
                     && profile.options().deletion_method.is_none()
                 {
                     return Err(UiValidationError::DeletionMethodRequired);
                 }
-                if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
-                    && self.settings.mode() != ApplicationMode::Advanced
-                {
-                    return Err(UiValidationError::PermanentRemovalRequiresAdvanced);
-                }
+                self.validate_profile_for_mode(&profile)?;
                 if self.form.schedule_enabled
                     && profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
                     && !authorizations.allow_unattended_permanent_removal()
@@ -5089,7 +5063,7 @@ impl SyncPlusApp {
                             == Some(DeletionMethod::PermanentRemoval)
                         {
                             ui.label(
-                                "This profile is configured for Permanent Removal. Switch to Advanced Mode to change or save that setting.",
+                                "This profile contains an Advanced Mode setting. Switch to Advanced Mode to review or change it before continuing.",
                             );
                         } else {
                             ui.radio_value(
@@ -5195,7 +5169,15 @@ impl SyncPlusApp {
                         ui.label("Unattended Permanent Removal remains disabled unless Permanent Removal is selected.");
                     }
                     ui.separator();
-                    ui.label("Metadata preservation (validated named options)");
+                    ui.label(egui::RichText::new("Mirror Equality").size(15.0).strong());
+                    ui.label(
+                        egui::RichText::new(
+                            "For Mirror Sync, items are the same when their content and item type match. The metadata choices below add the selected permissions, timestamps, ownership, ACL, or extended-attribute checks to that comparison.",
+                        )
+                        .small()
+                        .color(palette.muted),
+                    );
+                    ui.label(egui::RichText::new("Metadata preservation (validated named options)").strong());
                     ui.label(
                         egui::RichText::new(
                             "These options are checked at both endpoints. If a selected capability cannot be preserved and verified, precheck blocks the run; it never counts unsupported metadata as success.",
@@ -5205,7 +5187,7 @@ impl SyncPlusApp {
                     );
                     ui.label(
                         egui::RichText::new(
-                            "Mirror Equality always includes content and item type, plus the selected executable-permission and timestamp checks. Specialist metadata must be supported and verified before it can contribute to equality.",
+                            "Executable permissions and timestamps are included in Mirror Equality only when selected. Specialist metadata must be supported and verified before it can contribute to equality.",
                         )
                         .small()
                         .color(palette.muted),
@@ -6891,9 +6873,28 @@ fn draw_advanced_process_diagnostics(
     analysis: &FreshAnalysis,
     display_mode: ApplicationMode,
 ) {
-    if review.profile.mode() != SyncMode::OneWay
-        || display_mode != ApplicationMode::Advanced
-    {
+    if display_mode != ApplicationMode::Advanced {
+        return;
+    }
+    if review.profile.mode() == SyncMode::Mirror {
+        egui::CollapsingHeader::new("Validated process diagnostics (read-only)")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Mirror Sync does not produce one whole-tree command. It applies the reviewed per-item resolutions through the same typed process specification, so there is no editable shell or rsync command to expose.",
+                    )
+                    .small()
+                    .color(ui_palette(ui).muted),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "The Review and Execution Confirmation surfaces remain the authoritative record of what each peer will receive or preserve.",
+                    )
+                    .small()
+                    .color(ui_palette(ui).muted),
+                );
+            });
         return;
     }
     let mut preview = analysis.specification().preview();
@@ -7888,6 +7889,21 @@ fn map_storage_error(error: syncplus_core::StorageError) -> UiValidationError {
         }
         syncplus_core::StorageError::ScheduleRequiresAdvanced => {
             UiValidationError::ScheduleRequiresAdvanced
+        }
+        other => UiValidationError::Core(other.to_string()),
+    }
+}
+
+fn map_profile_mode_error(error: syncplus_core::ProcessSpecError) -> UiValidationError {
+    match error {
+        syncplus_core::ProcessSpecError::AdvancedModeRequired {
+            option: "Permanent Removal",
+        } => UiValidationError::PermanentRemovalRequiresAdvanced,
+        syncplus_core::ProcessSpecError::AdvancedModeRequired {
+            option: "Destination Cleanup",
+        } => UiValidationError::DestinationCleanupRequiresAdvanced,
+        syncplus_core::ProcessSpecError::AdvancedModeRequired { option } => {
+            UiValidationError::Core(format!("Advanced Mode is required for {option}."))
         }
         other => UiValidationError::Core(other.to_string()),
     }
@@ -10848,6 +10864,31 @@ mod tests {
     }
 
     #[test]
+    fn simple_mode_cannot_analyse_a_profile_with_hidden_advanced_options() {
+        let mut app = app();
+        app.form = valid_form();
+        app.form.safe_delete = true;
+        app.form.deletion_method = Some(DeletionMethod::PermanentRemoval);
+        app.show_sync_workspace();
+        app.workspace_tab = WorkspaceTab::Options;
+
+        let (texts, _) = painted_output_for(&mut app, ThemePreference::Light);
+        let options = texts.join("\n");
+        assert!(
+            options.contains("This profile contains an Advanced Mode setting"),
+            "Simple Mode must explain the mode boundary without exposing the hidden setting: {options}"
+        );
+        assert!(
+            !options.contains("This profile is configured for Permanent Removal"),
+            "Simple Mode must not reveal hidden Permanent Removal configuration: {options}"
+        );
+        assert_eq!(
+            app.analyze_profile(),
+            Err(UiValidationError::PermanentRemovalRequiresAdvanced)
+        );
+    }
+
+    #[test]
     fn manual_safe_delete_requires_a_fresh_deletion_method_choice() {
         let (mut form, _source, base) = filesystem_form();
         form.safe_delete = true;
@@ -11441,6 +11482,7 @@ mod tests {
         form.safe_delete = true;
         form.deletion_method = Some(DeletionMethod::PermanentRemoval);
         let mut app = app();
+        app.set_mode(ApplicationMode::Advanced);
         app.form = form;
         app.analyze_profile().expect("local analysis should pass");
         app.manual_deletion_method = Some(DeletionMethod::Trash);
@@ -11503,12 +11545,25 @@ mod tests {
         let (mut form, source, base) = filesystem_form();
         form.mode = SyncMode::Mirror;
         let mut app = app();
+        app.set_mode(ApplicationMode::Advanced);
         app.form = form;
 
         app.analyze_profile().expect("mirror analysis should pass");
         let entries = app.conflict_entries().expect("mirror conflict review");
         assert_eq!(entries.len(), 1);
         assert!(entries[0].is_read_only());
+        app.show_sync_workspace();
+        app.workspace_tab = WorkspaceTab::Review;
+        let (review_texts, _) = painted_output_for(&mut app, ThemePreference::Light);
+        let review = review_texts.join("\n");
+        assert!(
+            review.contains("Mirror Sync does not produce one whole-tree command"),
+            "Advanced Mirror Review must explain why there is no single command: {review}"
+        );
+        assert!(
+            review.contains("same typed process specification"),
+            "Advanced Mirror Review must expose the validated diagnostic boundary: {review}"
+        );
         assert!(
             app.start_resolution_run().is_err(),
             "missing decisions must block"
@@ -11615,7 +11670,7 @@ mod tests {
             assert!(advanced.contains(explanation), "Advanced Mode must show {explanation} in {advanced}");
         }
         assert!(advanced.contains("precheck blocks the run"));
-        assert!(advanced.contains("Mirror Equality always includes content and item type"));
+        assert!(advanced.contains("Mirror Equality"));
 
         form.retry_attempts = "11".to_owned();
         assert_eq!(form.build(), Err(UiValidationError::InvalidRetryAttempts));

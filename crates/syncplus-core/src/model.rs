@@ -657,6 +657,56 @@ impl SyncProfile {
         &self.exclusions
     }
 
+    /// Return the first configured option whose details are intentionally
+    /// hidden from Simple Mode. The profile retains the option when the user
+    /// changes display mode; callers must require Advanced Mode before
+    /// presenting or running that configuration so the effective settings do
+    /// not become invisible.
+    pub fn advanced_mode_requirement(&self) -> Option<&'static str> {
+        let options = self.options;
+        if options.deletion_method == Some(DeletionMethod::PermanentRemoval) {
+            return Some("Permanent Removal");
+        }
+        if options.destination_cleanup {
+            return Some("Destination Cleanup");
+        }
+        if !options.metadata.executable_permissions() {
+            return Some("executable-permission comparison");
+        }
+        if options.metadata.timestamps() {
+            return Some("timestamp preservation");
+        }
+        let specialist = options.metadata.specialist_metadata();
+        if specialist.ownership() {
+            return Some("ownership preservation");
+        }
+        if specialist.access_control_lists() {
+            return Some("access-control-list preservation");
+        }
+        if specialist.extended_attributes() {
+            return Some("extended-attribute preservation");
+        }
+        if options.partial_transfer_policy != PartialTransferPolicy::Cleanup {
+            return Some("keeping partial transfers for resume");
+        }
+        if options.retry_policy != RetryPolicy::default() {
+            return Some("custom retry policy");
+        }
+        if options.bandwidth_limit_kib_per_second.is_some() {
+            return Some("bandwidth limiting");
+        }
+        if self
+            .peer_a
+            .ssh_peer()
+            .into_iter()
+            .chain(self.peer_b.ssh_peer())
+            .any(|peer| peer.port() != 22)
+        {
+            return Some("custom SSH port");
+        }
+        None
+    }
+
     pub fn with_exclusion(mut self, exclusion: impl Into<String>) -> Self {
         self.exclusions.push(exclusion.into());
         self
