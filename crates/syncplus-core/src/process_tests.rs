@@ -123,6 +123,64 @@ fn simple_mode_rejects_profiles_that_require_advanced_options() {
         })
     ));
 
+    let destination_cleanup = base.clone().with_options(SyncOptions {
+        destination_cleanup: true,
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&destination_cleanup, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "Destination Cleanup"
+        })
+    ));
+
+    let specialist_metadata = base.clone().with_options(SyncOptions {
+        metadata: MetadataRequirements::default().with_specialist_metadata(
+            SpecialistMetadataRequirements::new(true, true, true),
+        ),
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&specialist_metadata, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "ownership preservation"
+        })
+    ));
+
+    let keep_partial = base.clone().with_options(SyncOptions {
+        partial_transfer_policy: crate::PartialTransferPolicy::KeepPartialForResume,
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&keep_partial, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "keeping partial transfers for resume"
+        })
+    ));
+
+    let bandwidth_limit = base.clone().with_options(SyncOptions {
+        bandwidth_limit_kib_per_second: Some(512),
+        ..SyncOptions::default()
+    });
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&bandwidth_limit, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "bandwidth limiting"
+        })
+    ));
+
+    let custom_ssh_port = SyncProfile::new(
+        "SSH process specification",
+        ssh_peer("/remote/source"),
+        Peer::new("Destination", PathBuf::from("/destination")),
+    );
+    assert!(matches!(
+        ProcessSpecification::from_profile_for_mode(&custom_ssh_port, ApplicationMode::Simple),
+        Err(ProcessSpecError::AdvancedModeRequired {
+            option: "custom SSH port"
+        })
+    ));
+
     assert!(
         ProcessSpecification::from_profile_for_mode(&permanent_removal, ApplicationMode::Advanced)
             .is_ok(),

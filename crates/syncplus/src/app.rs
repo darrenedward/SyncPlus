@@ -1995,12 +1995,6 @@ impl SyncPlusApp {
                 .clone()
                 .ok_or(UiValidationError::ReviewNotReady)?;
             let profile = expected.profile().clone();
-            self.validate_advanced_only_options(&profile)?;
-            if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
-                && self.settings.mode() != ApplicationMode::Advanced
-            {
-                return Err(UiValidationError::PermanentRemovalRequiresAdvanced);
-            }
             (profile, expected)
         };
         let run_id = self
@@ -2592,12 +2586,6 @@ impl SyncPlusApp {
         {
             return Err(UiValidationError::ScheduleRequiresAdvanced);
         }
-        self.validate_advanced_only_options(&profile)?;
-        if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
-            && self.settings.mode() != ApplicationMode::Advanced
-        {
-            return Err(UiValidationError::PermanentRemovalRequiresAdvanced);
-        }
         if self.form.schedule_enabled
             && profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
             && !authorizations.allow_unattended_permanent_removal()
@@ -2708,8 +2696,7 @@ impl SyncPlusApp {
 
     fn validated_profile(&self) -> Result<SyncProfile, UiValidationError> {
         let profile = self.form.build()?;
-        syncplus_core::ProcessSpecification::from_profile_for_mode(&profile, self.settings.mode())
-            .map_err(map_profile_mode_error)?;
+        self.validate_profile_for_mode(&profile)?;
         for peer in [profile.peer_a(), profile.peer_b()] {
             if let Some(ssh) = peer.ssh_peer()
                 && let SshAuthentication::SavedPassword(reference) = ssh.authentication()
@@ -2727,16 +2714,10 @@ impl SyncPlusApp {
         Ok(profile)
     }
 
-    fn validate_advanced_only_options(
-        &self,
-        profile: &SyncProfile,
-    ) -> Result<(), UiValidationError> {
-        if profile.options().destination_cleanup
-            && self.settings.mode() != ApplicationMode::Advanced
-        {
-            return Err(UiValidationError::DestinationCleanupRequiresAdvanced);
-        }
-        Ok(())
+    fn validate_profile_for_mode(&self, profile: &SyncProfile) -> Result<(), UiValidationError> {
+        syncplus_core::ProcessSpecification::from_profile_for_mode(profile, self.settings.mode())
+            .map(|_| ())
+            .map_err(map_profile_mode_error)
     }
 
     fn analyze_profile_snapshot_with_progress(
@@ -2998,7 +2979,6 @@ impl SyncPlusApp {
             ));
         }
         let profile = self.validated_profile()?;
-        self.validate_advanced_only_options(&profile)?;
         let profile_name = profile.name().to_owned();
         let application_mode = self.settings.mode();
         let authorizations = self.form.profile_authorizations;
@@ -3158,7 +3138,6 @@ impl SyncPlusApp {
 
     pub fn analyze_profile(&mut self) -> Result<(), UiValidationError> {
         let profile = self.validated_profile()?;
-        self.validate_advanced_only_options(&profile)?;
         let result = Self::analyze_profile_snapshot_with_progress(
             profile,
             |_| {},
@@ -3635,18 +3614,13 @@ impl SyncPlusApp {
                 {
                     return Err(UiValidationError::ScheduleRequiresAdvanced);
                 }
-                self.validate_advanced_only_options(&profile)?;
                 if self.form.schedule_enabled
                     && profile.options().safe_delete
                     && profile.options().deletion_method.is_none()
                 {
                     return Err(UiValidationError::DeletionMethodRequired);
                 }
-                if profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
-                    && self.settings.mode() != ApplicationMode::Advanced
-                {
-                    return Err(UiValidationError::PermanentRemovalRequiresAdvanced);
-                }
+                self.validate_profile_for_mode(&profile)?;
                 if self.form.schedule_enabled
                     && profile.options().deletion_method == Some(DeletionMethod::PermanentRemoval)
                     && !authorizations.allow_unattended_permanent_removal()
