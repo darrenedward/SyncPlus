@@ -171,6 +171,7 @@ impl ScheduledRun {
                 ));
                 mark_unattended_blocked(store, self.run_id, self.snapshot().profile(), &error)?;
                 self.record_missed_schedule(store, &error)?;
+                self.record_error_event(store, &error)?;
                 return Err(error);
             }
         };
@@ -381,10 +382,16 @@ mod tests {
 
     use super::{BackgroundScheduler, SchedulerClock, SchedulerError};
     use crate::{
-        ApplicationMode, DeletionMethod, LocalPrecheckProbe, Peer, RecoveryMethod,
-        MissedScheduleDecision, PeerScope, PeerScopeLockRegistry, ProcessSupervisor,
-        RunEvidenceStore, RunId, RunReportStatus, SchedulerEventKind,
-        SchedulerNotificationSink, ScopeLockOwner, SyncOptions, SyncProfile,
+        AccessSnapshot, ApplicationMode, CredentialResolver, DeletionMethod, LocalPrecheckProbe,
+        MissedScheduleDecision, PasswordSource, Peer, PeerScope, PeerScopeLockRegistry,
+        ProcessSupervisor, RecoveryEvidence, RecoveryMethod, RemotePrecheckObservation,
+        RemotePrecheckRequest, RemoteRsyncCapability, RemoteSha256Capability, RemoteTrashCapability,
+        ResolvedSshCredential, RunEvidenceStore, RunId, RunReportStatus, SchedulerEventKind,
+        SchedulerNotificationSink, ScopeLockOwner, SecretStore, SecretStoreError, SecretValue,
+        SshAuthentication, SshHostFingerprint, SshHostIdentityError, SshHostIdentityProbe,
+        SshPeer, SshRemotePrecheck, SshRemotePrecheckProbe, SshRunBackend, SshRunError,
+        SshTransferEvidence, SshTransferRequest, SourceInventory, SyncOptions, SyncProfile,
+        SavedSecretReference,
     };
 
     static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
@@ -395,6 +402,110 @@ mod tests {
     impl SchedulerClock for FixedClock {
         fn now_unix_seconds(&self) -> Result<i64, SchedulerError> {
             Ok(self.0)
+        }
+    }
+
+    struct MissingSecretStore;
+
+    impl SecretStore for MissingSecretStore {
+        fn save(
+            &self,
+            _reference: &SavedSecretReference,
+            _secret: &SecretValue,
+        ) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+
+        fn load(&self, _reference: &SavedSecretReference) -> Result<SecretValue, SecretStoreError> {
+            Err(SecretStoreError::Missing)
+        }
+
+        fn delete(&self, _reference: &SavedSecretReference) -> Result<(), SecretStoreError> {
+            Ok(())
+        }
+    }
+
+    struct FixedHostProbe;
+
+    impl SshHostIdentityProbe for FixedHostProbe {
+        fn probe(
+            &self,
+            _peer: &SshPeer,
+        ) -> Result<SshHostFingerprint, SshHostIdentityError> {
+            Ok(SshHostFingerprint::sha256([4; 32]))
+        }
+    }
+
+    struct PassingRemoteProbe;
+
+    impl SshRemotePrecheckProbe for PassingRemoteProbe {
+        fn probe(
+            &self,
+            _peer: &SshPeer,
+            _credential: &ResolvedSshCredential,
+            _host_permit: &crate::SshHostTrustPermit,
+            _request: &RemotePrecheckRequest,
+        ) -> Result<RemotePrecheckObservation, crate::PrecheckError> {
+            Ok(RemotePrecheckObservation::new(
+                true,
+                AccessSnapshot::new(true, true, true),
+                RemoteRsyncCapability::Compatible,
+                RemoteSha256Capability::Available,
+                RemoteTrashCapability::unavailable(),
+            ))
+        }
+    }
+
+    struct UnusedSshBackend;
+
+    impl SshHostIdentityProbe for UnusedSshBackend {
+        fn probe(
+            &self,
+            _peer: &SshPeer,
+        ) -> Result<SshHostFingerprint, SshHostIdentityError> {
+            Ok(SshHostFingerprint::sha256([4; 32]))
+        }
+    }
+
+    impl SshRemotePrecheckProbe for UnusedSshBackend {
+        fn probe(
+            &self,
+            _peer: &SshPeer,
+            _credential: &ResolvedSshCredential,
+            _host_permit: &crate::SshHostTrustPermit,
+            _request: &RemotePrecheckRequest,
+        ) -> Result<RemotePrecheckObservation, crate::PrecheckError> {
+            unreachable!("missing credential must stop before remote probing")
+        }
+    }
+
+    impl SshRunBackend for UnusedSshBackend {
+        fn inventory(
+            &self,
+            _peer: &SshPeer,
+            _credential: &ResolvedSshCredential,
+            _host_permit: &crate::SshHostTrustPermit,
+            _exclusions: &[String],
+        ) -> Result<SourceInventory, SshRunError> {
+            unreachable!("missing credential must stop before inventory")
+        }
+
+        fn transfer(
+            &self,
+            _request: &SshTransferRequest<'_>,
+            _should_cancel: &dyn Fn() -> bool,
+            _progress: &mut dyn FnMut(u64),
+        ) -> Result<SshTransferEvidence, SshRunError> {
+            unreachable!("missing credential must stop before transfer")
+        }
+
+        fn recover_source(
+            &self,
+            _request: &SshTransferRequest<'_>,
+            _transfer: &SshTransferEvidence,
+            _should_cancel: &dyn Fn() -> bool,
+        ) -> Result<RecoveryEvidence, SshRunError> {
+            unreachable!("missing credential must stop before recovery")
         }
     }
 
@@ -454,6 +565,190 @@ mod tests {
         let events = store.list_scheduler_events().expect("scheduler events");
         assert!(events.iter().any(|event| {
             event.run_id() == claim.run_id() && event.kind() == SchedulerEventKind::Completed
+        }));
+        fs::remove_dir_all(root).expect("fixture cleanup");
+    }
+
+    #[test]
+    fn disabled_schedule_is_not_claimed_by_the_background_scheduler() {
+        let profile = SyncProfile::new(
+            "disabled schedule profile",
+            Peer::new("source", PathBuf::from("/source")),
+            Peer::new("destination", PathBuf::from("/destination")),
+        );
+        let mut store = RunEvidenceStore::open_in_memory().expect("store");
+        let persisted = store.create_profile(&profile).expect("profile");
+        let schedule = crate::ScheduleDefinition::new_with_next_run_at(
+            1,
+            "UTC",
+            false,
+            None,
+        )
+        .expect("disabled schedule");
+        store
+            .update_schedule_at(persisted.id(), Some(schedule), ApplicationMode::Simple, 100)
+            .expect("schedule update");
+
+        let scheduler = BackgroundScheduler::with_clock(FixedClock(100));
+        assert!(scheduler.poll_due(&mut store).expect("due poll").is_empty());
+        assert_eq!(
+            store
+                .list_profiles()
+                .expect("profiles")
+                .into_iter()
+                .next()
+                .expect("profile")
+                .schedule()
+                .expect("schedule")
+                .next_run_at_unix_seconds(),
+            None,
+            "a disabled schedule remains configured but has no next occurrence"
+        );
+    }
+
+    #[test]
+    fn scheduled_run_snapshot_freezes_transport_and_authorization_before_profile_edits() {
+        let profile = SyncProfile::new(
+            "snapshot schedule profile",
+            Peer::new("source", PathBuf::from("/source")),
+            Peer::new("destination", PathBuf::from("/destination")),
+        )
+        .with_options(SyncOptions {
+            safe_delete: true,
+            deletion_method: Some(DeletionMethod::Trash),
+            bandwidth_limit_kib_per_second: Some(512),
+            ..SyncOptions::default()
+        });
+        let mut store = RunEvidenceStore::open_in_memory().expect("store");
+        let persisted = store
+            .create_profile_with_authorizations(
+                &profile,
+                crate::AuthorizationSnapshot::new(true, false),
+            )
+            .expect("authorized profile");
+        let schedule = crate::ScheduleDefinition::new_with_next_run_at(1, "UTC", true, Some(100))
+            .expect("schedule");
+        store
+            .update_schedule_at(persisted.id(), Some(schedule), ApplicationMode::Advanced, 100)
+            .expect("schedule update");
+
+        let scheduler = BackgroundScheduler::with_clock(FixedClock(100));
+        let claim = scheduler
+            .poll_due(&mut store)
+            .expect("due poll")
+            .pop()
+            .expect("claim");
+
+        let edited = profile.clone().with_options(SyncOptions {
+            bandwidth_limit_kib_per_second: Some(1024),
+            ..SyncOptions::default()
+        });
+        store
+            .update_profile(persisted.id(), &edited)
+            .expect("edit profile after claim");
+
+        assert_eq!(
+            claim
+                .snapshot()
+                .validated_options()
+                .bandwidth_limit_kib_per_second(),
+            Some(512)
+        );
+        assert!(claim
+            .snapshot()
+            .authorizations()
+            .allow_unattended_destructive());
+        assert_eq!(
+            store
+                .load_profile(persisted.id())
+                .expect("current profile")
+                .expect("profile")
+                .profile()
+                .options()
+                .bandwidth_limit_kib_per_second,
+            Some(1024)
+        );
+    }
+
+    #[test]
+    fn scheduled_ssh_run_missing_saved_credential_is_blocked_before_remote_work() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture root");
+        let source = root.join("source");
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("must-remain.txt"), b"source data").expect("source file");
+        let reference = SavedSecretReference::new("missing-ssh-password").expect("reference");
+        let remote = SshPeer::new(
+            "backup.example.test",
+            "sync-user",
+            2222,
+            None,
+            SshAuthentication::SavedPassword(reference),
+            "/srv/sync",
+        )
+        .expect("SSH peer");
+        let profile = SyncProfile::new(
+            "scheduled SSH profile",
+            Peer::new("source", source.clone()),
+            Peer::from_ssh("destination", remote.clone()),
+        );
+        let mut store = RunEvidenceStore::open_in_memory().expect("store");
+        let persisted = store.create_profile(&profile).expect("profile");
+        let schedule = crate::ScheduleDefinition::new_with_next_run_at(1, "UTC", true, Some(100))
+            .expect("schedule");
+        store
+            .update_schedule_at(persisted.id(), Some(schedule), ApplicationMode::Advanced, 100)
+            .expect("schedule update");
+        let claim = BackgroundScheduler::with_clock(FixedClock(100))
+            .poll_due(&mut store)
+            .expect("due poll")
+            .pop()
+            .expect("claim");
+
+        let trust_store = RunEvidenceStore::open_in_memory().expect("trust store");
+        let mut trust = crate::SshHostTrustController::new(trust_store);
+        let decision = trust
+            .inspect(&remote, &FixedHostProbe)
+            .expect("host inspection");
+        trust
+            .approve(&remote, &decision, crate::HostTrustMode::Interactive)
+            .expect("host approval");
+        let host_permit = trust
+            .pre_mutation_permit(&remote, &FixedHostProbe)
+            .expect("host permit");
+        let credential = ResolvedSshCredential::Password {
+            source: PasswordSource::SavedSecret,
+            secret: SecretValue::new("test-only-secret"),
+        };
+        let (_, request) = RemotePrecheckRequest::from_profile(&profile).expect("SSH request");
+        let precheck = SshRemotePrecheck::check(
+            &remote,
+            &credential,
+            &host_permit,
+            &request,
+            &PassingRemoteProbe,
+        )
+        .expect("precheck");
+        let precheck = precheck.require_passed().expect("passing precheck");
+        let workflow = crate::RunWorkflow::new(RecoveryMethod::trash(root.join("trash")));
+        let result = claim.execute_ssh(
+            &workflow,
+            &CredentialResolver::new(MissingSecretStore),
+            &host_permit,
+            &precheck,
+            &UnusedSshBackend,
+            &mut store,
+            || false,
+        );
+
+        assert!(result.is_err(), "missing unattended credential must block the run");
+        assert!(source.join("must-remain.txt").exists());
+        assert_eq!(
+            store.load_report(claim.run_id()).expect("report").status(),
+            RunReportStatus::Blocked
+        );
+        assert!(store.list_scheduler_events().expect("events").iter().any(|event| {
+            event.run_id() == claim.run_id() && event.kind() == SchedulerEventKind::BlockedPreflight
         }));
         fs::remove_dir_all(root).expect("fixture cleanup");
     }
